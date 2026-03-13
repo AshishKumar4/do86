@@ -25,7 +25,7 @@ const IMAGES: Record<string, ImageDef> = {
              url: "http://www.helenos.org/releases/HelenOS-0.5.0-ia32.iso" },
   linux4:  { file: "linux4.iso",  drive: "cdrom", memory: 128, vgaMemory: 8, label: "Linux (text)",     description: "Minimal Linux kernel. Text mode only.",
              url: "https://copy.sh/v86/images/linux4.iso" },
-  aqeous:  { file: "aqeous.iso",  drive: "cdrom", memory: 128, vgaMemory: 8, label: "AqeousOS",        description: "Custom x86 OS built from scratch. Full GUI with window system." },
+  aqeous:  { file: "aqeous.iso",  drive: "cdrom", memory: 32, vgaMemory: 8, label: "AqeousOS",        description: "Custom x86 OS built from scratch. Full GUI with window system." },
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
