@@ -165,6 +165,7 @@ function updateFocusUI() {
   if (!vmRunning || !wsConnected) {
     hideOverlay(focusOverlay);
     canvas.style.outline = "none";
+    canvas.style.boxShadow = "none";
     displayContainer.style.cursor = "default";
     return;
   }
@@ -173,15 +174,18 @@ function updateFocusUI() {
     hideOverlay(focusOverlay);
     canvas.style.outline = "2px solid #58a6ff";
     canvas.style.outlineOffset = "-2px";
+    canvas.style.boxShadow = "0 0 12px rgba(88, 166, 255, 0.4)";
     displayContainer.style.cursor = "none";
   } else if (canvasFocused) {
     hideOverlay(focusOverlay);
-    canvas.style.outline = "1px solid #30363d";
-    canvas.style.outlineOffset = "-1px";
+    canvas.style.outline = "2px solid #3fb950";
+    canvas.style.outlineOffset = "-2px";
+    canvas.style.boxShadow = "0 0 8px rgba(63, 185, 80, 0.3)";
     displayContainer.style.cursor = "crosshair";
   } else {
     showOverlay(focusOverlay);
     canvas.style.outline = "none";
+    canvas.style.boxShadow = "none";
     displayContainer.style.cursor = "default";
   }
 }
@@ -325,7 +329,9 @@ fitCanvas();
 
 document.addEventListener("pointerlockchange", () => {
   pointerLocked = document.pointerLockElement === canvas;
-  canvasFocused = pointerLocked;
+  // Don't unfocus keyboard when pointer lock exits — canvas focus is independent.
+  // Pointer lock is only for mouse capture (GUI OSes); keyboard should keep working.
+  if (pointerLocked) canvasFocused = true;
   updateFocusUI();
 });
 
