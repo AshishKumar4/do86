@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.wrangler/
+.vite/
+*.log
+
+# Large OS images — download separately (see README)
+public/assets/dsl.iso
+public/assets/helenos.iso
+public/assets/linux4.iso
+package-lock.json
+public/assets/v86.wasm

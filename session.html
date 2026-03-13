@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>do86</title>
+    <!-- CSS is imported via src/client/main.ts (Vite bundles it) -->
+  </head>
+  <body>
+    <header>
+      <a href="/">&#8592; do86</a>
+      <span id="status">disconnected</span>
+      <span id="session-id"></span>
+      <span id="frame-stats"></span>
+      <span id="resolution"></span>
+    </header>
+    <div id="display-container">
+      <canvas id="screen" width="720" height="400"></canvas>
+
+      <!-- Loading overlay (shown during download/boot) -->
+      <div id="loading-overlay" class="canvas-overlay">
+        <div class="spinner"></div>
+        <div class="loading-text" id="loading-text">Connecting...</div>
+        <div class="loading-sub" id="loading-sub"></div>
+      </div>
+
+      <!-- Focus overlay (shown when canvas is not focused) -->
+      <div id="focus-overlay" class="canvas-overlay hidden">
+        <div class="focus-hint">
+          Click to focus &middot; Click again to capture mouse<br />
+          <kbd>Esc</kbd> to release
+        </div>
+      </div>
+
+      <!-- Reconnect overlay -->
+      <div id="reconnect-overlay" class="canvas-overlay hidden">
+        <div class="reconnect-inner">
+          <div class="reconnect-text">Reconnecting<span class="reconnect-dots"></span></div>
+          <div class="reconnect-sub">Connection lost. Retrying automatically.</div>
+        </div>
+      </div>
+    </div>
+    <div id="serial-panel" class="collapsed">
+      <button id="serial-toggle">Serial &#9650;</button>
+      <div id="serial-output"></div>
+      <div id="serial-input-bar">
+        <span>serial&gt;</span>
+        <input id="serial-cmd" type="text" placeholder="Type command and press Enter" />
+      </div>
+    </div>
+    <script type="module" src="/src/client/main.ts"></script>
+  </body>
+</html>
