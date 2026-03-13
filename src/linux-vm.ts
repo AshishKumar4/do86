@@ -536,7 +536,14 @@ export class LinuxVM extends DurableObject<unknown> {
 
   // ── Render loop ───────────────────────────────────────────────────────
 
-  private renderFrame(): void {
+   private _renderCount = 0;
+   private renderFrame(): void {
+    this._renderCount++;
+    if (this._renderCount % 50 === 0) {
+      const sa = this.screenAdapter;
+      const preview = sa ? sa.getTextScreen().filter(r => r.trim()).slice(0, 3).join(" | ") : "(no adapter)";
+      console.log(`${LOG_PREFIX} renderFrame #${this._renderCount} sessions=${this.sessions.size} preview="${preview.substring(0,120)}"`);
+    }
     if (!this.emulator || !this.screenAdapter || this.sessions.size === 0) return;
 
     const vga = this.getVga();
