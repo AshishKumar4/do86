@@ -26,8 +26,8 @@ export const CACHE_DEVICE = "cache";
 
 // ── Boot constants ──────────────────────────────────────────────────────────
 
-export const BOOT_ORDER_CDROM_FIRST = 0x321;
-export const BOOT_ORDER_HDA_FIRST = 0x132;
+export const BOOT_ORDER_CDROM_FIRST = 0x213;
+export const BOOT_ORDER_HDA_FIRST = 0x312;
 export const EMULATOR_LOAD_TIMEOUT_MS = 30_000;
 export const SNAPSHOT_DELAY_FAST_MS = 30_000;  // KolibriOS — boots fast
 export const SNAPSHOT_DELAY_SLOW_MS = 60_000;  // Heavier OSes

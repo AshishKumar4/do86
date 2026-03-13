@@ -66,6 +66,12 @@ export class ChunkedBlobStore {
     return result.buffer as ArrayBuffer;
   }
 
+  /** Delete a named blob from the store */
+  delete(name: string): void {
+    this.sql.exec(`DELETE FROM ${this.metaTable} WHERE name = ?`, name);
+    this.sql.exec(`DELETE FROM ${this.dataTable} WHERE name = ?`, name);
+  }
+
   /**
    * Store an ArrayBuffer as chunked blobs.
    * Meta row is written last as a commit marker — if interrupted, has() returns

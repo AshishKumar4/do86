@@ -25,6 +25,7 @@ const IMAGES: Record<string, ImageDef> = {
              url: "http://www.helenos.org/releases/HelenOS-0.5.0-ia32.iso" },
   linux4:  { file: "linux4.iso",  drive: "cdrom", memory: 128, vgaMemory: 8, label: "Linux (text)",     description: "Minimal Linux kernel. Text mode only.",
              url: "https://copy.sh/v86/images/linux4.iso" },
+  aqeous:  { file: "aqeous.iso",  drive: "cdrom", memory: 128, vgaMemory: 8, label: "AqeousOS",        description: "Custom x86 OS built from scratch. Full GUI with window system." },
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -98,8 +99,14 @@ export default {
           new Request(new URL("/status", request.url).toString()),
         );
         const { running } = await statusResp.json<{ running: boolean }>();
+        const freshBoot = url.searchParams.get("fresh") === "1";
 
-        if (!running) {
+        if (freshBoot && running) {
+          // Force reboot: tell DO to stop, then re-init
+          await stub.fetch(new Request(new URL("/reboot", request.url).toString(), { method: "POST" }));
+        }
+
+        if (!running || freshBoot) {
           // Always fetch BIOS ROMs from static assets (small: 131KB + 36KB)
           const [bios, vgaBios] = await Promise.all([
             getAsset(env, "/assets/seabios.bin", request.url),
@@ -133,6 +140,11 @@ export default {
           } else {
             // Small/local image (e.g. KolibriOS floppy): send inline
             assets.disk = await getAsset(env, `/assets/${imageDef.file}`, request.url);
+          }
+
+          // Pass fresh=1 query param to force cold boot (clears saved snapshot)
+          if (url.searchParams.get("fresh") === "1") {
+            meta.fresh = true;
           }
 
           assets.metadata = new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer;

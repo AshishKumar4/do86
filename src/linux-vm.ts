@@ -75,6 +75,23 @@ export class LinuxVM extends DurableObject<unknown> {
       return Response.json({ running: this.booted || this.booting });
     }
 
+    if (url.pathname === "/reboot" && request.method === "POST") {
+      console.log(`${LOG_PREFIX} Reboot requested — stopping emulator`);
+      if (this.renderInterval) { clearInterval(this.renderInterval); this.renderInterval = null; }
+      if (this.emulator) {
+        try { (this.emulator as any).stop?.(); } catch { /* ok */ }
+        try { (this.emulator as any).destroy?.(); } catch { /* ok */ }
+      }
+      this.emulator = null;
+      this.booted = false;
+      this.booting = false;
+      this.bootError = null;
+      this.snapshotSaved = false;
+      this.cachedAssets = null;
+      this.broadcast(encodeStatus("rebooting"));
+      return Response.json({ status: "rebooted" });
+    }
+
     if (url.pathname === "/init" && request.method === "POST") {
       if (this.booted || this.booting) {
         return Response.json({ status: "already_running", imageKey: this.imageKey });
@@ -168,6 +185,14 @@ export class LinuxVM extends DurableObject<unknown> {
       // Always initialize storage early (needed for snapshots and image cache)
       this.ensureStorage();
 
+      // ── Handle fresh boot request (clear cached snapshot) ──────────────
+      const metaForFresh = metadataRaw ? JSON.parse(new TextDecoder().decode(metadataRaw)) : {};
+      if (metaForFresh.fresh && this.imageCache!.states.has(imageKey)) {
+        console.log(`${LOG_PREFIX} Fresh boot requested — clearing snapshot for ${imageKey}`);
+        this.imageCache!.states.delete(imageKey);
+        this.snapshotSaved = false;
+      }
+
       // ── Check for existing state snapshot ─────────────────────────────
       let savedState: ArrayBuffer | null = null;
       if (this.imageCache!.states.has(imageKey)) {
@@ -233,6 +258,30 @@ export class LinuxVM extends DurableObject<unknown> {
       this.cachedAssets = null;
 
       const { V86 } = await import("v86");
+
+      // Monkey-patch microtick for Workers environment where performance.now() is coarsened
+      // to only return the time of the last I/O. The WASM main_loop calls microtick() repeatedly
+      // to check if TIME_PER_FRAME (1ms) has elapsed — but since no I/O happens during synchronous
+      // WASM execution, performance.now() never advances and the loop spins forever, exhausting cpu_ms.
+      //
+      // Hybrid approach: advance synthetically during synchronous WASM execution (~50 calls per frame
+      // at 0.02ms increment = 1ms), but sync to real time whenever I/O causes it to advance.
+      // The PIT/guest OS timer is driven by cycle count, not wall clock, so synthetic time is fine.
+      let syntheticTime = performance.now();
+      let lastRealTime = syntheticTime;
+      const MICROTICK_INCREMENT = 0.02; // 20μs per call — ~50 calls to hit 1ms TIME_PER_FRAME
+      (V86 as any).microtick = () => {
+        const realNow = performance.now();
+        if (realNow > lastRealTime) {
+          // I/O happened — real time advanced. Sync up.
+          syntheticTime = realNow;
+          lastRealTime = realNow;
+        } else {
+          // Still in synchronous WASM execution — advance synthetically
+          syntheticTime += MICROTICK_INCREMENT;
+        }
+        return syntheticTime;
+      };
 
       const v86Config: Record<string, any> = {
         wasm_fn: async (env: any) => (await WebAssembly.instantiate(v86WasmModule, env)).exports,
