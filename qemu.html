@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>do86 - QEMU WASM</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      background: #0d1117;
+      color: #e6edf3;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    #info-bar {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 8px 16px;
+      font-size: 12px;
+      color: #8b949e;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    #info-bar a { color: #f97316; text-decoration: none; font-weight: 600; }
+    #status { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; background: #1f2937; color: #8b949e; }
+    #status.running { background: #064e3b; color: #34d399; }
+    #status.error { background: #7f1d1d; color: #f87171; }
+    #perf-info { margin-left: auto; font-size: 11px; color: #484f58; }
+
+    #progress {
+      padding: 12px 16px;
+      font-size: 13px;
+      color: #8b949e;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+    }
+    .spinner {
+      display: inline-block;
+      width: 12px; height: 12px;
+      border: 2px solid rgba(249,115,22,.3);
+      border-top-color: #f97316;
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #canvas-container {
+      display: none;
+      flex: 0 0 auto;
+      background: #000;
+      text-align: center;
+      border-bottom: 1px solid #30363d;
+    }
+    #screen {
+      display: block;
+      margin: 0 auto;
+      image-rendering: pixelated;
+      cursor: default;
+    }
+
+    #controls {
+      display: none;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 6px 16px;
+      gap: 8px;
+      align-items: center;
+    }
+    #controls button {
+      background: #21262d;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 4px 12px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    #controls button:hover { border-color: #f97316; }
+
+    #terminal {
+      flex: 1;
+      padding: 12px 16px;
+      font-size: 13px;
+      line-height: 1.5;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #8b949e;
+      background: #0d1117;
+    }
+  </style>
+</head>
+<body>
+  <div id="info-bar">
+    <a href="/">&larr; do86</a>
+    <span id="status">initializing</span>
+    <span id="perf-info"></span>
+  </div>
+  <div id="progress"></div>
+  <div id="canvas-container">
+    <canvas id="screen" width="720" height="400"></canvas>
+  </div>
+  <div id="controls">
+    <button id="btn-fullscreen">Fullscreen</button>
+  </div>
+  <pre id="terminal"></pre>
+
+  <!-- COOP/COEP headers are set by the Vite dev server plugin and the Worker
+       (required for SharedArrayBuffer / Emscripten pthreads) -->
+
+  <!-- Boot script: loads Emscripten QEMU JS dynamically via fetch+blob URL
+       to bypass Vite's module transformation -->
+  <script type="module" src="/src/client/qemu-boot.ts"></script>
+</body>
+</html>

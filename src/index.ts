@@ -70,9 +70,23 @@ function packAssets(assets: Record<string, ArrayBuffer>): ArrayBuffer {
   return packed;
 }
 
+// ── Helpers: COOP/COEP for SharedArrayBuffer (required by QEMU pthreads) ────
+
+function withCoopCoep(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  headers.set("Cross-Origin-Embedder-Policy", "require-corp");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 const SESSION_RE = /^\/s\/([a-zA-Z0-9_-]+)$/;
+const QEMU_RE = /^\/qemu(?:\/([a-zA-Z0-9_.-]*))?$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -81,6 +95,14 @@ export default {
     // GET / → landing page (served from static index.html)
     if (url.pathname === "/") {
       return env.ASSETS.fetch(new Request(new URL("/index.html", request.url).toString()));
+    }
+
+    // /qemu → QEMU-WASM browser emulation page
+    if (url.pathname === "/qemu" || url.pathname === "/qemu/") {
+      const resp = await env.ASSETS.fetch(
+        new Request(new URL("/qemu.html", request.url).toString()),
+      );
+      return withCoopCoep(resp);
     }
 
     // /s/:sessionId → session VM
@@ -186,6 +208,14 @@ export default {
     }
 
     // Everything else → static assets
-    return env.ASSETS.fetch(request);
+    // Add COOP/COEP headers for QEMU-related assets (needed for SharedArrayBuffer)
+    const assetResp = await env.ASSETS.fetch(request);
+    if (
+      url.pathname.startsWith("/qemu/") ||
+      url.pathname.startsWith("/assets/")
+    ) {
+      return withCoopCoep(assetResp);
+    }
+    return assetResp;
   },
 };
