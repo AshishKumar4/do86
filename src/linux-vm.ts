@@ -51,6 +51,15 @@ export class LinuxVM extends DurableObject<unknown> {
   private snapshotSaved = false;
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private restoredFromSnapshot = false;
+  private noSnapshot = false;
+
+  // ── Input gating ──────────────────────────────────────────────────────
+  // During a cold boot, user input is blocked until the boot-complete snapshot
+  // is captured. This ensures the snapshot reflects pristine boot state, not
+  // whatever the user typed while the OS was still loading.
+  // Gating is lifted when: (a) snapshot saves successfully, (b) snapshot is
+  // skipped (noSnapshot / already exists), or (c) the snapshot attempt fails.
+  private inputGated = false;
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
@@ -70,6 +79,7 @@ export class LinuxVM extends DurableObject<unknown> {
     if (url.pathname === "/reboot" && request.method === "POST") {
       console.log(`${LOG_PREFIX} Reboot requested — stopping emulator`);
       if (this.renderInterval) { clearInterval(this.renderInterval); this.renderInterval = null; }
+      if (this.snapshotTimer) { clearTimeout(this.snapshotTimer); this.snapshotTimer = null; }
       if (this.emulator) {
         try { (this.emulator as any).stop?.(); } catch { /* ok */ }
         try { (this.emulator as any).destroy?.(); } catch { /* ok */ }
@@ -79,9 +89,33 @@ export class LinuxVM extends DurableObject<unknown> {
       this.booting = false;
       this.bootError = null;
       this.snapshotSaved = false;
+      this.restoredFromSnapshot = false;
+      this.inputGated = false;
       this.cachedAssets = null;
+
+      // Clear persisted snapshot so the next boot is a cold boot
+      if (this.imageKey && this.imageCache) {
+        console.log(`${LOG_PREFIX} Clearing persisted snapshot for ${this.imageKey}`);
+        this.imageCache.states.delete(this.imageKey);
+      }
+
       this.broadcast(encodeStatus("rebooting"));
       return Response.json({ status: "rebooted" });
+    }
+
+    if (url.pathname === "/clear-snapshot" && request.method === "POST") {
+      const key = url.searchParams.get("image") || this.imageKey;
+      if (key) {
+        this.ensureStorage();
+        if (this.imageCache!.states.has(key)) {
+          this.imageCache!.states.delete(key);
+          this.snapshotSaved = false;
+          console.log(`${LOG_PREFIX} Snapshot cleared for ${key}`);
+          return Response.json({ status: "cleared", imageKey: key });
+        }
+        return Response.json({ status: "no_snapshot", imageKey: key });
+      }
+      return Response.json({ status: "no_image_key" }, { status: 400 });
     }
 
     if (url.pathname === "/init" && request.method === "POST") {
@@ -174,6 +208,7 @@ export class LinuxVM extends DurableObject<unknown> {
           label = meta.label || label;
           diskUrl = meta.diskUrl || null;
           diskFile = meta.diskFile || null;
+          this.noSnapshot = !!meta.noSnapshot;
         } catch (e) {
           console.error(`${LOG_PREFIX} Failed to parse boot metadata:`, e);
         }
@@ -183,17 +218,18 @@ export class LinuxVM extends DurableObject<unknown> {
       // Always initialize storage early (needed for snapshots and image cache)
       this.ensureStorage();
 
-      // ── Handle fresh boot request (clear cached snapshot) ──────────────
+      // ── Handle fresh boot / noSnapshot (clear cached snapshot) ────────
       const metaForFresh = metadataRaw ? JSON.parse(new TextDecoder().decode(metadataRaw)) : {};
-      if (metaForFresh.fresh && this.imageCache!.states.has(imageKey)) {
-        console.log(`${LOG_PREFIX} Fresh boot requested — clearing snapshot for ${imageKey}`);
+      if ((metaForFresh.fresh || this.noSnapshot) && this.imageCache!.states.has(imageKey)) {
+        const reason = this.noSnapshot ? "noSnapshot flag" : "fresh boot requested";
+        console.log(`${LOG_PREFIX} ${reason} — clearing snapshot for ${imageKey}`);
         this.imageCache!.states.delete(imageKey);
         this.snapshotSaved = false;
       }
 
       // ── Check for existing state snapshot ─────────────────────────────
       let savedState: ArrayBuffer | null = null;
-      if (this.imageCache!.states.has(imageKey)) {
+      if (!this.noSnapshot && this.imageCache!.states.has(imageKey)) {
         console.log(`${LOG_PREFIX} State snapshot found for ${imageKey} — restoring`);
         this.broadcast(encodeStatus(`restoring: ${label}`));
         savedState = this.imageCache!.states.get(imageKey);
@@ -407,15 +443,26 @@ export class LinuxVM extends DurableObject<unknown> {
       this.startRenderLoop();
 
       if (savedState) {
+        // Restored from snapshot — no need to gate input or save again
+        this.inputGated = false;
         console.log(`${LOG_PREFIX} Restored from snapshot: ${label}`);
         this.broadcast(encodeStatus(`running: ${label}`));
       } else {
-        console.log(`${LOG_PREFIX} Boot complete: ${label}`);
-        this.broadcast(encodeStatus(`running: ${label}`));
+        console.log(`${LOG_PREFIX} Cold boot complete: ${label}`);
 
-        // Schedule snapshot save after boot stabilizes
-        const delayMs = imageKey === "kolibri" ? SNAPSHOT_DELAY_FAST_MS : SNAPSHOT_DELAY_SLOW_MS;
-        this.scheduleSnapshot(label, delayMs);
+        // Schedule snapshot save after boot stabilizes (skip for noSnapshot images).
+        // Gate user input until the snapshot is captured so we get pristine boot state.
+        if (!this.noSnapshot) {
+          this.inputGated = true;
+          const delayMs = imageKey === "kolibri" ? SNAPSHOT_DELAY_FAST_MS : SNAPSHOT_DELAY_SLOW_MS;
+          console.log(`${LOG_PREFIX} Input gated — snapshot will capture clean boot state in ${delayMs / 1000}s`);
+          this.broadcast(encodeStatus(`running: ${label}`));
+          this.scheduleSnapshot(label, delayMs);
+        } else {
+          this.inputGated = false;
+          console.log(`${LOG_PREFIX} Snapshot saving disabled for ${imageKey} (noSnapshot)`);
+          this.broadcast(encodeStatus(`running: ${label}`));
+        }
       }
     } catch (err) {
       if (this.imageKey && this.imageCache) {
@@ -423,6 +470,7 @@ export class LinuxVM extends DurableObject<unknown> {
       }
       this.bootError = String(err);
       this.cachedAssets = null;
+      this.inputGated = false; // Don't leave input gated on boot failure
       console.error(`${LOG_PREFIX} Boot failed:`, err);
       throw err;
     } finally {
@@ -433,32 +481,48 @@ export class LinuxVM extends DurableObject<unknown> {
   // ── Snapshot management ───────────────────────────────────────────────
 
   private async saveSnapshot(label: string): Promise<void> {
-    if (this.snapshotSaved || !this.emulator || !this.imageCache || !this.imageKey) return;
+    if (this.noSnapshot || this.snapshotSaved || !this.emulator || !this.imageCache || !this.imageKey) {
+      this.ungateInput("snapshot precondition not met");
+      return;
+    }
 
     const vga = this.getVga();
     if (!vga?.graphical_mode) {
       console.log(`${LOG_PREFIX} Snapshot skipped — not in graphical mode yet`);
+      this.ungateInput("not in graphical mode");
       return;
     }
 
     if (this.imageCache.states.has(this.imageKey)) {
       this.snapshotSaved = true;
       console.log(`${LOG_PREFIX} Snapshot already exists for ${this.imageKey}`);
+      this.ungateInput("snapshot already exists");
       return;
     }
 
     try {
       this.broadcast(encodeStatus("saving snapshot..."));
-      console.log(`${LOG_PREFIX} Saving state snapshot for ${label}...`);
+      console.log(`${LOG_PREFIX} Saving boot snapshot for ${label} (input gated — no user activity captured)...`);
       const state = await this.emulator.save_state();
       this.imageCache.states.put(this.imageKey, state);
       this.snapshotSaved = true;
-      console.log(`${LOG_PREFIX} State snapshot saved for ${label} (${(state.byteLength / 1024 / 1024).toFixed(1)}MB)`);
+      console.log(`${LOG_PREFIX} Boot snapshot saved for ${label} (${(state.byteLength / 1024 / 1024).toFixed(1)}MB) — no further snapshots will be taken`);
       this.broadcast(encodeStatus(`running: ${label}`));
     } catch (err) {
       console.error(`${LOG_PREFIX} Failed to save snapshot:`, err);
       this.broadcast(encodeStatus(`running: ${label}`));
+    } finally {
+      // Always ungate input after the snapshot attempt, success or failure.
+      // This is the only code path that lifts the gate during cold boot.
+      this.ungateInput("boot snapshot complete");
     }
+  }
+
+  /** Lift the input gate and allow user interaction with the emulator. */
+  private ungateInput(reason: string): void {
+    if (!this.inputGated) return;
+    this.inputGated = false;
+    console.log(`${LOG_PREFIX} Input gate lifted — ${reason}`);
   }
 
   private scheduleSnapshot(label: string, delayMs: number): void {
@@ -796,6 +860,11 @@ export class LinuxVM extends DurableObject<unknown> {
 
       if (msg.type === "heartbeat") return;
 
+      // Drop all user input while the boot snapshot is pending.
+      // This prevents keyboard/mouse activity from contaminating the
+      // pristine boot state that gets persisted for future sessions.
+      if (this.inputGated) return;
+
       // ── Input messages — require running emulator ──────────────────────
       if (!this.emulator) return;
       const bus = this.emulator.bus;
@@ -832,6 +901,12 @@ export class LinuxVM extends DurableObject<unknown> {
           bus.send("mouse-click", [...this.mouseButtons]);
           break;
         }
+        case "text":
+          if (msg.data) this.emulator.keyboard_send_text?.(msg.data);
+          break;
+        case "scancodes":
+          if (msg.codes) this.emulator.keyboard_send_scancodes?.(msg.codes);
+          break;
         case "serial":
           this.emulator.serial0_send?.(msg.data);
           break;
