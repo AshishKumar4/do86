@@ -17,6 +17,14 @@
       {
         "name": "LINUX_VM",
         "class_name": "LinuxVM"
+      },
+      {
+        "name": "COORDINATOR",
+        "class_name": "CoordinatorDO"
+      },
+      {
+        "name": "CPU_CORE",
+        "class_name": "CpuCoreDO"
       }
     ]
   },
@@ -30,6 +38,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["LinuxVM"]
+    },
+    {
+      "tag": "v2",
+      "new_classes": ["CoordinatorDO", "CpuCoreDO"]
     }
   ]
 }

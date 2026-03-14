@@ -434,27 +434,121 @@ async stop(): Promise<void>
 
 ---
 
-## Open Questions
+## Resolved Design Decisions
 
-1. **v86 ICR interception**: Can we hook ICR writes from JS without modifying
-   v86's Rust/WASM? Options:
-   - (a) Poll LAPIC ICR register after each `main_loop()` call
-   - (b) Patch v86 WASM to export ICR write events
-   - (c) Intercept MMIO writes to 0xFEE00300 in JS memory handler
+### 1. v86 ICR Interception — Polling (Option A, chosen)
 
-2. **Page fault granularity**: Should we intercept at 4KB page level or
-   larger (64KB superpages)? Larger pages = fewer RPCs but more data per RPC.
+We poll the LAPIC ICR register from JS after each `do_tick()` execution cycle.
+No WASM or Rust modifications required.
 
-3. **WASM memory sharing**: Each core's v86 has its own WASM linear memory.
-   We need to copy pages between them via ArrayBuffer over RPC. The
-   serialization overhead of 4KB pages is ~0.
+**APIC struct layout** (46 x Int32 = 184 bytes at `cpu.get_apic_addr()`):
 
-4. **TSC synchronization**: Each core's TSC (Time Stamp Counter) should be
-   roughly synchronized. v86's TSC is driven by wall-clock time, so cores
-   in the same data center should be naturally close.
+```
+Index  Byte Offset  Field
+[0]    0            apic_id
+[1-5]  4-20         lvt_timer, lvt_perf, lvt_int0, lvt_int1, lvt_error
+[6-15] 24-60        timer state (initial_count, divider, tick tracking)
+[16-23] 64-92       irr[8]  — Interrupt Request Register (256 bits)
+[24-31] 96-124      isr[8]  — In-Service Register
+[32-39] 128-156     tmr[8]  — Trigger Mode Register
+[40]   160          icr0    — ICR Low  (guest writes here to send IPIs)
+[41]   164          icr1    — ICR High (destination APIC ID in bits 31:24)
+[42]   168          svr     — Spurious Vector Register
+[43]   172          tpr     — Task Priority Register
+[44]   176          timer_divider
+[45]   180          timer_divider_shift
+```
 
-5. **ACPI/MADT patching**: SeaBIOS in v86 generates MADT with 1 CPU entry.
-   We need to either: (a) patch SeaBIOS to report N CPUs, (b) have the
-   kernel's MADT parser detect cores via a custom mechanism, or (c) modify
-   the MADT in memory after BIOS runs. Option (b) is simplest for AqeousOS
-   since we control the kernel.
+**Interception flow** (in `CpuCoreDO.executionCycle()`):
+
+1. Before tick: inject any pending inbound IPIs by OR'ing into `irr[vector/32]`
+2. Execute: `v86.do_tick()` — runs ~100K guest instructions
+3. After tick: read `icr0`/`icr1`. If changed since last cycle, decode via
+   `decodeICR()` and fire-and-forget RPC to coordinator's `routeIPI()`.
+
+v86 clears ICR bit 12 (delivery-status) after processing, so we mask it
+out during comparison to avoid false positives.
+
+**Why polling works**: AqeousOS's `BootAPs()` sends INIT, waits ~10ms, sends
+SIPI, waits ~200μs, retries SIPI. The polling interval (~1ms per tick) is
+well within this timing window. Standard IPIs (scheduler, TLB shootdown) are
+also tolerant of 1-5ms delivery latency.
+
+### 2. IRR Injection — Direct WASM Memory Write
+
+Inbound IPIs are injected by writing directly into the APIC struct's IRR
+array in WASM linear memory:
+
+```ts
+const regIndex = vector >>> 5;            // vector / 32
+const bitOffset = vector & 0x1F;          // vector % 32
+apicView[APIC_I32_IRR_BASE + regIndex] |= (1 << bitOffset);
+```
+
+v86's `handle_irqs()` checks IRR on every instruction batch and delivers
+the highest-priority pending interrupt. No v86 code changes needed.
+
+### 3. Page Fault Granularity — 4KB Pages
+
+4KB matches x86 page granularity and v86's TLB granularity. At DO RPC
+latencies, the transfer cost of 4KB vs 64KB is negligible (both fit in a
+single RPC message). 4KB gives finer-grained sharing — a 64KB superpage
+would force false-sharing invalidations on pages the core doesn't actually
+need exclusive access to.
+
+### 4. TSC Synchronization — Wall Clock Is Sufficient
+
+v86's TSC (`current_tsc` in global_pointers.rs) is driven by wall-clock time
+via `microtick()`. Cores in the same data center (via `locationHint`) share
+the same wall clock within ~1ms. This is within the tolerance of any guest
+TSC synchronization algorithm (which typically allows hundreds of cycles of
+skew). No explicit sync protocol needed.
+
+### 5. ACPI/MADT — Kernel-Side Detection (Option B)
+
+Since we control the AqeousOS kernel, we modify `MADTapic_parse()` to detect
+the number of cores from a **kernel command line parameter** or a **fixed
+memory address** written by the coordinator before boot:
+
+**Approach**: The coordinator writes a small "SMP config block" into guest
+physical memory at a fixed address (e.g., `0x500` — within the BIOS data
+area, unused by SeaBIOS after POST) before starting the BSP emulator:
+
+```
+Offset  Size  Field
+0x500   4     Magic: 0x534D5043 ("SMPC")
+0x504   4     Number of cores
+0x508   4     Core 0 APIC ID
+0x50C   4     Core 1 APIC ID
+...
+```
+
+The AqeousOS kernel checks for this magic during `BasicCPU_Init()`. If
+present, it overrides the MADT-detected core count and APIC IDs. This avoids
+patching SeaBIOS entirely.
+
+**Alternative (Phase 2 fallback)**: Modify v86's WASM memory after SeaBIOS
+has written the MADT but before the kernel reads it. The coordinator can scan
+for the "APIC" signature in the RSDT and patch the processor entry count.
+This is fragile (depends on SeaBIOS memory layout) but requires zero kernel
+changes.
+
+---
+
+## Open Questions (Remaining)
+
+1. **RPC latency measurement**: Need to measure actual DO-to-DO RPC latency
+   when both DOs are co-located via `locationHint`. The design assumes 0.5-5ms
+   but this needs empirical validation.
+
+2. **WASM memory growth**: Each core's v86 allocates its own WASM linear memory
+   (up to 128MB). With 2 cores + coordinator, that's ~384MB of WASM memory
+   across 3 DOs. Each DO has its own 128MB limit — this is fine. But the
+   coordinator also needs memory for the page directory (canonical page data).
+   With 32MB guest RAM, canonical data is at most 32MB — fits easily.
+
+3. **DO hibernation**: When all browser clients disconnect, the coordinator and
+   core DOs should hibernate to stop billing. The coordinator can use the
+   WebSocket Hibernation API. Core DOs should implement an idle timeout via
+   `ctx.storage.setAlarm()` — if no execution or RPC in N seconds, save state
+   and stop.

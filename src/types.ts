@@ -42,7 +42,9 @@ export type ClientMessage =
   | { type: "keydown" | "keyup"; code: number }
   | { type: "mousemove"; dx: number; dy: number }
   | { type: "mousedown" | "mouseup"; button: number }
-  | { type: "serial"; data: string };
+  | { type: "serial"; data: string }
+  | { type: "text"; data: string }
+  | { type: "scancodes"; codes: number[] };
 
 export interface ClientState {
   needsKeyframe: boolean;

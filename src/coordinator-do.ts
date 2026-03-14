@@ -12,13 +12,13 @@
 
 import { DurableObject } from "cloudflare:workers";
 import {
-  type ClientMessage, type ClientState,
-  FPS_DEFAULT, FPS_MAX, FPS_MIN, LARGE_FRAME_BYTES,
+  type ClientState,
+  FPS_DEFAULT,
   LOG_PREFIX,
 } from "./types";
 import { DeltaEncoder, encodeSerialData, encodeStatus, encodeTextScreen } from "./delta-encoder";
 import { PageDirectory } from "./memory-coherence";
-import { IPIRouter, IOAPIC, type IPIMessage, DeliveryMode, decodeICR } from "./ipi-handler";
+import { IPIRouter, IOAPIC, type IPIMessage } from "./ipi-handler";
 import { unpackAssets } from "./sqlite-storage";
 
 // ── Env ──────────────────────────────────────────────────────────────────────
@@ -55,6 +55,8 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   private renderInterval: ReturnType<typeof setInterval> | null = null;
   private deltaEncoder = new DeltaEncoder();
   private currentFPS = FPS_DEFAULT;
+  private lastTextContent = "";
+  private _renderCount = 0;
 
   // ── Boot state ────────────────────────────────────────────────────────
   private booting = false;
@@ -146,14 +148,14 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     try {
       const bios = this.cachedAssets.get("bios");
       const vgaBios = this.cachedAssets.get("vgaBios");
-      const disk = this.cachedAssets.get("disk");
       if (!bios || !vgaBios) throw new Error("Missing BIOS assets");
-      if (!disk) throw new Error("Missing disk image");
 
       // Parse metadata
       let memorySizeMB = 32;
       let vgaMemoryMB = 8;
       let diskDrive: "fda" | "cdrom" = "cdrom";
+      let diskUrl: string | null = null;
+      let diskFile: string | null = null;
       const metadataRaw = this.cachedAssets.get("metadata");
       if (metadataRaw) {
         const meta = JSON.parse(new TextDecoder().decode(metadataRaw));
@@ -161,8 +163,22 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         vgaMemoryMB = meta.vgaMemory || vgaMemoryMB;
         diskDrive = meta.drive || diskDrive;
         this.vmId = meta.imageKey || "unknown";
-        this.numCores = meta.numCores || 2;
+        this.numCores = meta.numCores || 1;
+        diskUrl = meta.diskUrl || null;
+        diskFile = meta.diskFile || null;
       }
+
+      // Resolve disk image — may need to be fetched from URL
+      let disk = this.cachedAssets.get("disk") || null;
+      if (!disk && diskUrl) {
+        console.log(`${LOG_PREFIX} Fetching disk from ${diskUrl}`);
+        this.broadcast(encodeStatus("downloading disk image..."));
+        const resp = await fetch(diskUrl, { redirect: "follow" });
+        if (!resp.ok) throw new Error(`Failed to fetch ${diskUrl}: ${resp.status}`);
+        disk = await resp.arrayBuffer();
+        console.log(`${LOG_PREFIX} Downloaded disk: ${(disk.byteLength / 1024 / 1024).toFixed(1)}MB`);
+      }
+      if (!disk) throw new Error("No disk image: not provided inline and no URL configured");
 
       // Initialize memory coherence
       const memoryBytes = memorySizeMB * 1024 * 1024;
@@ -351,7 +367,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     this.pageDir.acceptWriteback(physAddr, fromCore, data);
   }
 
-  // ── Render loop (fetches frames from BSP core) ────────────────────────
+  // ── Render loop (fetches frames from BSP core via RPC) ─────────────
 
   private startRenderLoop(): void {
     if (this.renderInterval) return;
@@ -363,49 +379,86 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async renderFrame(): Promise<void> {
+    this._renderCount++;
     if (this.sessions.size === 0) return;
 
-    const bspStub = this.coreStubs.get(0);
-    if (!bspStub) return;
+    const bsp = this.coreStubs.get(0);
+    if (!bsp) return;
 
     try {
-      const frameData = await (bspStub as any).getScreenFrame();
-      if (!frameData) return;
-
-      // frameData is: [width:u32, height:u32, bufferWidth:u32, rgba...]
-      const view = new DataView(frameData);
-      const width = view.getUint32(0, true);
-      const height = view.getUint32(4, true);
-      const bufferWidth = view.getUint32(8, true);
-      const rgba = new Uint8ClampedArray(frameData, 12);
-
-      // Encode as delta frame
-      let anyNeedsKeyframe = false;
-      for (const state of this.sessions.values()) {
-        if (state.needsKeyframe) { anyNeedsKeyframe = true; break; }
+      // Also drain serial output from BSP
+      const serialData = await (bsp as any).flushSerial() as string | null;
+      if (serialData) {
+        this.broadcast(encodeSerialData(serialData));
       }
 
-      const result = this.deltaEncoder.encode(
-        width, height, bufferWidth, rgba, anyNeedsKeyframe,
-      );
-      if (!result) return;
+      // Check mode and render accordingly
+      const graphical = await (bsp as any).isGraphicalMode() as boolean;
 
-      // Send to all connected browsers
-      const now = Date.now();
-      const dead: WebSocket[] = [];
-      for (const [ws, state] of this.sessions.entries()) {
-        try {
-          ws.send(result.data);
-          state.lastSendTime = now;
-          state.needsKeyframe = false;
-        } catch {
-          dead.push(ws);
-        }
+      if (graphical) {
+        await this.renderGraphicalFrame(bsp);
+      } else {
+        await this.renderTextFrame(bsp);
       }
-      for (const ws of dead) this.sessions.delete(ws);
-    } catch (e) {
-      // Frame fetch failed — BSP might be busy, skip this frame
+    } catch {
+      // RPC failed — BSP might be busy, skip this frame
     }
+  }
+
+  private async renderGraphicalFrame(bsp: DurableObjectStub): Promise<void> {
+    const frameData = await (bsp as any).getScreenFrame() as ArrayBuffer | null;
+    if (!frameData) return;
+
+    const view = new DataView(frameData);
+    const width = view.getUint32(0, true);
+    const height = view.getUint32(4, true);
+    const bufferWidth = view.getUint32(8, true);
+    const rgba = new Uint8ClampedArray(frameData, 12);
+
+    let anyNeedsKeyframe = false;
+    for (const state of this.sessions.values()) {
+      if (state.needsKeyframe) { anyNeedsKeyframe = true; break; }
+    }
+
+    const result = this.deltaEncoder.encode(
+      width, height, bufferWidth, rgba, anyNeedsKeyframe,
+    );
+    if (!result) return;
+
+    const now = Date.now();
+    const dead: WebSocket[] = [];
+    for (const [ws, state] of this.sessions.entries()) {
+      let data = result.data;
+      // Send keyframe to clients that need it
+      if (state.needsKeyframe && result.isDelta) {
+        try {
+          const keyframe = this.deltaEncoder.encode(width, height, bufferWidth, rgba, true);
+          if (keyframe) data = keyframe.data;
+        } catch { /* use delta */ }
+      }
+      try {
+        ws.send(data);
+        state.lastSendTime = now;
+        state.droppedFrames = 0;
+        state.needsKeyframe = false;
+      } catch {
+        dead.push(ws);
+      }
+    }
+    for (const ws of dead) this.sessions.delete(ws);
+  }
+
+  private async renderTextFrame(bsp: DurableObjectStub): Promise<void> {
+    const textData = await (bsp as any).getTextScreen() as {
+      cols: number; rows: number; lines: string[];
+    } | null;
+    if (!textData) return;
+
+    const textContent = textData.lines.join("\n");
+    if (textContent === this.lastTextContent) return;
+    this.lastTextContent = textContent;
+
+    this.broadcast(encodeTextScreen(textData.cols, textData.rows, textData.lines));
   }
 
   // ── WebSocket handlers ────────────────────────────────────────────────
@@ -414,22 +467,44 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     try {
       if (message instanceof ArrayBuffer) return;
 
-      let msg: ClientMessage;
+      let msg: any;
       try { msg = JSON.parse(message); }
       catch { return; }
 
-      // Forward input to BSP (Core 0)
-      const bspStub = this.coreStubs.get(0);
-      if (!bspStub) return;
+      // Forward all input to BSP (Core 0)
+      const bsp = this.coreStubs.get(0);
+      if (!bsp) return;
 
       switch (msg.type) {
-        case "keydown":
-          await (bspStub as any).sendKeyCode(msg.code, false);
+        case "keydown": {
+          const code = msg.code as number;
+          await (bsp as any).sendKeyCode(code, false);
           break;
-        case "keyup":
-          await (bspStub as any).sendKeyCode(msg.code, true);
+        }
+        case "keyup": {
+          const code = msg.code as number;
+          await (bsp as any).sendKeyCode(code, true);
           break;
-        // TODO: mouse events
+        }
+        case "mousemove":
+          await (bsp as any).sendMouseDelta(msg.dx as number, msg.dy as number);
+          break;
+        case "mousedown":
+        case "mouseup": {
+          const idx = msg.button === 1 ? 1 : msg.button === 2 ? 2 : 0;
+          this.mouseButtons[idx] = msg.type === "mousedown";
+          await (bsp as any).sendMouseClick([...this.mouseButtons]);
+          break;
+        }
+        case "text":
+          if (msg.data) await (bsp as any).sendText(msg.data as string);
+          break;
+        case "scancodes":
+          if (msg.codes) await (bsp as any).sendScancodes(msg.codes as number[]);
+          break;
+        case "serial":
+          // TODO: serial input forwarding
+          break;
       }
     } catch { /* Never throw from WS handler */ }
   }

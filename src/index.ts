@@ -1,7 +1,11 @@
 export { LinuxVM } from "./linux-vm";
+export { CoordinatorDO } from "./coordinator-do";
+export { CpuCoreDO } from "./core-do";
 
 export interface Env {
   LINUX_VM: DurableObjectNamespace;
+  COORDINATOR: DurableObjectNamespace;
+  CPU_CORE: DurableObjectNamespace;
   ASSETS: { fetch: (request: Request | string) => Promise<Response> };
 }
 
@@ -73,6 +77,7 @@ function packAssets(assets: Record<string, ArrayBuffer>): ArrayBuffer {
 // ── Router ────────────────────────────────────────────────────────────────────
 
 const SESSION_RE = /^\/s\/([a-zA-Z0-9_-]+)$/;
+const SMP_SESSION_RE = /^\/smp\/([a-zA-Z0-9_-]+)$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -83,7 +88,81 @@ export default {
       return env.ASSETS.fetch(new Request(new URL("/index.html", request.url).toString()));
     }
 
-    // /s/:sessionId → session VM
+    // /smp/:sessionId → distributed SMP session via CoordinatorDO
+    const smpMatch = url.pathname.match(SMP_SESSION_RE);
+    if (smpMatch) {
+      if (request.headers.get("Upgrade") === "websocket") {
+        const imageKey = url.searchParams.get("image") || "aqeous";
+        const imageDef = IMAGES[imageKey] || IMAGES.aqeous;
+
+        const id = env.COORDINATOR.idFromName(`smp-${imageKey}`);
+        const stub = env.COORDINATOR.get(id);
+
+        // Check if already running
+        const statusResp = await stub.fetch(
+          new Request(new URL("/status", request.url).toString()),
+        );
+        const { running } = await statusResp.json<{ running: boolean }>();
+
+        if (!running) {
+          // Fetch BIOS ROMs
+          const [bios, vgaBios] = await Promise.all([
+            getAsset(env, "/assets/seabios.bin", request.url),
+            getAsset(env, "/assets/vgabios.bin", request.url),
+          ]);
+
+          const meta: Record<string, any> = {
+            imageKey,
+            drive: imageDef.drive,
+            memory: imageDef.memory,
+            vgaMemory: imageDef.vgaMemory,
+            label: imageDef.label,
+            noSnapshot: true, // No snapshots for SMP (yet)
+            numCores: 1, // Phase 2: single core only
+          };
+
+          const assets: Record<string, ArrayBuffer> = { bios, vgaBios };
+
+          // Get disk image
+          try {
+            const localResp = await env.ASSETS.fetch(
+              new URL(`/assets/${imageDef.file}`, request.url).toString(),
+            );
+            if (localResp.ok) {
+              assets.disk = await localResp.arrayBuffer();
+            }
+          } catch { /* not available locally */ }
+
+          if (!assets.disk && imageDef.url) {
+            meta.diskUrl = imageDef.url;
+            meta.diskFile = imageDef.file;
+          }
+
+          if (!assets.disk && !meta.diskUrl) {
+            return new Response("Disk image not found for SMP boot", { status: 500 });
+          }
+
+          assets.metadata = new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer;
+          const packed = packAssets(assets);
+
+          const initResp = await stub.fetch(
+            new Request(new URL("/init", request.url).toString(), {
+              method: "POST",
+              body: packed,
+            }),
+          );
+          if (!initResp.ok) return new Response("Failed to init SMP VM", { status: 500 });
+        }
+
+        // Forward WebSocket upgrade to coordinator
+        return stub.fetch(request);
+      }
+
+      // Regular GET → serve the same session page (client is image-agnostic)
+      return env.ASSETS.fetch(new Request(new URL("/session.html", request.url).toString()));
+    }
+
+    // /s/:sessionId → session VM (original single-DO path)
     const sessionMatch = url.pathname.match(SESSION_RE);
     if (sessionMatch) {
       // WebSocket upgrade → route to the session's DO
