@@ -15,6 +15,8 @@ interface ImageDef {
   /** Remote URL for the disk image. If set, the DO fetches + caches it in SQLite
    *  instead of the Worker sending the full binary via /init. */
   url?: string;
+  /** If true, never save/restore snapshots for this image (unstable OS) */
+  noSnapshot?: boolean;
 }
 
 const IMAGES: Record<string, ImageDef> = {
@@ -25,7 +27,7 @@ const IMAGES: Record<string, ImageDef> = {
              url: "http://www.helenos.org/releases/HelenOS-0.5.0-ia32.iso" },
   linux4:  { file: "linux4.iso",  drive: "cdrom", memory: 128, vgaMemory: 8, label: "Linux (text)",     description: "Minimal Linux kernel. Text mode only.",
              url: "https://copy.sh/v86/images/linux4.iso" },
-  aqeous:  { file: "aqeous.iso",  drive: "cdrom", memory: 32, vgaMemory: 8, label: "AqeousOS",        description: "Custom x86 OS built from scratch. Full GUI with window system." },
+  aqeous:  { file: "aqeous.iso",  drive: "cdrom", memory: 32, vgaMemory: 8, label: "AqeousOS",        description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true },
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -119,6 +121,7 @@ export default {
             memory: imageDef.memory,
             vgaMemory: imageDef.vgaMemory,
             label: imageDef.label,
+            noSnapshot: imageDef.noSnapshot || false,
           };
 
           const assets: Record<string, ArrayBuffer> = { bios, vgaBios };
