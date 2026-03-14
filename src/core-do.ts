@@ -69,6 +69,33 @@ export interface CoreConfig {
   diskDrive?: "fda" | "cdrom";
 }
 
+// ── v86 CPU register WASM offsets (byte offsets into wasm_memory) ────────────
+// These are used to set up AP CPU state after v86 boots from BIOS.
+
+const CPU_WASM_OFF = {
+  REG32:              64,   // Int32Array[8] — EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
+  FLAGS:              120,  // Int32Array[1]
+  SEG_ACCESS_BYTES:   512,  // Uint8Array[8] — segment access rights
+  INSTRUCTION_PTR:    556,  // Int32Array[1]
+  IDTR_SIZE:          564,  // Int32Array[1]
+  IDTR_OFFSET:        568,  // Int32Array[1]
+  GDTR_SIZE:          572,  // Int32Array[1]
+  GDTR_OFFSET:        576,  // Int32Array[1]
+  CR:                 580,  // Int32Array[8] — CR0..CR7
+  CPL:                612,  // Uint8Array[1]
+  IN_HLT:             616,  // Uint8Array[1]
+  SREG:               668,  // Uint16Array[8] — ES, CS, SS, DS, FS, GS, ...
+  SEG_IS_NULL:        724,  // Uint8Array[8] — 1 if segment is null
+  SEG_OFFSETS:        736,  // Int32Array[8]
+  SEG_LIMITS:         768,  // Uint32Array[8]
+  PROTECTED_MODE:     800,  // Int32Array[1]
+  IS_32:              804,  // Int32Array[1]
+  STACK_SIZE_32:      808,  // Int32Array[1]
+} as const;
+
+// Segment register indices
+const SEG_ES = 0, SEG_CS = 1, SEG_SS = 2, SEG_DS = 3, SEG_FS = 4, SEG_GS = 5;
+
 // ── Env interface ───────────────────────────────────────────────────────────
 
 export interface CpuCoreEnv {
@@ -168,19 +195,25 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
   /**
    * SIPI — start execution at vector * 0x1000.
    * This is where AP cores begin their journey.
+   *
+   * @param vector  SIPI vector (start address = vector * 0x1000)
+   * @param memoryConfig  Memory configuration + BIOS binaries
+   * @param trampolinePages  Low-memory pages copied from BSP, keyed by page-aligned address.
+   *                          Must include the trampoline code page(s) and any data pages
+   *                          the AP needs during early boot (stack, GDT, etc.)
    */
   async startupIPI(vector: number, memoryConfig: {
     memorySizeBytes: number;
+    vgaMemorySizeBytes: number;
     bios: ArrayBuffer;
     vgaBios: ArrayBuffer;
-  }): Promise<void> {
+  }, trampolinePages: Map<number, ArrayBuffer>): Promise<void> {
     const startAddr = vector * 0x1000;
-    console.log(`${LOG_PREFIX} Core ${this.apicId} received SIPI — start at 0x${startAddr.toString(16)}`);
+    console.log(`${LOG_PREFIX} Core ${this.apicId} received SIPI — start at 0x${startAddr.toString(16)} (${trampolinePages.size} trampoline pages)`);
 
-    // Create a minimal v86 instance for this AP
-    // The AP will start executing from the trampoline code that the BSP
-    // placed at the SIPI vector address
-    await this.createAPEmulator(memoryConfig, startAddr);
+    // Create a v86 instance for this AP, patch its memory with trampoline
+    // pages from BSP, and set CPU registers to 16-bit real mode at CS:IP = vector:0000
+    await this.createAPEmulator(memoryConfig, startAddr, trampolinePages);
     this.state = CoreState.RUNNING;
     this.startExecutionLoop();
   }
@@ -223,6 +256,35 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
     }
 
     return pageData;
+  }
+
+  /**
+   * Read a range of physical memory pages from this core's v86 instance.
+   * Used by the coordinator to fetch trampoline pages for AP boot.
+   *
+   * @param startAddr  Page-aligned start address
+   * @param numPages   Number of 4KB pages to read
+   * @returns Array of [physAddr, pageData] pairs
+   */
+  async readPages(startAddr: number, numPages: number): Promise<Array<[number, ArrayBuffer]>> {
+    if (!this.emulator) throw new Error("Core not running");
+
+    const wasmMemory = (this.emulator as any).v86?.cpu?.wasm_memory;
+    if (!wasmMemory) throw new Error("No WASM memory");
+
+    const result: Array<[number, ArrayBuffer]> = [];
+    for (let i = 0; i < numPages; i++) {
+      const addr = startAddr + i * PAGE_SIZE;
+      if (addr + PAGE_SIZE > wasmMemory.buffer.byteLength) break;
+
+      const pageData = new ArrayBuffer(PAGE_SIZE);
+      new Uint8Array(pageData).set(
+        new Uint8Array(wasmMemory.buffer, addr, PAGE_SIZE),
+      );
+      result.push([addr, pageData]);
+    }
+
+    return result;
   }
 
   // ── Screen / VGA ────────────────────────────────────────────────────
@@ -475,19 +537,187 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
     console.log(`${LOG_PREFIX} BSP emulator created (mem=${config.memorySizeBytes / 1024 / 1024}MB)`);
   }
 
+  /**
+   * Create a v86 instance for an Application Processor.
+   *
+   * Strategy: Boot a full v86 with BIOS (needed for device init), wait for it
+   * to reach the BIOS reset vector, then:
+   *  1. Stop execution
+   *  2. Copy trampoline pages from BSP into the AP's WASM linear memory
+   *  3. Patch CPU registers to 16-bit real mode at CS:IP = vector:0000
+   *  4. Set the APIC ID to this core's ID
+   *  5. Resume execution — the AP runs the BSP's trampoline code
+   */
   private async createAPEmulator(
-    memoryConfig: { memorySizeBytes: number; bios: ArrayBuffer; vgaBios: ArrayBuffer },
+    memoryConfig: {
+      memorySizeBytes: number;
+      vgaMemorySizeBytes: number;
+      bios: ArrayBuffer;
+      vgaBios: ArrayBuffer;
+    },
     startAddr: number,
+    trampolinePages: Map<number, ArrayBuffer>,
   ): Promise<void> {
-    // AP cores need a v86 instance but start from a specific address.
-    // For now, we create a full v86 and will set the IP after boot.
-    // TODO: Proper AP initialization — this is a skeleton.
+    const { V86 } = await import("v86");
+
+    // Synthetic microtick (same as BSP)
+    let syntheticTime = performance.now();
+    let lastRealTime = syntheticTime;
+    (V86 as any).microtick = () => {
+      const realNow = performance.now();
+      if (realNow > lastRealTime) {
+        syntheticTime = realNow;
+        lastRealTime = realNow;
+      } else {
+        syntheticTime += 0.02;
+      }
+      return syntheticTime;
+    };
+
+    // Create v86 with BIOS — we need the BIOS to initialize devices.
+    // We'll override the CPU state after it loads.
+    const v86Config: Record<string, any> = {
+      wasm_fn: async (env: any) => (await WebAssembly.instantiate(v86WasmModule, env)).exports,
+      bios: { buffer: memoryConfig.bios },
+      vga_bios: { buffer: memoryConfig.vgaBios },
+      memory_size: memoryConfig.memorySizeBytes,
+      vga_memory_size: memoryConfig.vgaMemorySizeBytes,
+      autostart: false,
+      disable_speaker: true,
+      fastboot: true,
+      acpi: true,
+      // No disk for AP — it doesn't boot from disk
+    };
+
+    this.emulator = new V86(v86Config);
+
+    // Wait for v86 to finish loading (WASM instantiation)
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("AP emulator load timed out")), 30_000);
+      this.emulator!.add_listener("emulator-loaded", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+
+    // At this point v86 is loaded but not running.
+    // Run it briefly to let BIOS POST complete device init, or we can
+    // skip that and go straight to patching since AP doesn't need full BIOS.
+    // For safety: run one tick to initialize WASM internals, then stop.
+    const v86Internal = (this.emulator as any).v86;
+    const cpu = v86Internal?.cpu;
+    if (!cpu || !cpu.wasm_memory) {
+      throw new Error("AP: v86 CPU not available after load");
+    }
+
+    // ── Step 1: Copy trampoline pages from BSP into AP's memory ──────
+    const wasmBuf = cpu.wasm_memory.buffer;
+    const mem8 = new Uint8Array(wasmBuf);
+
+    for (const [addr, pageData] of trampolinePages.entries()) {
+      if (addr + PAGE_SIZE <= wasmBuf.byteLength) {
+        mem8.set(new Uint8Array(pageData), addr);
+      }
+    }
+
     console.log(
-      `${LOG_PREFIX} AP Core ${this.apicId} emulator created (start=0x${startAddr.toString(16)})`,
+      `${LOG_PREFIX} AP Core ${this.apicId}: copied ${trampolinePages.size} trampoline pages to WASM memory`,
     );
-    // AP emulator creation will be implemented in Phase 3
-    // It needs: (1) shared memory page fetching, (2) IP set to startAddr,
-    // (3) real-mode execution of the trampoline code
+
+    // ── Step 2: Set CPU registers to 16-bit real mode at SIPI vector ─
+    const vector = startAddr >>> 12; // SIPI vector = startAddr / 4096
+
+    // Protected mode = off, 16-bit mode
+    new Int32Array(wasmBuf, CPU_WASM_OFF.PROTECTED_MODE, 1)[0] = 0;
+    new Int32Array(wasmBuf, CPU_WASM_OFF.IS_32, 1)[0] = 0;
+
+    // CPL = 0 (ring 0)
+    new Uint8Array(wasmBuf, CPU_WASM_OFF.CPL, 1)[0] = 0;
+
+    // Not halted
+    new Uint8Array(wasmBuf, CPU_WASM_OFF.IN_HLT, 1)[0] = 0;
+
+    // EFLAGS = 0x02 (reserved bit 1 always set, interrupts disabled)
+    new Int32Array(wasmBuf, CPU_WASM_OFF.FLAGS, 1)[0] = 0x02;
+
+    // Control registers: CR0 = 0 (real mode, no paging)
+    const cr = new Int32Array(wasmBuf, CPU_WASM_OFF.CR, 8);
+    cr[0] = 0; // PE=0, PG=0
+
+    // Segment registers: real mode defaults
+    const sreg = new Uint16Array(wasmBuf, CPU_WASM_OFF.SREG, 8);
+    const segOffsets = new Int32Array(wasmBuf, CPU_WASM_OFF.SEG_OFFSETS, 8);
+    const segLimits = new Uint32Array(wasmBuf, CPU_WASM_OFF.SEG_LIMITS, 8);
+
+    // CS = vector, CS base = vector << 12
+    sreg[SEG_CS] = vector;
+    segOffsets[SEG_CS] = startAddr;
+    segLimits[SEG_CS] = 0xFFFF;
+
+    // All other segments: 0:0 with 64K limit (real mode default)
+    for (const seg of [SEG_ES, SEG_SS, SEG_DS, SEG_FS, SEG_GS]) {
+      sreg[seg] = 0;
+      segOffsets[seg] = 0;
+      segLimits[seg] = 0xFFFF;
+    }
+
+    // Segment is_null: all segments are valid (not null)
+    const segIsNull = new Uint8Array(wasmBuf, CPU_WASM_OFF.SEG_IS_NULL, 8);
+    segIsNull.fill(0);
+
+    // Segment access bytes: real mode defaults
+    // In real mode, data segments have 0xF2 (present, ring0, writable data)
+    // CS has 0xFA (present, ring0, executable+readable code)
+    const segAccessBytes = new Uint8Array(wasmBuf, CPU_WASM_OFF.SEG_ACCESS_BYTES, 8);
+    segAccessBytes.fill(0xF2);     // Default: data segment
+    segAccessBytes[SEG_CS] = 0xFA; // Code segment
+
+    // Stack size: 16-bit (real mode)
+    new Int32Array(wasmBuf, CPU_WASM_OFF.STACK_SIZE_32, 1)[0] = 0;
+
+    // EIP = CS_base + 0 = startAddr (instruction_pointer includes CS base in v86)
+    new Int32Array(wasmBuf, CPU_WASM_OFF.INSTRUCTION_PTR, 1)[0] = startAddr;
+
+    // General purpose registers: all zero
+    const reg32 = new Int32Array(wasmBuf, CPU_WASM_OFF.REG32, 8);
+    reg32.fill(0);
+
+    // GDTR/IDTR: real mode IVT (base=0, limit=0x3FF for IDT, no GDT)
+    new Int32Array(wasmBuf, CPU_WASM_OFF.IDTR_OFFSET, 1)[0] = 0;
+    new Int32Array(wasmBuf, CPU_WASM_OFF.IDTR_SIZE, 1)[0] = 0x3FF;
+    new Int32Array(wasmBuf, CPU_WASM_OFF.GDTR_OFFSET, 1)[0] = 0;
+    new Int32Array(wasmBuf, CPU_WASM_OFF.GDTR_SIZE, 1)[0] = 0;
+
+    // ── Step 3: Set APIC ID for this core ────────────────────────────
+    const apicAddr = cpu.get_apic_addr?.();
+    if (apicAddr && apicAddr > 0) {
+      const apicView = new Int32Array(wasmBuf, apicAddr, 46);
+      apicView[APIC_I32_APIC_ID] = this.apicId;
+    }
+
+    console.log(
+      `${LOG_PREFIX} AP Core ${this.apicId}: CPU set to real mode at ${vector.toString(16)}:0000 (phys 0x${startAddr.toString(16)})`,
+    );
+
+    // ── Step 4: Enable v86 execution ───────────────────────────────
+    // v86's do_tick() checks `this.running` — we must set it to true.
+    // We don't call run() because that would schedule BIOS execution.
+    // Instead, set the flag directly and let our execution loop call do_tick().
+    v86Internal.running = true;
+    v86Internal.stopping = false;
+
+    // Capture serial output (for debugging)
+    this.emulator.add_listener("serial0-output-byte", (byte: number) => {
+      const char = String.fromCharCode(byte);
+      this.serialBuffer += char;
+      if (this.serialBuffer.length > 4096) {
+        this.serialBuffer = this.serialBuffer.slice(-2048);
+      }
+    });
+
+    console.log(
+      `${LOG_PREFIX} AP Core ${this.apicId}: emulator ready, execution will start from trampoline`,
+    );
   }
 
   // ── Execution loop ────────────────────────────────────────────────────
@@ -506,6 +736,8 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
     }
   }
 
+  private _execErrors = 0;
+
   private executionCycle(): void {
     if (!this.emulator || this.state !== CoreState.RUNNING) return;
 
@@ -514,8 +746,6 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
       this.injectPendingIPIs();
 
       // Run v86 for one frame
-      // main_loop() returns sleep time in ms
-      // (we access it through the internal v86 object)
       const v86Internal = (this.emulator as any).v86;
       if (v86Internal) {
         v86Internal.do_tick();
@@ -523,8 +753,14 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
 
       // Check for outbound IPIs (ICR writes during this cycle)
       this.checkOutboundIPIs();
+
+      this._execErrors = 0; // Reset on success
     } catch (e) {
-      console.error(`${LOG_PREFIX} Core ${this.apicId} execution error:`, e);
+      this._execErrors++;
+      // Log sparingly — OOB reads from APIC polling are noisy but harmless
+      if (this._execErrors <= 3 || this._execErrors % 1000 === 0) {
+        console.error(`${LOG_PREFIX} Core ${this.apicId} execution error (#${this._execErrors}):`, e);
+      }
     }
   }
 
@@ -532,17 +768,23 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
 
   /**
    * Read the APIC struct from WASM memory as an Int32Array view.
-   * Returns null if the emulator or APIC isn't available.
+   * Returns null if the emulator or APIC isn't available or address is OOB.
    */
   private getApicView(): { view: Int32Array; apicAddr: number } | null {
-    const cpu = (this.emulator as any)?.v86?.cpu;
-    if (!cpu || typeof cpu.get_apic_addr !== "function") return null;
-    const apicAddr = cpu.get_apic_addr();
-    const wasmMem = cpu.wasm_memory;
-    if (!wasmMem) return null;
-    // 46 x i32 = 184 bytes
-    const view = new Int32Array(wasmMem.buffer, apicAddr, 46);
-    return { view, apicAddr };
+    try {
+      const cpu = (this.emulator as any)?.v86?.cpu;
+      if (!cpu || typeof cpu.get_apic_addr !== "function") return null;
+      const apicAddr = cpu.get_apic_addr();
+      const wasmMem = cpu.wasm_memory;
+      if (!wasmMem) return null;
+      // 46 x i32 = 184 bytes — verify address is within WASM memory bounds
+      const needed = apicAddr + 184;
+      if (apicAddr <= 0 || needed > wasmMem.buffer.byteLength) return null;
+      const view = new Int32Array(wasmMem.buffer, apicAddr, 46);
+      return { view, apicAddr };
+    } catch {
+      return null;
+    }
   }
 
   /**

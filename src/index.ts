@@ -74,10 +74,24 @@ function packAssets(assets: Record<string, ArrayBuffer>): ArrayBuffer {
   return packed;
 }
 
+// ── Helpers: COOP/COEP for SharedArrayBuffer (required by QEMU pthreads) ────
+
+function withCoopCoep(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  headers.set("Cross-Origin-Embedder-Policy", "require-corp");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 const SESSION_RE = /^\/s\/([a-zA-Z0-9_-]+)$/;
 const SMP_SESSION_RE = /^\/smp\/([a-zA-Z0-9_-]+)$/;
+const QEMU_RE = /^\/qemu(?:\/([a-zA-Z0-9_-]*))?$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -86,6 +100,17 @@ export default {
     // GET / → landing page (served from static index.html)
     if (url.pathname === "/") {
       return env.ASSETS.fetch(new Request(new URL("/index.html", request.url).toString()));
+    }
+
+    // ── /qemu or /qemu/:sessionId → QEMU-WASM page (browser-side emulation) ─
+    // Serves qemu.html with COOP+COEP headers for SharedArrayBuffer.
+    // QEMU WASM + BIOS + disk images are served from /qemu/* and /assets/* below.
+    const qemuMatch = url.pathname.match(QEMU_RE);
+    if (qemuMatch) {
+      const resp = await env.ASSETS.fetch(
+        new Request(new URL("/qemu.html", request.url).toString()),
+      );
+      return withCoopCoep(resp);
     }
 
     // /smp/:sessionId → distributed SMP session via CoordinatorDO
@@ -118,7 +143,7 @@ export default {
             vgaMemory: imageDef.vgaMemory,
             label: imageDef.label,
             noSnapshot: true, // No snapshots for SMP (yet)
-            numCores: 1, // Phase 2: single core only
+            numCores: 2, // Phase 3: distributed SMP (BSP + 1 AP)
           };
 
           const assets: Record<string, ArrayBuffer> = { bios, vgaBios };
@@ -265,6 +290,14 @@ export default {
     }
 
     // Everything else → static assets
-    return env.ASSETS.fetch(request);
+    // Add COOP/COEP headers for all assets when serving QEMU-related files
+    // (needed for SharedArrayBuffer in the browser)
+    const assetResp = await env.ASSETS.fetch(request);
+    if (url.pathname.startsWith("/qemu/") ||
+        url.pathname === "/coi-serviceworker.js" ||
+        url.pathname.startsWith("/assets/")) {
+      return withCoopCoep(assetResp);
+    }
+    return assetResp;
   },
 };

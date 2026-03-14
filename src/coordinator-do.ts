@@ -18,7 +18,7 @@ import {
 } from "./types";
 import { DeltaEncoder, encodeSerialData, encodeStatus, encodeTextScreen } from "./delta-encoder";
 import { PageDirectory } from "./memory-coherence";
-import { IPIRouter, IOAPIC, type IPIMessage } from "./ipi-handler";
+import { IPIRouter, IOAPIC, DeliveryMode, type IPIMessage } from "./ipi-handler";
 import { unpackAssets } from "./sqlite-storage";
 
 // ── Env ──────────────────────────────────────────────────────────────────────
@@ -63,6 +63,12 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   private booted = false;
   private bootError: string | null = null;
   private cachedAssets: Map<string, ArrayBuffer> | null = null;
+
+  // ── Cached BIOS binaries (needed for AP core creation after boot) ────
+  private biosData: ArrayBuffer | null = null;
+  private vgaBiosData: ArrayBuffer | null = null;
+  private memorySizeBytes: number = 0;
+  private vgaMemorySizeBytes: number = 0;
 
   constructor(ctx: DurableObjectState, env: CoordinatorEnv) {
     super(ctx, env);
@@ -180,8 +186,15 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       }
       if (!disk) throw new Error("No disk image: not provided inline and no URL configured");
 
-      // Initialize memory coherence
+      // Cache BIOS binaries for AP creation later
       const memoryBytes = memorySizeMB * 1024 * 1024;
+      const vgaMemoryBytes = vgaMemoryMB * 1024 * 1024;
+      this.biosData = bios;
+      this.vgaBiosData = vgaBios;
+      this.memorySizeBytes = memoryBytes;
+      this.vgaMemorySizeBytes = vgaMemoryBytes;
+
+      // Initialize memory coherence
       this.pageDir = new PageDirectory(memoryBytes);
 
       // Initialize IPI routing
@@ -191,17 +204,72 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
       this.ipiRouter.onCoreCreate = async (apicId) => {
         await this.createCore(apicId, false);
+        // Initialize the AP core — it won't create an emulator yet,
+        // just sets up state and waits for SIPI
+        const stub = this.coreStubs.get(apicId);
+        if (stub) {
+          const coordId = this.ctx.id.toString();
+          await (stub as any).init(
+            {
+              apicId,
+              isBSP: false,
+              memorySizeBytes: this.memorySizeBytes,
+              vgaMemorySizeBytes: this.vgaMemorySizeBytes,
+            },
+            coordId,
+          );
+        }
       };
 
       this.ipiRouter.onCoreSIPI = async (apicId, vector) => {
         const stub = this.coreStubs.get(apicId);
-        if (stub) {
-          await (stub as any).startupIPI(vector, {
-            memorySizeBytes: memoryBytes,
-            bios: bios,
-            vgaBios: vgaBios,
-          });
+        if (!stub) return;
+
+        // The AP needs the trampoline code that BSP wrote to low memory.
+        // Fetch pages from BSP's WASM memory around the SIPI vector address.
+        // AqeousOS writes trampoline at (vector << 12) and data above it.
+        // We grab a generous range: 8 pages below the vector page through
+        // 16 pages above it (covers stack, GDT, IDT, pmode code).
+        const bsp = this.coreStubs.get(0);
+        const trampolinePages = new Map<number, ArrayBuffer>();
+
+        if (bsp) {
+          const baseAddr = vector * 0x1000;
+          // Fetch low memory pages 0x0000-0x20000 (first 128KB)
+          // This covers: IVT (0x0000), BDA (0x400), trampoline + stack area
+          // AqeousOS AP stacks start at 8192 (0x2000), vector is typically
+          // at (AP_stacks + coreIndex*8192 - 4096)
+          const lowMemPages = 32; // 32 pages = 128KB
+          const pages = await (bsp as any).readPages(0, lowMemPages) as Array<[number, ArrayBuffer]>;
+          for (const [addr, data] of pages) {
+            trampolinePages.set(addr, data);
+          }
+
+          // Also grab the specific trampoline page and surroundings
+          // in case the kernel placed them above 128KB
+          if (baseAddr >= lowMemPages * 4096) {
+            const extraStart = baseAddr - 4096; // one page below
+            const extraPages = 8; // 8 pages (32KB)
+            const extra = await (bsp as any).readPages(
+              Math.max(0, extraStart), extraPages,
+            ) as Array<[number, ArrayBuffer]>;
+            for (const [addr, data] of extra) {
+              trampolinePages.set(addr, data);
+            }
+          }
+
+          console.log(
+            `${LOG_PREFIX} Fetched ${trampolinePages.size} pages from BSP for AP ${apicId} ` +
+            `(SIPI vector=0x${vector.toString(16)}, addr=0x${baseAddr.toString(16)})`,
+          );
         }
+
+        await (stub as any).startupIPI(vector, {
+          memorySizeBytes: this.memorySizeBytes,
+          vgaMemorySizeBytes: this.vgaMemorySizeBytes,
+          bios: this.biosData,
+          vgaBios: this.vgaBiosData,
+        }, trampolinePages);
       };
 
       // Initialize IOAPIC (24 entries, routes to cores)
@@ -301,6 +369,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     }
 
     try {
+      // INIT IPI: reset the core to wait for SIPI
+      if (ipi.mode === DeliveryMode.INIT) {
+        await (stub as any).initReset();
+        return;
+      }
+
+      // Standard IPI: inject into LAPIC IRR
       await (stub as any).injectInterrupt(ipi);
     } catch (e) {
       console.error(`${LOG_PREFIX} IPI delivery to core ${targetApicId} failed:`, e);

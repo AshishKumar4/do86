@@ -132,7 +132,7 @@ export class IPIRouter {
     await Promise.all(targets.map((t) => this.deliverFn(t, ipi)));
   }
 
-  /** Resolve which cores an IPI should be delivered to. */
+  /** Resolve which cores an IPI should be delivered to (only known cores). */
   private resolveTargets(ipi: IPIMessage): number[] {
     if (ipi.to === -2) {
       // ALL_INCLUDING_SELF
@@ -149,15 +149,38 @@ export class IPIRouter {
     return [];
   }
 
+  /**
+   * Resolve targets for INIT/boot IPIs — includes unknown specific targets.
+   * Unlike resolveTargets(), this returns the raw destination even if the
+   * core doesn't exist yet, because INIT is how new cores get created.
+   */
+  private resolveTargetsForBoot(ipi: IPIMessage): number[] {
+    if (ipi.to === -2) {
+      return [...this.knownCores];
+    }
+    if (ipi.to === -3) {
+      return [...this.knownCores].filter((id) => id !== ipi.from);
+    }
+    if (ipi.to >= 0) {
+      // Return the target even if not in knownCores — INIT creates new cores
+      return [ipi.to];
+    }
+    return [];
+  }
+
   /** Handle INIT IPI — resets target core, prepares for SIPI. */
   private async handleINIT(ipi: IPIMessage): Promise<void> {
-    const targets = this.resolveTargets(ipi);
+    // For INIT, we resolve targets but also include unknown specific targets
+    // because INIT is how new cores get created (the BSP sends INIT to an
+    // APIC ID that doesn't exist yet).
+    const targets = this.resolveTargetsForBoot(ipi);
     for (const targetId of targets) {
       if (targetId === ipi.from) continue; // INIT to self is unusual, skip
 
       if (!this.knownCores.has(targetId)) {
         // Core doesn't exist yet — create it
         if (this.onCoreCreate) {
+          console.log(`[IPI] INIT to unknown core ${targetId} — creating`);
           await this.onCoreCreate(targetId);
           this.knownCores.add(targetId);
         }
@@ -173,6 +196,7 @@ export class IPIRouter {
 
   /** Handle Startup IPI — starts AP execution at vector*0x1000. */
   private async handleSIPI(ipi: IPIMessage): Promise<void> {
+    // For SIPI, the target should already be known (created by INIT)
     const targets = this.resolveTargets(ipi);
     for (const targetId of targets) {
       if (!this.waitingForSipi.has(targetId)) {
@@ -183,6 +207,7 @@ export class IPIRouter {
 
       // Notify coordinator to actually start the core
       if (this.onCoreSIPI) {
+        console.log(`[IPI] SIPI to core ${targetId} — vector=0x${ipi.vector.toString(16)}`);
         await this.onCoreSIPI(targetId, ipi.vector);
       }
     }

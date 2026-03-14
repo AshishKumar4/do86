@@ -1,5 +1,19 @@
 # QEMU-WASM Build Plan for Durable Objects
 
+## BUILD SUCCEEDED — 2026-03-14
+
+**QEMU 10.1 `i386-softmmu` compiled to WebAssembly with TCI interpreter.**
+
+| Artifact | Size | Gzipped |
+|---|---|---|
+| `qemu-system-i386.wasm` | **27 MB** | **7.4 MB** |
+| `qemu-system-i386.js` | 343 KB | — |
+| `qemu-system-i386.worker.js` | 6.5 KB | — |
+
+Build config: Emscripten 3.1.50, QEMU 10.1.0, TCI interpreter, `wasm` coroutine backend, i386-softmmu target. All dependencies (glib 2.75.0, pixman 0.42.2, zlib 1.3.1, libffi) cross-compiled for Emscripten without Docker.
+
+---
+
 ## Executive Summary
 
 Two proven projects have successfully compiled QEMU to WebAssembly:
@@ -193,14 +207,17 @@ emconfigure ./configure \
 | Guest agent | Not needed |
 | AHCI | Can enable later if needed |
 
-### Estimated Binary Size
+### Actual Binary Size
 
-Based on pebble-qemu-wasm's 33MB for ARM TCI:
-- i386 target is larger (more instructions to decode) — estimate ~35-40MB
-- With LTO and stripping: ~25-30MB
-- gzip compressed: ~8-10MB
+| Artifact | Raw | Gzipped |
+|---|---|---|
+| `qemu-system-i386.wasm` | 27 MB | 7.4 MB |
+| `qemu-system-i386.js` | 343 KB | — |
+| `qemu-system-i386.worker.js` | 6.5 KB | — |
 
-**Worker size limit**: 10MB for the Worker script itself. BUT: the WASM binary can be loaded from R2 at runtime using `WebAssembly.instantiate()` with fetched bytes, or stored as a DO asset.
+Compared to pebble-qemu-wasm's 33 MB for ARM TCI — our i386 build is smaller (27 MB) thanks to LTO and fewer device models.
+
+**Worker size limit**: 10 MB for the Worker script itself. The WASM binary at 7.4 MB gzipped can be loaded from R2 at runtime using `WebAssembly.instantiate()` with fetched bytes.
 
 ---
 
@@ -341,37 +358,47 @@ Before integrating with DO, verify it works in a browser:
 
 ---
 
-## Configure Test Results (from this sandbox)
+## Actual Build Results (2026-03-14)
 
-We successfully ran `emconfigure ./configure` against QEMU 10.1.0 with Emscripten 3.1.50. Results:
+### Full build completed successfully — no Docker required
 
-### What worked
-- Emscripten detected as C compiler: `emcc -m32 (emscripten 3.1.50)`
-- Host CPU detected as `wasm32`
-- `--with-coroutine=wasm` accepted — **QEMU 10.1 has native WASM coroutine support!** (not `fiber` from older builds)
-- `--enable-tcg-interpreter` accepted
-- Thread detection passed (`Run-time dependency threads found: YES`)
-- All C compiler flag checks passed
+All dependencies were cross-compiled from source on a bare Linux sandbox (Ubuntu 22.04, 4 cores, 11 GB RAM, no Docker).
 
-### What failed (expected)
-- `glib-2.0` not found — requires pre-compiling glib for Emscripten (Docker build handles this)
-- No `pkg-config` configured for cross-compilation
+### Dependency build order (all compiled for Emscripten wasm32)
 
-### Key Discovery
-QEMU 10.1's meson build system has changed the coroutine backend options from older versions:
+| Dep | Version | Build time | Notes |
+|---|---|---|---|
+| zlib | 1.3.1 | ~30s | `emconfigure ./configure --prefix=$TARGET --static` |
+| libffi | adbcf2b2 | ~60s | `--host=wasm32-unknown-linux --disable-raw-api --disable-structs` |
+| glib | 2.75.0 | ~5 min | Required wrapper scripts to suppress `-Werror=unused-command-line-argument`. Patched config.h to remove HAVE_CLOSE_RANGE, HAVE_EPOLL_CREATE, HAVE_KQUEUE, HAVE_POSIX_SPAWN, HAVE_FALLOCATE. |
+| pixman | 0.42.2 | ~2 min | Standard autotools build |
+
+### QEMU configure flags (exact command that worked)
+```bash
+emconfigure ./configure \
+  --static \
+  --target-list=i386-softmmu \
+  --cpu=wasm32 \
+  --without-default-features \
+  --enable-system \
+  --enable-tcg-interpreter \
+  --with-coroutine=wasm \
+  --disable-tools --disable-docs --disable-pie --disable-guest-agent \
+  --extra-cflags="-O2 -DNDEBUG -DG_DISABLE_ASSERT -sASYNCIFY=1 -sFORCE_FILESYSTEM \
+    -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=256MB -sWASM_BIGINT -matomics -mbulk-memory \
+    -pthread -flto -I$TARGET/include -I$TARGET/include/glib-2.0 \
+    -I$TARGET/lib/glib-2.0/include -I$TARGET/include/pixman-1" \
+  --extra-ldflags="-flto -L$TARGET/lib \
+    -sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,FS"
 ```
-Old (qemu-wasm 8.2): --with-coroutine=fiber
-New (QEMU 10.1):     --with-coroutine=wasm    ← native WASM support!
-```
 
-This means QEMU 10.1 has **first-class Emscripten/WASM support** baked into the official source. The TCI interpreter for 32-bit guests is officially part of QEMU 10.1.
+### Key discoveries
+1. QEMU 10.1 has native `--with-coroutine=wasm` (not `fiber` from older builds)
+2. TCI interpreter for 32-bit guests is officially part of QEMU 10.1
+3. zlib and libffi headers needed to be copied into Emscripten sysroot — meson's pkg-config integration doesn't propagate include paths to all build targets
+4. glib requires an emcc wrapper script that converts `-Werror=unused-command-line-argument` to `-Wno-error=...` because Emscripten's `-sWASM_BIGINT` etc. are linker flags that generate warnings during compilation
 
-### Next step
-The build requires a Docker environment with glib, pixman, zlib, and libffi pre-compiled for Emscripten. The Dockerfiles from both ktock/qemu-wasm and pebble-qemu-wasm provide this. The most straightforward path is:
-
-1. Use QEMU 10.1's own `tests/docker/dockerfiles/emsdk-wasm32-cross.docker` as the base image
-2. Overlay the configure command above
-3. Build with `ninja -j$(nproc) qemu-system-i386.js`
+### Total build time: ~15 minutes (from source, no Docker, 4 cores)
 
 ---
 
