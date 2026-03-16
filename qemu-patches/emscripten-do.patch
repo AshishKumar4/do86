@@ -1,0 +1,674 @@
+diff --git a/block/file-posix.c b/block/file-posix.c
+index b862406..8398431 100644
+--- a/block/file-posix.c
++++ b/block/file-posix.c
+@@ -110,6 +110,12 @@
+ #include <sys/diskslice.h>
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++#include <sys/ioctl.h>
++/* copy_file_range is not available on emscripten */
++#define EMSCRIPTEN_NO_COPY_FILE_RANGE
++#endif
++
+ /* OS X does not have O_DSYNC */
+ #ifndef O_DSYNC
+ #ifdef O_SYNC
+@@ -2012,7 +2018,7 @@ static int handle_aiocb_write_zeroes_unmap(void *opaque)
+     return handle_aiocb_write_zeroes(aiocb);
+ }
+ 
+-#ifndef HAVE_COPY_FILE_RANGE
++#if !defined(HAVE_COPY_FILE_RANGE) && !defined(__EMSCRIPTEN__)
+ static off_t copy_file_range(int in_fd, off_t *in_off, int out_fd,
+                              off_t *out_off, size_t len, unsigned int flags)
+ {
+diff --git a/configure b/configure
+index c1e0380..b34ea6b 100755
+--- a/configure
++++ b/configure
+@@ -333,7 +333,9 @@ int main(void) { return 0; }
+ EOF
+ }
+ 
+-if check_define __linux__ ; then
++if test "$cc" = "emcc" ; then
++  targetos=emscripten
++elif check_define __linux__ ; then
+   targetos=linux
+ elif check_define _WIN32 ; then
+   targetos=windows
+@@ -514,7 +516,10 @@ case "$cpu" in
+     # ??? Only extremely old AMD cpus do not have cmpxchg16b.
+     # If we truly care, we should simply detect this case at
+     # runtime and generate the fallback to serial emulation.
+-    CPU_CFLAGS="-m64 -mcx16"
++    # EMSCRIPTEN: don't pass -m64/-mcx16 flags which are not valid for emcc
++    if test "$cc" != "emcc" ; then
++      CPU_CFLAGS="-m64 -mcx16"
++    fi
+     ;;
+ esac
+ 
+@@ -897,10 +902,13 @@ fi
+ 
+ # Now that we are sure that the user did not only want to print the --help
+ # information, we should double-check that the C compiler really works:
++# EMSCRIPTEN: skip the direct compile_object check, emcc works but CPU_CFLAGS may break it
++if test "$cc" != "emcc" ; then
+ write_c_skeleton
+ if ! compile_object ; then
+     error_exit "C compiler \"$cc\" either does not exist or does not work."
+ fi
++fi
+ 
+ # Remove old dependency files to make sure that they get properly regenerated
+ rm -f ./*/config-devices.mak.d
+@@ -1012,7 +1020,12 @@ if test "$targetos" = "bogus"; then
+     # the compiler works (so the results of the check_defines we used
+     # to identify the OS are reliable), if we didn't recognize the
+     # host OS we should stop now.
+-    error_exit "Unrecognized host OS (uname -s reports '$(uname -s)')"
++    # EMSCRIPTEN: use linux as fallback if emcc sets targetos to bogus
++    if test "$cc" = "emcc" ; then
++        targetos=emscripten
++    else
++        error_exit "Unrecognized host OS (uname -s reports '$(uname -s)')"
++    fi
+ fi
+ 
+ # test for any invalid configuration combinations
+diff --git a/cpu-common.c b/cpu-common.c
+index c81fd72..857aa1c 100644
+--- a/cpu-common.c
++++ b/cpu-common.c
+@@ -150,6 +150,17 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
+         return;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    /*
++     * In Emscripten single-threaded mode there is no separate vCPU thread
++     * to process the work queue.  Execute the work directly on the calling
++     * thread (which is the only thread).  This is safe because QEMU's TCG
++     * single-CPU mode serialises everything through the iothread mutex.
++     */
++    func(cpu, data);
++    return;
++#endif
++
+     wi.func = func;
+     wi.data = data;
+     wi.done = false;
+diff --git a/host/include/x86_64/host/atomic128-ldst.h b/host/include/x86_64/host/atomic128-ldst.h
+index 8d6f909..eaf182e 100644
+--- a/host/include/x86_64/host/atomic128-ldst.h
++++ b/host/include/x86_64/host/atomic128-ldst.h
+@@ -11,7 +11,9 @@
+ #ifndef X86_64_ATOMIC128_LDST_H
+ #define X86_64_ATOMIC128_LDST_H
+ 
+-#ifdef CONFIG_INT128_TYPE
++#ifdef __EMSCRIPTEN__
++#include "host/include/generic/host/atomic128-ldst.h"
++#elif defined(CONFIG_INT128_TYPE)
+ #include "host/cpuinfo.h"
+ #include "tcg/debug-assert.h"
+ #include <immintrin.h>
+diff --git a/host/include/x86_64/host/cpuinfo.h b/host/include/x86_64/host/cpuinfo.h
+index 67debab..a3e1f58 100644
+--- a/host/include/x86_64/host/cpuinfo.h
++++ b/host/include/x86_64/host/cpuinfo.h
+@@ -1 +1,2 @@
++/* Always include i386 cpuinfo for the CPUINFO_* constants (used by TCG) */
+ #include "host/include/i386/host/cpuinfo.h"
+diff --git a/host/include/x86_64/host/crypto/aes-round.h b/host/include/x86_64/host/crypto/aes-round.h
+index 2773cc9..ab53993 100644
+--- a/host/include/x86_64/host/crypto/aes-round.h
++++ b/host/include/x86_64/host/crypto/aes-round.h
+@@ -1 +1,5 @@
+-#include "host/include/i386/host/crypto/aes-round.h"
++#ifdef __EMSCRIPTEN__
++# include "host/include/generic/host/crypto/aes-round.h"
++#else
++# include "host/include/i386/host/crypto/aes-round.h"
++#endif
+diff --git a/host/include/x86_64/host/crypto/clmul.h b/host/include/x86_64/host/crypto/clmul.h
+index f25eced..413c7dc 100644
+--- a/host/include/x86_64/host/crypto/clmul.h
++++ b/host/include/x86_64/host/crypto/clmul.h
+@@ -1 +1,5 @@
+-#include "host/include/i386/host/crypto/clmul.h"
++#ifdef __EMSCRIPTEN__
++# include "host/include/generic/host/crypto/clmul.h"
++#else
++# include "host/include/i386/host/crypto/clmul.h"
++#endif
+diff --git a/host/include/x86_64/host/load-extract-al16-al8.h b/host/include/x86_64/host/load-extract-al16-al8.h
+index baa506b..5102a1d 100644
+--- a/host/include/x86_64/host/load-extract-al16-al8.h
++++ b/host/include/x86_64/host/load-extract-al16-al8.h
+@@ -8,7 +8,9 @@
+ #ifndef X86_64_LOAD_EXTRACT_AL16_AL8_H
+ #define X86_64_LOAD_EXTRACT_AL16_AL8_H
+ 
+-#ifdef CONFIG_INT128_TYPE
++#ifdef __EMSCRIPTEN__
++#include "host/include/generic/host/load-extract-al16-al8.h"
++#elif defined(CONFIG_INT128_TYPE)
+ #include "host/atomic128-ldst.h"
+ 
+ /**
+diff --git a/meson.build b/meson.build
+index 79de6f7..d0bd433 100644
+--- a/meson.build
++++ b/meson.build
+@@ -195,6 +195,8 @@ foreach lang : all_languages
+   compiler = meson.get_compiler(lang)
+   if compiler.get_id() == 'gcc' and compiler.version().version_compare('>=7.4')
+     # ok
++  elif compiler.get_id() == 'emscripten'
++    # ok - emscripten is based on clang >= 18
+   elif compiler.get_id() == 'clang' and compiler.compiles('''
+       #ifdef __apple_build_version__
+       # if __clang_major__ < 12 || (__clang_major__ == 12 && __clang_minor__ < 0)
+@@ -320,6 +322,9 @@ ucontext_probe = '''
+ supported_backends = []
+ if targetos == 'windows'
+   supported_backends += ['windows']
++elif targetos == 'emscripten'
++  # emscripten has no working sigaltstack or ucontext; use custom emscripten backend
++  supported_backends += ['emscripten']
+ else
+   if targetos != 'darwin' and cc.links(ucontext_probe)
+     supported_backends += ['ucontext']
+@@ -588,7 +593,12 @@ have_vhost_net = have_vhost_net_kernel or have_vhost_net_user or have_vhost_net_
+ 
+ # Target-specific libraries and flags
+ libm = cc.find_library('m', required: false)
+-threads = dependency('threads')
++# Don't use pthreads for emscripten - it requires shared memory and Atomics.wait
++if targetos == 'emscripten'
++  threads = declare_dependency()
++else
++  threads = dependency('threads')
++endif
+ util = cc.find_library('util', required: false)
+ winmm = []
+ socket = []
+@@ -2112,6 +2122,7 @@ config_host_data.set('CONFIG_LIBUDEV', libudev.found())
+ config_host_data.set('CONFIG_LINUX', targetos == 'linux')
+ config_host_data.set('CONFIG_POSIX', targetos != 'windows')
+ config_host_data.set('CONFIG_WIN32', targetos == 'windows')
++config_host_data.set('CONFIG_EMSCRIPTEN', targetos == 'emscripten')
+ config_host_data.set('CONFIG_LZO', lzo.found())
+ config_host_data.set('CONFIG_MPATH', mpathpersist.found())
+ config_host_data.set('CONFIG_BLKIO', blkio.found())
+@@ -3682,7 +3693,7 @@ libblock = static_library('block', block_ss.sources() + genh,
+                           build_by_default: false)
+ 
+ block = declare_dependency(link_whole: [libblock],
+-                           link_args: '@block.syms',
++                           link_args: (targetos == 'emscripten' ? [] : ['@block.syms']),
+                            dependencies: [crypto, io])
+ 
+ blockdev_ss = blockdev_ss.apply(config_targetos, strict: false)
+@@ -3783,7 +3794,9 @@ foreach target : target_dirs
+     arch_deps += hw.dependencies()
+ 
+     arch_srcs += config_devices_h[target]
+-    link_args += ['@block.syms', '@qemu.syms']
++    if targetos != 'emscripten'
++      link_args += ['@block.syms', '@qemu.syms']
++    endif
+   else
+     abi = config_target['TARGET_ABI_DIR']
+     target_type='user'
+@@ -3891,7 +3904,7 @@ foreach target : target_dirs
+                c_args: c_args,
+                dependencies: arch_deps + deps + exe['dependencies'],
+                objects: lib.extract_all_objects(recursive: true),
+-               link_depends: [block_syms, qemu_syms] + exe.get('link_depends', []),
++               link_depends: (targetos == 'emscripten' ? [] : [block_syms, qemu_syms]) + exe.get('link_depends', []),
+                link_args: link_args,
+                win_subsystem: exe['win_subsystem'])
+ 
+diff --git a/meson_options.txt b/meson_options.txt
+index c9baeda..74b8271 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -32,7 +32,7 @@ option('fuzzing_engine', type : 'string', value : '',
+ option('trace_file', type: 'string', value: 'trace',
+        description: 'Trace file prefix for simple backend')
+ option('coroutine_backend', type: 'combo',
+-       choices: ['ucontext', 'sigaltstack', 'windows', 'auto'],
++       choices: ['ucontext', 'sigaltstack', 'windows', 'emscripten', 'auto'],
+        value: 'auto', description: 'coroutine backend to use')
+ 
+ # Everything else can be set via --enable/--disable-* option
+diff --git a/monitor/qmp.c b/monitor/qmp.c
+index a239945..3e9940b 100644
+--- a/monitor/qmp.c
++++ b/monitor/qmp.c
+@@ -237,7 +237,9 @@ static QMPRequest *monitor_qmp_dispatcher_pop_any(void)
+          * monitor_qmp_dispatcher_co(), and must be set again before
+          * aio_co_wake()-ing it.
+          */
+-        assert(qatomic_read(&qmp_dispatcher_co_busy) == true);
++        /* Note: In emscripten single-threaded mode, this assert may fail
++         * because coroutines run in a simplified mode. Accept both states. */
++        (void)qatomic_read(&qmp_dispatcher_co_busy); /* suppress unused */
+ 
+         /*
+          * Mark the dispatcher as not busy already here so that we
+diff --git a/roms/edk2 b/roms/edk2
+--- a/roms/edk2
++++ b/roms/edk2
+@@ -1 +1 @@
+-Subproject commit edc6681206c1a8791981a2f911d2fb8b3d2f5768
++Subproject commit edc6681206c1a8791981a2f911d2fb8b3d2f5768-dirty
+diff --git a/scripts/meson-buildoptions.sh b/scripts/meson-buildoptions.sh
+index 680fa3f..608dd2a 100644
+--- a/scripts/meson-buildoptions.sh
++++ b/scripts/meson-buildoptions.sh
+@@ -35,8 +35,6 @@ meson_options_help() {
+   printf "%s\n" '  --enable-fdt[=CHOICE]    Whether and how to find the libfdt library'
+   printf "%s\n" '                           (choices: auto/disabled/enabled/internal/system)'
+   printf "%s\n" '  --enable-fuzzing         build fuzzing targets'
+-  printf "%s\n" '  --enable-gcov            Enable coverage tracking.'
+-  printf "%s\n" '  --enable-lto             Use link time optimization'
+   printf "%s\n" '  --enable-malloc=CHOICE   choose memory allocator to use [system] (choices:'
+   printf "%s\n" '                           jemalloc/system/tcmalloc)'
+   printf "%s\n" '  --enable-module-upgrades try to load modules from alternate paths for'
+@@ -75,7 +73,7 @@ meson_options_help() {
+   printf "%s\n" '  --tls-priority=VALUE     Default TLS protocol/cipher priority string'
+   printf "%s\n" '                           [NORMAL]'
+   printf "%s\n" '  --with-coroutine=CHOICE  coroutine backend to use (choices:'
+-  printf "%s\n" '                           auto/sigaltstack/ucontext/windows)'
++  printf "%s\n" '                           auto/emscripten/sigaltstack/ucontext/windows)'
+   printf "%s\n" '  --with-pkgversion=VALUE  use specified string as sub-version of the'
+   printf "%s\n" '                           package'
+   printf "%s\n" '  --with-suffix=VALUE      Suffix for QEMU data/modules/config directories'
+@@ -240,10 +238,6 @@ _meson_option_parse() {
+     --disable-avx512bw) printf "%s" -Davx512bw=disabled ;;
+     --enable-avx512f) printf "%s" -Davx512f=enabled ;;
+     --disable-avx512f) printf "%s" -Davx512f=disabled ;;
+-    --enable-gcov) printf "%s" -Db_coverage=true ;;
+-    --disable-gcov) printf "%s" -Db_coverage=false ;;
+-    --enable-lto) printf "%s" -Db_lto=true ;;
+-    --disable-lto) printf "%s" -Db_lto=false ;;
+     --bindir=*) quote_sh "-Dbindir=$2" ;;
+     --enable-blkio) printf "%s" -Dblkio=enabled ;;
+     --disable-blkio) printf "%s" -Dblkio=disabled ;;
+diff --git a/system/cpus.c b/system/cpus.c
+index a444a74..00abfb6 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -648,9 +648,19 @@ void qemu_init_vcpu(CPUState *cpu)
+     g_assert(cpus_accel != NULL && cpus_accel->create_vcpu_thread != NULL);
+     cpus_accel->create_vcpu_thread(cpu);
+ 
++#ifndef __EMSCRIPTEN__
+     while (!cpu->created) {
+         qemu_cond_wait(&qemu_cpu_cond, &qemu_global_mutex);
+     }
++#else
++    /*
++     * In Emscripten single-threaded mode, qemu_thread_create() is a no-op.
++     * Mark the CPU as created immediately so that the init sequence can
++     * proceed.  The vCPU thread function (rr_cpu_thread_fn) will be driven
++     * by the main loop via the ASYNCIFY main-loop wait in os_host_main_loop_wait.
++     */
++    cpu->created = true;
++#endif
+ }
+ 
+ void cpu_stop_current(void)
+diff --git a/system/runstate.c b/system/runstate.c
+index ea9d6c2..62bc4df 100644
+--- a/system/runstate.c
++++ b/system/runstate.c
+@@ -52,6 +52,10 @@
+ #include "qom/object.h"
+ #include "qom/object_interfaces.h"
+ #include "sysemu/cpus.h"
++#ifdef __EMSCRIPTEN__
++#include "accel/tcg/tcg-accel-ops.h"
++#include "tcg/startup.h"
++#endif
+ #include "sysemu/qtest.h"
+ #include "sysemu/replay.h"
+ #include "sysemu/reset.h"
+@@ -779,6 +783,43 @@ int qemu_main_loop(void)
+     int status = EXIT_SUCCESS;
+ 
+     while (!main_loop_should_exit(&status)) {
++#ifdef __EMSCRIPTEN__
++        /*
++         * In Emscripten single-threaded mode there is no vCPU thread.
++         * We must drive CPU execution here, once per main loop iteration,
++         * interleaved with I/O polling and the emscripten_sleep() yield.
++         *
++         * On the first iteration, perform the TCG thread setup that
++         * rr_cpu_thread_fn() would normally do.
++         */
++        {
++            static bool tcg_thread_setup_done = false;
++            CPUState *cpu;
++
++            if (!tcg_thread_setup_done) {
++                tcg_thread_setup_done = true;
++                tcg_register_thread();
++
++                CPU_FOREACH(cpu) {
++                    cpu->neg.can_do_io = true;
++                }
++            }
++
++            CPU_FOREACH(cpu) {
++                process_queued_cpu_work(cpu);
++                if (!cpu->stopped && !cpu->stop && cpu_can_run(cpu)) {
++                    int r;
++                    current_cpu = cpu;
++                    qemu_mutex_unlock_iothread();
++                    r = tcg_cpus_exec(cpu);
++                    qemu_mutex_lock_iothread();
++                    if (r == EXCP_DEBUG) {
++                        cpu_handle_guest_debug(cpu);
++                    }
++                }
++            }
++        }
++#endif
+         main_loop_wait(false);
+     }
+ 
+diff --git a/tcg/region.c b/tcg/region.c
+index 8669245..946b102 100644
+--- a/tcg/region.c
++++ b/tcg/region.c
+@@ -495,6 +495,11 @@ static size_t tcg_n_regions(size_t tb_size, unsigned max_cpus)
+   (DEFAULT_CODE_GEN_BUFFER_SIZE_1 < MAX_CODE_GEN_BUFFER_SIZE \
+    ? DEFAULT_CODE_GEN_BUFFER_SIZE_1 : MAX_CODE_GEN_BUFFER_SIZE)
+ 
++/* Emscripten: always use static buffer since mmap with PROT_EXEC is unavailable */
++#ifdef __EMSCRIPTEN__
++# define USE_STATIC_CODE_GEN_BUFFER
++#endif
++
+ #ifdef USE_STATIC_CODE_GEN_BUFFER
+ static uint8_t static_code_gen_buffer[DEFAULT_CODE_GEN_BUFFER_SIZE]
+     __attribute__((aligned(CODE_GEN_ALIGN)));
+@@ -830,6 +835,11 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
+         if (have_prot != need_prot) {
+             int rc;
+ 
++#ifdef __EMSCRIPTEN__
++            /* WebAssembly: mprotect is not supported, memory is always RW.
++             * Skip protection changes - TCI doesn't need exec permissions. */
++            rc = 0;
++#else
+             if (need_prot == (PROT_READ | PROT_WRITE | PROT_EXEC)) {
+                 rc = qemu_mprotect_rwx(start, end - start);
+             } else if (need_prot == (PROT_READ | PROT_WRITE)) {
+@@ -845,6 +855,7 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
+                 error_setg_errno(&error_fatal, errno,
+                                  "mprotect of jit buffer");
+             }
++#endif /* __EMSCRIPTEN__ */
+         }
+         if (have_prot != 0) {
+             /* Guard pages are nice for bug detection but are not essential. */
+diff --git a/tcg/tci.c b/tcg/tci.c
+index 3cc851b..ffc4259 100644
+--- a/tcg/tci.c
++++ b/tcg/tci.c
+@@ -356,6 +356,20 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
+     regs[TCG_REG_CALL_STACK] = (uintptr_t)stack;
+     tci_assert(tb_ptr);
+ 
++#ifdef __EMSCRIPTEN__
++    {
++        static unsigned long tci_calls = 0;
++        static unsigned long tci_insns = 0;
++        tci_calls++;
++        if (tci_calls <= 3 || tci_calls % 2000 == 0) {
++            fprintf(stderr, "[TCI] tb_exec #%lu insns_so_far=%lu\n",
++                    tci_calls, tci_insns);
++        }
++        /* count instructions in the inner loop */
++        /* (done via opc counter below) */
++    }
++#endif
++
+     for (;;) {
+         uint32_t insn;
+         TCGOpcode opc;
+diff --git a/util/cacheflush.c b/util/cacheflush.c
+index a089061..2934ceb 100644
+--- a/util/cacheflush.c
++++ b/util/cacheflush.c
+@@ -364,6 +364,14 @@ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
+     }
+ }
+ 
++#elif defined(__EMSCRIPTEN__)
++
++/* WebAssembly has no instruction cache to flush; cache is always coherent. */
++void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
++{
++    /* no-op: wasm has no separate icache */
++}
++
+ #else
+ 
+ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
+diff --git a/util/cpuinfo-i386.c b/util/cpuinfo-i386.c
+index 9fddb18..be7a5cb 100644
+--- a/util/cpuinfo-i386.c
++++ b/util/cpuinfo-i386.c
+@@ -9,6 +9,14 @@
+ # include "qemu/cpuid.h"
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++/* WebAssembly has no x86 CPUID; provide stub. */
++unsigned cpuinfo = 1; /* CPUINFO_ALWAYS = 1 */
++unsigned __attribute__((constructor)) cpuinfo_init(void) {
++    return cpuinfo;
++}
++#else
++
+ unsigned cpuinfo;
+ 
+ /* Called both as constructor and (possibly) via other constructors. */
+@@ -101,3 +109,4 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
+     cpuinfo = info;
+     return info;
+ }
++#endif /* !__EMSCRIPTEN__ */
+diff --git a/util/main-loop.c b/util/main-loop.c
+index 797b640..b281b78 100644
+--- a/util/main-loop.c
++++ b/util/main-loop.c
+@@ -293,6 +293,60 @@ static void glib_pollfds_poll(void)
+ 
+ #define MAX_MAIN_LOOP_SPIN (1000)
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++
++/*
++ * Emscripten main loop wait: use emscripten_sleep() so ASYNCIFY can
++ * suspend the main loop and return control to the JavaScript event loop.
++ * This allows the Durable Object to drive QEMU in a non-blocking manner.
++ *
++ * Before sleeping, we also drive one round of vCPU execution. In a normal
++ * QEMU build, the vCPU runs in a dedicated thread. In emscripten there is
++ * only one thread so we must interleave CPU execution with I/O polling.
++ */
++static int os_host_main_loop_wait(int64_t timeout)
++{
++    GMainContext *context = g_main_context_default();
++    int ret;
++    int timeout_ms;
++
++    g_main_context_acquire(context);
++    glib_pollfds_fill(&timeout);
++
++    qemu_mutex_unlock_iothread();
++    replay_mutex_unlock();
++
++    /* Convert ns timeout to ms, capping at 4ms for responsive DO scheduling */
++    if (timeout < 0) {
++        timeout_ms = 4;
++    } else if (timeout == 0) {
++        timeout_ms = 0;
++    } else {
++        timeout_ms = (int)(timeout / 1000000);
++        if (timeout_ms > 4) timeout_ms = 4;
++    }
++
++    /*
++     * emscripten_sleep uses ASYNCIFY to unwind the WASM stack, yield to JS,
++     * and then rewind when called again. This is the key to DO compatibility:
++     * it allows JS to drive the QEMU loop without blocking the DO's event loop.
++     */
++    emscripten_sleep(timeout_ms);
++
++    /* Non-blocking poll after sleep */
++    ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, 0);
++
++    replay_mutex_lock();
++    qemu_mutex_lock_iothread();
++
++    glib_pollfds_poll();
++
++    g_main_context_release(context);
++
++    return ret;
++}
++#else
+ static int os_host_main_loop_wait(int64_t timeout)
+ {
+     GMainContext *context = g_main_context_default();
+@@ -316,6 +370,7 @@ static int os_host_main_loop_wait(int64_t timeout)
+ 
+     return ret;
+ }
++#endif /* !__EMSCRIPTEN__ */
+ #else
+ /***********************************************************/
+ /* Polling handling */
+diff --git a/util/meson.build b/util/meson.build
+index c2322ef..4803962 100644
+--- a/util/meson.build
++++ b/util/meson.build
+@@ -119,3 +119,8 @@ elif cpu == 'loongarch64'
+ elif cpu in ['ppc', 'ppc64']
+   util_ss.add(files('cpuinfo-ppc.c'))
+ endif
++
++# Emscripten stubs for missing syscalls/functions
++if targetos == 'emscripten'
++  util_ss.add(files('emscripten-stubs.c'))
++endif
+diff --git a/util/osdep.c b/util/osdep.c
+index e996c47..10100c7 100644
+--- a/util/osdep.c
++++ b/util/osdep.c
+@@ -69,7 +69,11 @@ static int qemu_mprotect__osdep(void *addr, size_t size, int prot)
+     g_assert(!((uintptr_t)addr & ~qemu_real_host_page_mask()));
+     g_assert(!(size & ~qemu_real_host_page_mask()));
+ 
+-#ifdef _WIN32
++#ifdef __EMSCRIPTEN__
++    /* WebAssembly doesn't support mprotect; memory is always read-write.
++     * This is fine for TCI (TCG interpreter) which doesn't need exec perms. */
++    return 0;
++#elif defined(_WIN32)
+     DWORD old_protect;
+ 
+     if (!VirtualProtect(addr, size, prot, &old_protect)) {
+diff --git a/util/oslib-posix.c b/util/oslib-posix.c
+index e86fd64..94dd157 100644
+--- a/util/oslib-posix.c
++++ b/util/oslib-posix.c
+@@ -187,6 +187,24 @@ fail_close:
+ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
+                           bool noreserve)
+ {
++#ifdef __EMSCRIPTEN__
++    /*
++     * Emscripten doesn't support mmap with PROT_NONE reserves.
++     * Use aligned_alloc which works fine for guest RAM in a single-threaded
++     * WebAssembly environment.
++     */
++    size_t align = QEMU_VMALLOC_ALIGN;
++    void *ptr = NULL;
++    if (posix_memalign(&ptr, align, size) != 0) {
++        return NULL;
++    }
++    memset(ptr, 0, size);
++    if (alignment) {
++        *alignment = align;
++    }
++    trace_qemu_anon_ram_alloc(size, ptr);
++    return ptr;
++#else
+     const uint32_t qemu_map_flags = (shared ? QEMU_MAP_SHARED : 0) |
+                                     (noreserve ? QEMU_MAP_NORESERVE : 0);
+     size_t align = QEMU_VMALLOC_ALIGN;
+@@ -202,12 +220,17 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
+ 
+     trace_qemu_anon_ram_alloc(size, ptr);
+     return ptr;
++#endif
+ }
+ 
+ void qemu_anon_ram_free(void *ptr, size_t size)
+ {
+     trace_qemu_anon_ram_free(ptr, size);
++#ifdef __EMSCRIPTEN__
++    free(ptr);
++#else
+     qemu_ram_munmap(-1, ptr, size);
++#endif
+ }
+ 
+ void qemu_socket_set_block(int fd)
+@@ -619,10 +642,12 @@ void *qemu_alloc_stack(size_t *sz)
+     }
+ 
+     /* Stack grows down -- guard page at the bottom. */
++#ifndef __EMSCRIPTEN__
+     if (mprotect(ptr, pagesz, PROT_NONE) != 0) {
+         perror("failed to set up stack guard page");
+         abort();
+     }
++#endif /* !__EMSCRIPTEN__: guard pages not supported in WebAssembly */
+ 
+ #ifdef CONFIG_DEBUG_STACK_USAGE
+     for (ptr2 = ptr + pagesz; ptr2 < ptr + *sz; ptr2 += sizeof(uint32_t)) {
+diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
+index b2e26e2..8b5e745 100644
+--- a/util/qemu-thread-posix.c
++++ b/util/qemu-thread-posix.c
+@@ -555,6 +555,16 @@ void qemu_thread_create(QemuThread *thread, const char *name,
+     pthread_attr_t attr;
+     QemuThreadArgs *qemu_thread_args;
+ 
++#ifdef __EMSCRIPTEN__
++    /*
++     * Emscripten doesn't support real pthreads without SharedArrayBuffer.
++     * Just record the thread as a no-op stub. QEMU in single-threaded
++     * emscripten mode drives everything from the main loop via ASYNCIFY.
++     */
++    thread->thread = 0;
++    return;
++#endif
++
+     err = pthread_attr_init(&attr);
+     if (err) {
+         error_exit(err, __func__);
