@@ -530,7 +530,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     if (!textData) return;
 
     const textContent = textData.lines.join("\n");
-    if (textContent === this.lastTextContent) return;
+    if (textContent === this.lastTextContent && this._renderCount > 30) return;
     this.lastTextContent = textContent;
 
     this.broadcast(encodeTextScreen(textData.cols, textData.rows, textData.lines));

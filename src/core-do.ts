@@ -726,7 +726,7 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
     if (this.executionTimer) return;
     this.executionTimer = setInterval(() => {
       this.executionCycle();
-    }, 0);
+    }, 4);
   }
 
   private stopExecutionLoop(): void {
