@@ -3,6 +3,7 @@ dist/
 .wrangler/
 .vite/
 *.log
+wrangler.jsonc
 
 # Large OS images — download separately (see README)
 public/assets/dsl.iso

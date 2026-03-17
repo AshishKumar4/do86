@@ -18,19 +18,23 @@ interface ImageDef {
   url?: string;
 }
 
+// Memory budget: Durable Objects have a 128 MB total isolate limit.
+// Each VM's guest RAM + VGA framebuffer + v86 WASM heap + JS runtime overhead
+// must all fit within that budget. Keep guest memory ≤ 64 MB to leave headroom
+// for WASM (~30 MB) and the JS heap (~20 MB). Exceeding this causes OOM eviction.
 const IMAGES: Record<string, ImageDef> = {
-  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: 256, vgaMemory: 8, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
+  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: 32,  vgaMemory: 4, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: 32,  vgaMemory: 8, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system." },
-  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: 256, vgaMemory: 8, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
+  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: 48,  vgaMemory: 4, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system." },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: 48,  vgaMemory: 4, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
-  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: 256, vgaMemory: 8, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: 48,  vgaMemory: 4, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
                 url: "http://tinycorelinux.net/11.x/x86/release/TinyCore-11.1.iso" },
-  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: 256, vgaMemory: 8, label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
+  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: 32,  vgaMemory: 4, label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
                 url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
-  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: 256, vgaMemory: 8, label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
+  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: 48,  vgaMemory: 4, label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
                 url: "https://www.helenos.org/releases/HelenOS-0.14.1-ia32.iso" },
-  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 256, vgaMemory: 8, label: "Linux 4 (Text)", description: "Minimal Linux kernel. Text-only — great for exploring the shell.",
+  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,  vgaMemory: 2, label: "Linux 4 (Text)", description: "Minimal Linux kernel. Text-only — great for exploring the shell.",
                 url: "https://copy.sh/v86/images/linux4.iso" },
 };
 
@@ -97,9 +101,9 @@ export default {
       const imageDef = IMAGES[imageKey] || IMAGES.kolibri;
       const freshBoot = url.searchParams.get("fresh") === "1";
 
-      // All sessions for the same image share one DO — enables multi-client
-      // viewing and shared state snapshots.
-      const id = env.LINUX_VM.idFromName(`vm-${imageKey}`);
+      const sessionId = sessionMatch[1];
+      
+      const id = env.LINUX_VM.idFromName(`vm-${sessionId}`);
       const stub = env.LINUX_VM.get(id);
 
       // ── WebSocket upgrade → pure passthrough ───────────────────────────

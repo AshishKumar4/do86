@@ -46,6 +46,7 @@ if (sessionId) {
 // ── State ────────────────────────────────────────────────────────────────────
 
 let ws: WebSocket | null = null;
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let screenWidth = 720;
 let screenHeight = 400;
 let canvasFocused = false;
@@ -135,6 +136,7 @@ function setStatus(text: string) {
     statusEl.className = "booting";
   } else if (
     text.startsWith("booting") ||
+    text.startsWith("waiting_for_boot") ||
     text.startsWith("downloading") ||
     text.startsWith("mode:") ||
     text.startsWith("resize:")
@@ -438,6 +440,15 @@ function connect() {
       showOverlay(loadingOverlay);
     }
     updateFocusUI();
+
+    // Trigger boot from the server side. Boot runs inside webSocketMessage so
+    // v86's internal setTimeout(d,0) fires within an active DO event handler.
+    ws.send(JSON.stringify({ type: "boot" }));
+
+    // Heartbeat every 10s to keep the non-hibernating DO alive
+    heartbeatInterval = setInterval(() => {
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "heartbeat" }));
+    }, 10_000);
   });
 
   ws.addEventListener("message", (event) => {
@@ -458,6 +469,7 @@ function connect() {
     hideOverlay(focusOverlay);
     canvasFocused = false;
     updateFocusUI();
+    if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
     reconnectTimer = setTimeout(connect, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 30000);
   });
