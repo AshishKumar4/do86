@@ -1,11 +1,16 @@
 /**
  * qemu-wrapper.ts — QEMU WASM lifecycle manager for Durable Objects.
  *
- * Loads qemu-system-i386 (Emscripten, NO ASYNCIFY), configures the
- * Emscripten VFS with BIOS/disk images, hooks serial + display + APIC
+ * Loads qemu-system-i386 (Emscripten, NO ASYNCIFY, MODULARIZE), configures
+ * the Emscripten VFS with BIOS/disk images, hooks serial + display + APIC
  * bridge exports, and drives the main-loop via emscripten_set_main_loop().
  *
- * Actual WASM exports (Emscripten adds `_` prefix):
+ * The JS glue is built with -sMODULARIZE=1 -sEXPORT_NAME=createQemuModule.
+ * Loading pattern:
+ *   const createQemuModule = new Function(jsGlue + "\nreturn createQemuModule;")();
+ *   const Module = await createQemuModule({ print, printErr, wasmBinary, ... });
+ *
+ * WASM exports (Emscripten adds `_` prefix):
  *   _wasm_display_init
  *   _wasm_get_display_surface_data, _wasm_get_display_stride,
  *   _wasm_get_display_width, _wasm_get_display_height,
@@ -16,7 +21,7 @@
  *   _wasm_apic_inject_irq, _wasm_apic_read_icr,
  *   _wasm_apic_get_highest_irr
  *
- * EM_ASM callbacks (set on Module before init, called synchronously by QEMU):
+ * EM_ASM callbacks (set on Module via factory overrides, called synchronously):
  *   Module.onTlbMiss(gpa)       — page fault handler, returns WASM offset
  *   Module.onICRWrite(lo, hi)   — LAPIC ICR write (outbound IPI)
  *   Module.onSerialChar(code)   — per-character serial output
@@ -172,8 +177,8 @@ export class QEMUWrapper {
   /**
    * Initialize and start the QEMU instance.
    *
-   * 1. Evaluate JS glue (sets up globalThis.Module).
-   * 2. Wait for onRuntimeInitialized.
+   * 1. Evaluate JS glue to get createQemuModule factory.
+   * 2. await createQemuModule({...}) — waits for runtime init.
    * 3. Write BIOS/disk to Emscripten VFS.
    * 4. callMain() — registers emscripten_set_main_loop callback.
    * 5. Set APIC ID, install hooks.
@@ -215,137 +220,131 @@ export class QEMUWrapper {
   /**
    * Load the QEMU Emscripten module. Returns when callMain() has completed
    * (i.e., emscripten_set_main_loop callback is registered).
+   *
+   * The JS glue is built with -sMODULARIZE=1 -sEXPORT_NAME=createQemuModule,
+   * so it exports a factory function. We call it with our overrides and await
+   * the returned promise — no globalThis.Module hacks needed.
    */
-  private loadModule(config: QEMUWrapperConfig): Promise<QEMUModule> {
-    return new Promise<QEMUModule>((resolve, reject) => {
-      let moduleRef: QEMUModule | null = null;
+  private async loadModule(config: QEMUWrapperConfig): Promise<QEMUModule> {
+    // Extract the factory function from the JS glue code.
+    // The glue ends with: module.exports = createQemuModule
+    // We use new Function() to evaluate it and return the factory.
+    // eslint-disable-next-line no-new-func
+    const factory = new Function(
+      config.jsGlue + "\nreturn createQemuModule;",
+    )() as (overrides: Record<string, unknown>) => Promise<QEMUModule>;
 
-      const moduleOverrides: Record<string, unknown> = {
-        noInitialRun: true,
-        noExitRuntime: true,
+    // Prepare module overrides — all callbacks are wired here.
+    // The factory merges these into the Module object before init.
+    const moduleOverrides: Record<string, unknown> = {
+      noInitialRun: true,
+      noExitRuntime: true,
 
-        // Serial console output (stdout)
-        print: (line: string) => {
-          if (config.onSerialOutput) {
-            for (const ch of line) {
-              config.onSerialOutput(ch);
-            }
-            config.onSerialOutput("\n");
+      // Serial console output (stdout)
+      print: (line: string) => {
+        if (config.onSerialOutput) {
+          for (const ch of line) {
+            config.onSerialOutput(ch);
           }
-        },
+          config.onSerialOutput("\n");
+        }
+      },
 
-        // Debug/error output (stderr)
-        printErr: (line: string) => {
-          console.error(`${LOG_PREFIX} [qemu:${config.apicId}]`, line);
-        },
+      // Debug/error output (stderr)
+      printErr: (line: string) => {
+        console.error(`${LOG_PREFIX} [qemu:${config.apicId}]`, line);
+      },
 
-        // Per-character serial hook (called from QEMU's serial device via EM_ASM)
-        onSerialChar: (charCode: number) => {
-          config.onSerialOutput?.(String.fromCharCode(charCode));
-        },
+      // Per-character serial hook (called from QEMU's serial device via EM_ASM)
+      onSerialChar: (charCode: number) => {
+        config.onSerialOutput?.(String.fromCharCode(charCode));
+      },
 
-        // ICR write callback (called from patched apic_mem_write via EM_ASM)
-        onICRWrite: (icrLow: number, icrHigh: number) => {
-          this.handleICRWrite(icrLow, icrHigh);
-        },
+      // ICR write callback (called from patched apic_mem_write via EM_ASM)
+      onICRWrite: (icrLow: number, icrHigh: number) => {
+        this.handleICRWrite(icrLow, icrHigh);
+      },
 
-        // TLB miss / page fault callback — SYNCHRONOUS.
-        // Called from patched cputlb.c via EM_ASM when QEMU's softmmu
-        // can't resolve a guest physical address. Returns the WASM heap
-        // offset of the page frame containing the data, or -1.
-        onTlbMiss: (gpa: number) => {
-          return this.handleTlbMiss(gpa);
-        },
+      // TLB miss / page fault callback — SYNCHRONOUS.
+      // Called from patched cputlb.c via EM_ASM when QEMU's softmmu
+      // can't resolve a guest physical address. Returns the WASM heap
+      // offset of the page frame containing the data, or -1.
+      onTlbMiss: (gpa: number) => {
+        return this.handleTlbMiss(gpa);
+      },
 
-        // Display update callback
-        onDisplayUpdate: (
-          x: number, y: number, w: number, h: number,
-          dataPtr: number, stride: number, surfaceWidth: number,
-        ) => {
-          this.displayDirty = true;
-          // If caller registered a region-level callback, forward it
-          if (config.onDisplayUpdate && moduleRef) {
-            const bpp = 4; // 32bpp BGRA
-            const regionBytes = w * h * bpp;
-            // Read region from WASM memory and convert BGRA→RGBA
-            const rgba = new Uint8Array(regionBytes);
-            const heap = moduleRef.HEAPU8;
-            for (let row = 0; row < h; row++) {
-              const srcRowStart = dataPtr + (y + row) * stride + x * bpp;
-              const dstRowStart = row * w * bpp;
-              for (let col = 0; col < w; col++) {
-                const s = srcRowStart + col * bpp;
-                const d = dstRowStart + col * bpp;
-                rgba[d + 0] = heap[s + 2]; // R ← B
-                rgba[d + 1] = heap[s + 1]; // G ← G
-                rgba[d + 2] = heap[s + 0]; // B ← R
-                rgba[d + 3] = 255;          // A
-              }
-            }
-            config.onDisplayUpdate(x, y, w, h, rgba);
-          }
-        },
-
-        // Display resize callback
-        onDisplayResize: (width: number, height: number) => {
-          this.displayWidth = width;
-          this.displayHeight = height;
-          this.displayDirty = true;
-        },
-
-        // Pre/post tick hooks — called by patched main_loop_callback
-        preTick: () => this.preTick(),
-        postTick: () => this.postTick(),
-
-        onRuntimeInitialized: () => {
-          moduleRef = (globalThis as unknown as Record<string, unknown>)
-            .Module as QEMUModule;
-
-          try {
-            this.mountFilesystem(moduleRef, config);
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            this.aborted = true;
-            reject(new Error(`Failed to mount files: ${msg}`));
-            return;
-          }
-
-          // Build QEMU args
-          const args = this.buildQemuArgs(config);
-
-          try {
-            moduleRef.callMain(args);
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            if (msg !== "unwind" && !msg.includes("ExitStatus")) {
-              this.aborted = true;
-              reject(new Error(`QEMU callMain error: ${msg}`));
-              return;
+      // Display update callback
+      onDisplayUpdate: (
+        x: number, y: number, w: number, h: number,
+        dataPtr: number, stride: number, surfaceWidth: number,
+      ) => {
+        this.displayDirty = true;
+        // If caller registered a region-level callback, forward it
+        if (config.onDisplayUpdate && mod) {
+          const bpp = 4; // 32bpp BGRA
+          const regionBytes = w * h * bpp;
+          // Read region from WASM memory and convert BGRA→RGBA
+          const rgba = new Uint8Array(regionBytes);
+          const heap = mod.HEAPU8;
+          for (let row = 0; row < h; row++) {
+            const srcRowStart = dataPtr + (y + row) * stride + x * bpp;
+            const dstRowStart = row * w * bpp;
+            for (let col = 0; col < w; col++) {
+              const s = srcRowStart + col * bpp;
+              const d = dstRowStart + col * bpp;
+              rgba[d + 0] = heap[s + 2]; // R ← B
+              rgba[d + 1] = heap[s + 1]; // G ← G
+              rgba[d + 2] = heap[s + 0]; // B ← R
+              rgba[d + 3] = 255;          // A
             }
           }
+          config.onDisplayUpdate(x, y, w, h, rgba);
+        }
+      },
 
-          // callMain returned — main loop callback is registered.
-          resolve(moduleRef);
-        },
+      // Display resize callback
+      onDisplayResize: (width: number, height: number) => {
+        this.displayWidth = width;
+        this.displayHeight = height;
+        this.displayDirty = true;
+      },
 
-        onAbort: (what: string) => {
-          this.aborted = true;
-          reject(new Error(`QEMU aborted: ${what}`));
-        },
+      // Pre/post tick hooks — called by patched main_loop_callback
+      preTick: () => this.preTick(),
+      postTick: () => this.postTick(),
 
-        // Provide WASM binary (raw ArrayBuffer from R2/SQLite cache).
-        // Emscripten accepts either ArrayBuffer or WebAssembly.Module.
-        wasmBinary: new Uint8Array(config.wasmBinary),
-      };
+      onAbort: (what: string) => {
+        this.aborted = true;
+        throw new Error(`QEMU aborted: ${what}`);
+      },
 
-      // Set up globalThis.Module — the JS glue reads from it.
-      (globalThis as unknown as Record<string, unknown>).Module = moduleOverrides;
+      // Provide WASM binary (raw ArrayBuffer from R2/SQLite cache).
+      // Emscripten accepts either ArrayBuffer or WebAssembly.Module.
+      wasmBinary: new Uint8Array(config.wasmBinary),
+    };
 
-      // Execute the Emscripten JS glue code (fetched from R2/SQLite cache).
-      // eslint-disable-next-line no-new-func
-      const fn = new Function(config.jsGlue);
-      fn();
-    });
+    // Call the factory — it returns a promise that resolves when the
+    // Emscripten runtime is fully initialized (replaces onRuntimeInitialized).
+    const mod = await factory(moduleOverrides) as unknown as QEMUModule;
+
+    // Mount BIOS/disk files into the Emscripten VFS
+    this.mountFilesystem(mod, config);
+
+    // Build QEMU args and start the VM
+    const args = this.buildQemuArgs(config);
+
+    try {
+      mod.callMain(args);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg !== "unwind" && !msg.includes("ExitStatus")) {
+        this.aborted = true;
+        throw new Error(`QEMU callMain error: ${msg}`);
+      }
+    }
+
+    // callMain returned — main loop callback is registered.
+    return mod;
   }
 
   /**
