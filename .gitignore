@@ -10,3 +10,5 @@ public/assets/helenos.iso
 public/assets/linux4.iso
 package-lock.json
 public/assets/v86.wasm
+images/
+public/assets/kolibri.img

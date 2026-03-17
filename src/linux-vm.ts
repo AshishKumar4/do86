@@ -284,7 +284,11 @@ export class LinuxVM extends DurableObject<unknown> {
       };
 
       const v86Config: Record<string, any> = {
-        wasm_fn: async (env: any) => (await WebAssembly.instantiate(v86WasmModule, env)).exports,
+        wasm_fn: async (importObj: any) => {
+          const instance = await WebAssembly.instantiate(v86WasmModule, importObj);
+          return instance.exports;
+        },
+        disable_jit: false,
         bios: { buffer: bios },
         vga_bios: { buffer: vgaBios },
         memory_size: memorySizeMB * 1024 * 1024,
