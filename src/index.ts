@@ -17,25 +17,34 @@ interface ImageDef {
   label: string;
   description: string;
   /** Remote URL for the disk image. If set, the DO fetches + caches it in SQLite
-   *  instead of the Worker sending the full binary via /init. */
+   *  instead of the Worker sending the full binary via /init.
+   *  If absent, the image is static-only (aqeous.iso served from ASSETS). */
   url?: string;
   /** If true, never save/restore snapshots for this image (unstable OS) */
   noSnapshot?: boolean;
 }
 
 const IMAGES: Record<string, ImageDef> = {
-  kolibri: { file: "kolibri.img", drive: "fda",   memory: 128, vgaMemory: 8, label: "KolibriOS",       description: "Full GUI, boots fast. Tiny x86 OS written in FASM." },
-  dsl:     { file: "dsl.iso",     drive: "cdrom", memory: 128, vgaMemory: 8, label: "Damn Small Linux", description: "Fluxbox window manager + Firefox. ~50MB Linux distro.",
-             url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
-  helenos: { file: "helenos.iso", drive: "cdrom", memory: 128, vgaMemory: 8, label: "HelenOS",          description: "Research microkernel OS with a custom GUI.",
-             url: "http://www.helenos.org/releases/HelenOS-0.5.0-ia32.iso" },
-  linux4:  { file: "linux4.iso",  drive: "cdrom", memory: 128, vgaMemory: 8, label: "Linux (text)",     description: "Minimal Linux kernel. Text mode only.",
-             url: "https://copy.sh/v86/images/linux4.iso" },
-  aqeous:  { file: "aqeous.iso",  drive: "cdrom", memory: 32, vgaMemory: 8, label: "AqeousOS",        description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true },
+  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: 256, vgaMemory: 8, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
+                url: "https://copy.sh/v86/images/kolibri.img" },
+  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: 32,  vgaMemory: 8, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: 256, vgaMemory: 8, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
+                url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: 256, vgaMemory: 8, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
+                url: "http://tinycorelinux.net/11.x/x86/release/TinyCore-11.1.iso" },
+  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: 256, vgaMemory: 8, label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
+                url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
+  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: 256, vgaMemory: 8, label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
+                url: "https://www.helenos.org/releases/HelenOS-0.14.1-ia32.iso" },
+  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 256, vgaMemory: 8, label: "Linux 4 (Text)", description: "Minimal Linux kernel. Text-only — great for exploring the shell.",
+                url: "https://copy.sh/v86/images/linux4.iso" },
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/** Fetch a static asset via the ASSETS binding.
+ *  MUST only be called from plain HTTP handlers — ASSETS.fetch() returns 403
+ *  when invoked inside a WebSocket upgrade handler. */
 async function getAsset(env: Env, path: string, baseUrl: string): Promise<ArrayBuffer> {
   const resp = await env.ASSETS.fetch(new URL(path, baseUrl).toString());
   if (!resp.ok) throw new Error(`Asset ${path}: ${resp.status}`);
@@ -97,7 +106,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // GET / → landing page (served from static index.html)
+    // GET / → landing page
     if (url.pathname === "/") {
       return env.ASSETS.fetch(new Request(new URL("/index.html", request.url).toString()));
     }
@@ -148,7 +157,7 @@ export default {
 
           const assets: Record<string, ArrayBuffer> = { bios, vgaBios };
 
-          // Get disk image
+          // Get disk image — try local ASSETS first, fall back to remote URL
           try {
             const localResp = await env.ASSETS.fetch(
               new URL(`/assets/${imageDef.file}`, request.url).toString(),
@@ -190,90 +199,90 @@ export default {
     // /s/:sessionId → session VM (original single-DO path)
     const sessionMatch = url.pathname.match(SESSION_RE);
     if (sessionMatch) {
-      // WebSocket upgrade → route to the session's DO
+      const imageKey = url.searchParams.get("image") || "kolibri";
+      const imageDef = IMAGES[imageKey] || IMAGES.kolibri;
+      const freshBoot = url.searchParams.get("fresh") === "1";
+
+      // All sessions for the same image share one DO — enables multi-client
+      // viewing and shared state snapshots.
+      const id = env.LINUX_VM.idFromName(`vm-${imageKey}`);
+      const stub = env.LINUX_VM.get(id);
+
+      // ── WebSocket upgrade → pure passthrough ───────────────────────────
+      // Init has already been done by the preceding HTTP GET for this page.
+      // env.ASSETS.fetch() CANNOT be called inside a WebSocket upgrade handler
+      // (returns 403), so all asset fetching must happen before this branch.
       if (request.headers.get("Upgrade") === "websocket") {
-        const imageKey = url.searchParams.get("image") || "kolibri";
-        const imageDef = IMAGES[imageKey] || IMAGES.kolibri;
+        return stub.fetch(request);
+      }
 
-        // Use image key as DO name — all sessions for the same image share one VM.
-        // This enables: (a) multi-client viewing, (b) shared state snapshots.
-        const id = env.LINUX_VM.idFromName(`vm-${imageKey}`);
-        const stub = env.LINUX_VM.get(id);
-
-        // Check if the VM is already running — skip the 25-50MB asset reload
-        const statusResp = await stub.fetch(
-          new Request(new URL("/status", request.url).toString()),
-        );
-        const { running } = await statusResp.json<{ running: boolean }>();
-        const freshBoot = url.searchParams.get("fresh") === "1";
-
-        if (freshBoot && running) {
-          // Force reboot: tell DO to stop, then re-init
-          await stub.fetch(new Request(new URL("/reboot", request.url).toString(), { method: "POST" }));
+      // ── HTTP GET → init DO (if needed), then serve session.html ────────
+      // This is a normal HTTP request so env.ASSETS.fetch() works correctly.
+      try {
+        let running = false;
+        try {
+          const statusResp = await stub.fetch(new Request(new URL("/status", request.url).toString()));
+          running = (JSON.parse(await statusResp.text()) as { running: boolean }).running ?? false;
+        } catch (e) {
+          console.error("[do86] Failed to check DO status:", e);
         }
 
-        if (!running || freshBoot) {
-          // Always fetch BIOS ROMs from static assets (small: 131KB + 36KB)
+        if (freshBoot && running) {
+          await stub.fetch(new Request(new URL("/reboot", request.url).toString(), { method: "POST" }));
+          running = false;
+        }
+
+        if (!running) {
+          // Fetch BIOS ROMs (128 KB + 36 KB) — safe here, plain HTTP handler.
           const [bios, vgaBios] = await Promise.all([
             getAsset(env, "/assets/seabios.bin", request.url),
             getAsset(env, "/assets/vgabios.bin", request.url),
           ]);
 
-          const meta: Record<string, any> = {
+          const meta: Record<string, unknown> = {
             imageKey,
             drive: imageDef.drive,
             memory: imageDef.memory,
             vgaMemory: imageDef.vgaMemory,
             label: imageDef.label,
             noSnapshot: imageDef.noSnapshot || false,
+            ...(freshBoot ? { fresh: true } : {}),
           };
 
           const assets: Record<string, ArrayBuffer> = { bios, vgaBios };
 
           if (imageDef.url) {
-            // Try local asset first (dev mode); fall back to URL fetch in DO
-            try {
-              const localResp = await env.ASSETS.fetch(new URL(`/assets/${imageDef.file}`, request.url).toString());
-              if (localResp.ok) {
-                assets.disk = await localResp.arrayBuffer();
-              }
-            } catch { /* not available locally */ }
-
-            if (!assets.disk) {
-              // No local asset — let the DO fetch + cache from URL
-              meta.diskUrl = imageDef.url;
-              meta.diskFile = imageDef.file;
-            }
+            // URL-backed image: tell the DO to fetch + cache it in SQLite.
+            meta.diskUrl = imageDef.url;
+            meta.diskFile = imageDef.file;
           } else {
-            // Small/local image (e.g. KolibriOS floppy): send inline
+            // No public URL (aqeous): send the disk binary inline.
             assets.disk = await getAsset(env, `/assets/${imageDef.file}`, request.url);
           }
 
-          // Pass fresh=1 query param to force cold boot (clears saved snapshot)
-          if (url.searchParams.get("fresh") === "1") {
-            meta.fresh = true;
-          }
-
           assets.metadata = new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer;
-          const packed = packAssets(assets);
 
           const initResp = await stub.fetch(
             new Request(new URL("/init", request.url).toString(), {
               method: "POST",
-              body: packed,
+              body: packAssets(assets),
             }),
           );
-          if (!initResp.ok) return new Response("Failed to init VM", { status: 500 });
+          if (!initResp.ok) {
+            const msg = await initResp.text().catch(() => String(initResp.status));
+            return new Response(`Failed to init VM: ${msg}`, { status: 500 });
+          }
         }
-
-        return stub.fetch(request);
+      } catch (e) {
+        console.error("[do86] Session init error:", e);
+        return new Response(`Init error: ${e}`, { status: 500 });
       }
 
-      // Regular GET → serve the VM client (session.html)
+      // Serve session.html — the client JS will open the WebSocket
       return env.ASSETS.fetch(new Request(new URL("/session.html", request.url).toString()));
     }
 
-    // /api/*
+    // /api/images
     if (url.pathname === "/api/images") {
       return Response.json(
         Object.entries(IMAGES).map(([key, def]) => ({
@@ -285,6 +294,7 @@ export default {
         })),
       );
     }
+
     if (url.pathname === "/api/health") {
       return Response.json({ status: "ok" });
     }

@@ -1,35 +1,47 @@
 /**
- * QEMU ASYNCIFY wrapper for Cloudflare Durable Objects.
+ * QEMU v5 wrapper for Cloudflare Durable Objects.
  *
- * This module drives QEMU compiled to WebAssembly with Emscripten ASYNCIFY.
+ * This module drives QEMU compiled to WebAssembly with Emscripten's
+ * `emscripten_set_main_loop()` callback model (NO ASYNCIFY).
+ *
  * Key properties for DO compatibility:
- *   - No pthreads / no SharedArrayBuffer.Atomics.wait
- *   - ASYNCIFY transforms emscripten_sleep() calls into JS async boundaries
- *   - QEMU's main loop calls emscripten_sleep(N) instead of poll/select
- *   - Each call to step() lets QEMU run for one main-loop iteration (~4ms)
+ *   - No pthreads / no SharedArrayBuffer
+ *   - No ASYNCIFY — QEMU's main loop is driven by `emscripten_set_main_loop()`
+ *     which registers a callback invoked by the JS event loop (setInterval)
+ *   - `callMain()` returns normally after registering the callback
+ *   - Each callback iteration runs TCG translation blocks (up to 4096 per tick)
+ *     then processes I/O events via `main_loop_wait(false)`
+ *   - ~6.3MB WASM (vs ~12MB with ASYNCIFY)
  *
- * Build flags used:
- *   -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=131072
- *   -sASYNCIFY_IMPORTS=emscripten_sleep
- *   -sINVOKE_RUN=0  (we call callMain manually)
- *   -sEXPORTED_RUNTIME_METHODS=FS,callMain
- *   -sENVIRONMENT=node
- *   No -sPROXY_TO_PTHREAD (critical for DO compatibility)
+ * Build flags used (v5):
+ *   -sENVIRONMENT=web,worker,node
+ *   -sEXIT_RUNTIME=0
+ *   -sALLOW_MEMORY_GROWTH=1
+ *   -sINITIAL_MEMORY=268435456
+ *   -sSTACK_SIZE=4194304
+ *   -sALLOW_TABLE_GROWTH=1
+ *   No ASYNCIFY, no pthreads
  *
  * Usage in a Durable Object:
  *
- *   import { QEMUInstance, loadQEMU } from './qemu-asyncify';
+ *   import { QEMUInstance, loadQEMUFromText } from './qemu-asyncify';
  *
  *   export class MyDO extends DurableObject {
  *     qemu: QEMUInstance | null = null;
  *
  *     async fetch(request: Request) {
  *       if (!this.qemu) {
- *         this.qemu = await loadQEMU({
- *           args: ['-M', 'none', '-m', '16M', '-nographic', '-S'],
+ *         const jsText = await getQemuJs(); // load the .js glue code
+ *         const wasmBinary = await getQemuWasm(); // load the .wasm binary
+ *
+ *         this.qemu = await loadQEMUFromText(jsText, {
+ *           args: ['-M', 'pc', '-m', '32M', '-nographic', '-nodefaults',
+ *                  '-no-user-config', '-serial', 'stdio'],
+ *           wasmBinary,
+ *           biosFiles: { 'bios-256k.bin': biosData, 'vgabios.bin': vgaData, ... },
  *           onOutput: (line) => console.log('[QEMU]', line),
  *         });
- *         // QEMU is now running in its main loop, yielding via ASYNCIFY every 4ms
+ *         // QEMU is now running: SeaBIOS boots, serial output flows via onOutput
  *       }
  *       // ... handle requests
  *     }
@@ -43,16 +55,16 @@ export type QEMUOutputCallback = (line: string) => void;
 export interface QEMUOptions {
   /**
    * QEMU command-line arguments (excluding the program name).
-   * Example: ['-M', 'none', '-m', '16M', '-nographic', '-S']
-   *
-   * Note: Machines with complex hardware (PC, isapc) may hang due to
-   * coroutine limitations in the current build. Use '-M none' for
-   * basic operation, or provide a custom kernel/firmware.
+   * Example: ['-M', 'pc', '-m', '32M', '-nographic', '-nodefaults',
+   *           '-no-user-config', '-serial', 'stdio']
    */
   args: string[];
 
-  /** Called with each line of QEMU's stdout/stderr output */
+  /** Called with each line of QEMU's stdout output (serial console) */
   onOutput?: QEMUOutputCallback;
+
+  /** Called with each line of QEMU's stderr output */
+  onError?: QEMUOutputCallback;
 
   /**
    * Called when QEMU aborts (error condition).
@@ -61,17 +73,29 @@ export interface QEMUOptions {
   onAbort?: (reason: string) => void;
 
   /**
-   * Path to the QEMU wasm file (relative or absolute).
-   * Default: './qemu-system-i386.wasm' (for Workers/DO environments,
-   * this should be the URL/binding for the WASM asset)
-   */
-  wasmUrl?: string;
-
-  /**
    * Pre-loaded WASM binary (ArrayBuffer or Uint8Array).
-   * Provide this when you can't use file:// URLs (e.g., in a Worker).
+   * Required in Worker/DO environments where file:// URLs aren't available.
    */
   wasmBinary?: ArrayBuffer | Uint8Array;
+
+  /**
+   * BIOS/firmware files to mount into QEMU's virtual filesystem at
+   * /usr/local/share/qemu/. Keys are filenames, values are file contents.
+   *
+   * Typical files needed for -M pc:
+   *   - bios-256k.bin (SeaBIOS)
+   *   - kvmvapic.bin
+   *   - linuxboot.bin
+   *   - vgabios.bin or vgabios-stdvga.bin or vgabios-cirrus.bin
+   */
+  biosFiles?: Record<string, Uint8Array | ArrayBuffer>;
+
+  /**
+   * Additional files to mount into the virtual filesystem.
+   * Keys are absolute paths, values are file contents.
+   * Parent directories are created automatically.
+   */
+  extraFiles?: Record<string, Uint8Array | ArrayBuffer>;
 }
 
 /** A running QEMU instance */
@@ -82,7 +106,6 @@ export interface QEMUInstance {
   /**
    * The QEMU FS (virtual filesystem).
    * Use this to read/write files that QEMU can access.
-   * Example: qemu.fs.writeFile('/drive.raw', data)
    */
   readonly fs: EmscriptenFS;
 
@@ -93,6 +116,8 @@ export interface QEMUInstance {
 
   /**
    * Stop the QEMU instance (best-effort cleanup).
+   * Cancels the main loop callback. WASM memory is freed by GC
+   * when the DO is evicted.
    */
   stop(): void;
 }
@@ -101,7 +126,6 @@ export interface QEMUInstance {
 interface EmscriptenModule {
   callMain: (args: string[]) => void;
   FS: EmscriptenFS;
-  _emscripten_sleep?: (ms: number) => void;
   [key: string]: unknown;
 }
 
@@ -110,128 +134,79 @@ interface EmscriptenFS {
   writeFile(path: string, data: string | Uint8Array, opts?: { encoding?: string }): void;
   readFile(path: string, opts?: { encoding?: string }): Uint8Array | string;
   mkdir(path: string): void;
+  mkdirTree?(path: string): void;
   unlink(path: string): void;
   stat(path: string): { size: number; mode: number };
   [key: string]: unknown;
 }
 
 /**
- * Load and start QEMU.
- *
- * Returns a Promise that resolves after QEMU's runtime initializes and
- * callMain() has been invoked. At this point QEMU is running asynchronously
- * via ASYNCIFY — its main loop yields to the JS event loop every ~4ms.
+ * Recursively create directories for a path.
+ * Works even if mkdirTree is not available.
  */
-export async function loadQEMU(options: QEMUOptions): Promise<QEMUInstance> {
-  const { args, onOutput, onAbort, wasmUrl, wasmBinary } = options;
-  const outputLines: string[] = [];
-  let aborted = false;
-  let moduleRef: EmscriptenModule | null = null;
-
-  await new Promise<void>((resolve, reject) => {
-    // Set up the Module BEFORE loading the QEMU JS.
-    // The QEMU JS was patched to check globalThis.Module so this works
-    // even when the JS is loaded via require() or dynamic import.
-    (globalThis as unknown as Record<string, unknown>).Module = {
-      // Don't auto-run main — we call it manually after initialization
-      noInitialRun: true,
-
-      // Handle QEMU stdout/stderr
-      print: (line: string) => {
-        outputLines.push(line);
-        onOutput?.(line);
-      },
-      printErr: (line: string) => {
-        outputLines.push(line);
-        onOutput?.(line);
-      },
-
-      // Called when the WASM runtime is ready (but before main runs)
-      onRuntimeInitialized() {
-        moduleRef = (globalThis as unknown as Record<string, unknown>).Module as EmscriptenModule;
-
-        // Launch QEMU's main(). With ASYNCIFY, callMain() suspends when
-        // QEMU's main loop calls emscripten_sleep(), returning control here.
-        try {
-          moduleRef.callMain(args);
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          // ASYNCIFY "unwind" exceptions are normal and should be swallowed
-          if (msg !== 'unwind' && !msg.includes('ExitStatus')) {
-            aborted = true;
-            onAbort?.(msg);
-            reject(new Error(`QEMU callMain error: ${msg}`));
-            return;
-          }
-        }
-
-        // callMain returned — QEMU is now running asynchronously.
-        // The emscripten_sleep() in QEMU's main loop will wake it up
-        // via setTimeout every ~4ms.
-        resolve();
-      },
-
-      onAbort(what: string) {
-        aborted = true;
-        const msg = `QEMU aborted: ${what}`;
-        onAbort?.(msg);
-        reject(new Error(msg));
-      },
-
-      // Provide WASM binary if given (needed for Worker environments
-      // where file: URLs aren't available)
-      ...(wasmBinary ? { wasmBinary } : {}),
-      ...(wasmUrl ? {
-        locateFile: (path: string) => {
-          if (path.endsWith('.wasm')) return wasmUrl;
-          return path;
-        }
-      } : {}),
-    };
-
-    // Load the QEMU JS glue code.
-    // In a Durable Object / Worker, you'd typically do:
-    //   const qemuJs = await env.ASSETS.get('qemu-system-i386.js');
-    //   eval(await qemuJs.text());
-    //
-    // For local testing (Node.js), use:
-    //   require('./qemu-system-i386.js');
-    //
-    // The QEMU JS is designed to use globalThis.Module (patched).
-    // This function just sets up the Module; the caller must arrange
-    // for the QEMU JS to be loaded/executed.
-  });
-
-  if (!moduleRef) {
-    throw new Error('QEMU module not initialized');
+function mkdirp(FS: EmscriptenFS, path: string): void {
+  if (FS.mkdirTree) {
+    FS.mkdirTree(path);
+    return;
   }
-
-  const module = moduleRef;
-
-  return {
-    get module() { return module; },
-    get fs() { return module.FS as EmscriptenFS; },
-    get aborted() { return aborted; },
-    stop() {
-      // Best-effort: there's no clean shutdown for ASYNCIFY QEMU
-      // The DO lifecycle will clean up the WASM memory
-      aborted = true;
-    },
-  };
+  const parts = path.split("/").filter(Boolean);
+  let current = "";
+  for (const part of parts) {
+    current += "/" + part;
+    try {
+      FS.mkdir(current);
+    } catch (_e) {
+      // directory already exists
+    }
+  }
 }
 
 /**
- * Helper to load QEMU in a Durable Object environment.
- * Evaluates the QEMU JS glue code from a text string.
+ * Mount BIOS and extra files into the Emscripten virtual filesystem.
+ */
+function mountFiles(FS: EmscriptenFS, options: QEMUOptions): void {
+  const BIOS_DIR = "/usr/local/share/qemu";
+
+  // Create BIOS directory
+  mkdirp(FS, BIOS_DIR);
+
+  // Mount BIOS files
+  if (options.biosFiles) {
+    for (const [name, data] of Object.entries(options.biosFiles)) {
+      const buf = data instanceof Uint8Array ? data : new Uint8Array(data);
+      FS.writeFile(`${BIOS_DIR}/${name}`, buf);
+    }
+  }
+
+  // Mount extra files
+  if (options.extraFiles) {
+    for (const [path, data] of Object.entries(options.extraFiles)) {
+      const dir = path.substring(0, path.lastIndexOf("/"));
+      if (dir) mkdirp(FS, dir);
+      const buf = data instanceof Uint8Array ? data : new Uint8Array(data);
+      FS.writeFile(path, buf);
+    }
+  }
+}
+
+/**
+ * Load and start QEMU from JS glue code text.
  *
- * @param qemuJsText - The contents of qemu-system-i386.js
+ * This is the primary entry point for Durable Object / Worker environments
+ * where the JS glue code is loaded as a text string (e.g., from KV, R2, or
+ * bundled as a string asset).
+ *
+ * The v5 build uses `emscripten_set_main_loop()` — after `callMain()` returns,
+ * QEMU runs autonomously via the JS event loop. No explicit stepping needed.
+ *
+ * @param qemuJsText - The contents of qemu-system-i386-v5.cjs (globalThis.Module patched)
  * @param options - QEMU initialization options
  */
 export async function loadQEMUFromText(
   qemuJsText: string,
-  options: QEMUOptions
+  options: QEMUOptions,
 ): Promise<QEMUInstance> {
-  const { args, onOutput, onAbort, wasmBinary } = options;
+  const { args, onOutput, onError, onAbort, wasmBinary } = options;
   let resolveInit: () => void;
   let rejectInit: (e: Error) => void;
   let moduleRef: EmscriptenModule | null = null;
@@ -242,25 +217,161 @@ export async function loadQEMUFromText(
     rejectInit = reject;
   });
 
-  // Set up Module globally before the QEMU JS runs
+  // Set up Module globally before the QEMU JS runs.
+  // The .cjs variant is patched to read from globalThis.Module.
   (globalThis as unknown as Record<string, unknown>).Module = {
+    // Don't auto-run main — we call it manually after FS setup
     noInitialRun: true,
 
-    print: (line: string) => onOutput?.(line),
-    printErr: (line: string) => onOutput?.(line),
+    // Don't exit the runtime when main() returns
+    noExitRuntime: true,
 
+    // Serial console output (stdout)
+    print: (line: string) => onOutput?.(line),
+
+    // Debug/error output (stderr)
+    printErr: (line: string) => (onError ?? onOutput)?.(line),
+
+    // Called when the WASM runtime is ready
     onRuntimeInitialized() {
-      moduleRef = (globalThis as unknown as Record<string, unknown>).Module as EmscriptenModule;
+      moduleRef = (globalThis as unknown as Record<string, unknown>)
+        .Module as EmscriptenModule;
+
+      // Mount BIOS and other files before starting QEMU
+      try {
+        mountFiles(moduleRef.FS, options);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        aborted = true;
+        rejectInit(new Error(`Failed to mount files: ${msg}`));
+        return;
+      }
+
+      // Launch QEMU. In v5 (no ASYNCIFY), callMain() runs qemu_init()
+      // and then emscripten_set_main_loop() which registers the main
+      // loop callback. callMain() returns normally.
       try {
         moduleRef.callMain(args);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (msg !== 'unwind' && !msg.includes('ExitStatus')) {
+        // ASYNCIFY "unwind" is swallowed for backwards compat with
+        // older builds. ExitStatus(0) is normal for some configs.
+        if (msg !== "unwind" && !msg.includes("ExitStatus")) {
           aborted = true;
-          rejectInit(new Error(`QEMU callMain: ${msg}`));
+          rejectInit(new Error(`QEMU callMain error: ${msg}`));
           return;
         }
       }
+
+      // callMain returned — QEMU's main loop callback is now
+      // registered via emscripten_set_main_loop(). The JS event
+      // loop will invoke it automatically.
+      resolveInit();
+    },
+
+    onAbort(what: string) {
+      aborted = true;
+      rejectInit(new Error(`QEMU aborted: ${what}`));
+    },
+
+    // Provide WASM binary (required in Worker/DO where fetch() of
+    // file:// URLs isn't possible)
+    ...(wasmBinary ? { wasmBinary } : {}),
+  };
+
+  // Execute the QEMU JS glue code in the current context.
+  // This kicks off WASM compilation and will call onRuntimeInitialized
+  // asynchronously when ready.
+  // eslint-disable-next-line no-new-func
+  const fn = new Function(qemuJsText);
+  fn();
+
+  await initPromise;
+
+  const module = moduleRef!;
+  return {
+    get module() {
+      return module;
+    },
+    get fs() {
+      return module.FS as EmscriptenFS;
+    },
+    get aborted() {
+      return aborted;
+    },
+    stop() {
+      // Cancel the Emscripten main loop if possible
+      try {
+        const cancelMainLoop = module[
+          "_emscripten_cancel_main_loop"
+        ] as (() => void) | undefined;
+        if (typeof cancelMainLoop === "function") {
+          cancelMainLoop();
+        }
+      } catch (_e) {
+        // best-effort
+      }
+      aborted = true;
+    },
+  };
+}
+
+/**
+ * Load and start QEMU using require() (Node.js / CJS testing only).
+ *
+ * Sets up globalThis.Module and then requires the .cjs file.
+ * The .cjs file must be the globalThis.Module-patched variant.
+ *
+ * @param requirePath - Path to the .cjs file (e.g., './qemu-wasm/qemu-system-i386-v5.cjs')
+ * @param options - QEMU initialization options
+ */
+export async function loadQEMU(options: QEMUOptions & { requirePath: string }): Promise<QEMUInstance> {
+  const { requirePath, ...rest } = options;
+
+  // In Node.js, we can read the file and use loadQEMUFromText
+  // But for CJS compat, we set up globalThis.Module and use require()
+  const { args, onOutput, onError, onAbort, wasmBinary } = rest;
+  let resolveInit: () => void;
+  let rejectInit: (e: Error) => void;
+  let moduleRef: EmscriptenModule | null = null;
+  let aborted = false;
+
+  const initPromise = new Promise<void>((resolve, reject) => {
+    resolveInit = resolve;
+    rejectInit = reject;
+  });
+
+  (globalThis as unknown as Record<string, unknown>).Module = {
+    noInitialRun: true,
+    noExitRuntime: true,
+
+    print: (line: string) => onOutput?.(line),
+    printErr: (line: string) => (onError ?? onOutput)?.(line),
+
+    onRuntimeInitialized() {
+      moduleRef = (globalThis as unknown as Record<string, unknown>)
+        .Module as EmscriptenModule;
+
+      try {
+        mountFiles(moduleRef.FS, rest);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        aborted = true;
+        rejectInit(new Error(`Failed to mount files: ${msg}`));
+        return;
+      }
+
+      try {
+        moduleRef.callMain(args);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg !== "unwind" && !msg.includes("ExitStatus")) {
+          aborted = true;
+          rejectInit(new Error(`QEMU callMain error: ${msg}`));
+          return;
+        }
+      }
+
       resolveInit();
     },
 
@@ -272,20 +383,35 @@ export async function loadQEMUFromText(
     ...(wasmBinary ? { wasmBinary } : {}),
   };
 
-  // Execute the QEMU JS glue code in the current context
-  // This sets up the WASM loading and will call onRuntimeInitialized
-  // when ready (asynchronously via Promise)
-  // eslint-disable-next-line no-new-func
-  const fn = new Function(qemuJsText);
-  fn();
+  // Use dynamic require for CJS
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  require(requirePath);
 
   await initPromise;
 
   const module = moduleRef!;
   return {
-    get module() { return module; },
-    get fs() { return module.FS as EmscriptenFS; },
-    get aborted() { return aborted; },
-    stop() { aborted = true; },
+    get module() {
+      return module;
+    },
+    get fs() {
+      return module.FS as EmscriptenFS;
+    },
+    get aborted() {
+      return aborted;
+    },
+    stop() {
+      try {
+        const cancelMainLoop = module[
+          "_emscripten_cancel_main_loop"
+        ] as (() => void) | undefined;
+        if (typeof cancelMainLoop === "function") {
+          cancelMainLoop();
+        }
+      } catch (_e) {
+        // best-effort
+      }
+      aborted = true;
+    },
   };
 }
