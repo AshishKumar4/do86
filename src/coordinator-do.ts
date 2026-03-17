@@ -88,7 +88,7 @@ interface CoreStubRPC {
     isBSP: boolean;
     pageStats: Record<string, number> | null;
     ramStats: Record<string, number> | null;
-    heapUsage: number;
+    cpuHalted: boolean;
   }>;
 }
 
@@ -414,7 +414,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     isBSP: boolean;
     pageStats: Record<string, number> | null;
     ramStats: Record<string, number> | null;
-    heapUsage: number;
+    cpuHalted: boolean;
   } | { apicId: number; state: string; error: string }>> {
     const statuses: Array<{
       apicId: number;
@@ -422,7 +422,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       isBSP: boolean;
       pageStats: Record<string, number> | null;
       ramStats: Record<string, number> | null;
-      heapUsage: number;
+      cpuHalted: boolean;
     } | { apicId: number; state: string; error: string }> = [];
     for (const [apicId, stub] of this.coreStubs) {
       try {

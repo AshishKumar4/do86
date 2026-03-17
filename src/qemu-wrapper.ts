@@ -1,19 +1,29 @@
 /**
- * qemu-wrapper.ts — QEMU WASM v5 lifecycle manager for Durable Objects.
+ * qemu-wrapper.ts — QEMU WASM lifecycle manager for Durable Objects.
  *
- * Loads qemu-system-i386-v5 (Emscripten, NO ASYNCIFY), configures the
+ * Loads qemu-system-i386 (Emscripten, NO ASYNCIFY), configures the
  * Emscripten VFS with BIOS/disk images, hooks serial + display + APIC
  * bridge exports, and drives the main-loop via emscripten_set_main_loop().
  *
- * 17 confirmed WASM exports from the QEMU v5 build:
- *   _main, _callMain,
- *   _wasm_apic_get_id, _wasm_apic_set_id,
- *   _wasm_apic_inject_irq, _wasm_apic_read_icr,
- *   _wasm_cpu_set_sipi_vector, _wasm_cpu_resume, _wasm_cpu_halt,
+ * Actual WASM exports (Emscripten adds `_` prefix):
+ *   _wasm_display_init
  *   _wasm_get_display_surface_data, _wasm_get_display_stride,
  *   _wasm_get_display_width, _wasm_get_display_height,
- *   _wasm_flush_tlb_page, _wasm_get_heap_usage,
- *   _wasm_page_fault_handler, _wasm_set_page_pool_base
+ *   _wasm_cpu_set_sipi_vector, _wasm_cpu_resume,
+ *   _wasm_cpu_get_halted, _wasm_cpu_get_eip,
+ *   _wasm_cpu_interrupt, _wasm_cpu_flush_tlb, _wasm_cpu_flush_tlb_page,
+ *   _wasm_apic_get_id, _wasm_apic_set_id,
+ *   _wasm_apic_inject_irq, _wasm_apic_read_icr,
+ *   _wasm_apic_get_highest_irr
+ *
+ * EM_ASM callbacks (set on Module before init, called synchronously by QEMU):
+ *   Module.onTlbMiss(gpa)       — page fault handler, returns WASM offset
+ *   Module.onICRWrite(lo, hi)   — LAPIC ICR write (outbound IPI)
+ *   Module.onSerialChar(code)   — per-character serial output
+ *   Module.onDisplayUpdate(x, y, w, h, ptr, stride, surfW)
+ *   Module.onDisplayResize(w, h)
+ *   Module.preTick()            — before each main-loop iteration
+ *   Module.postTick()           — after each main-loop iteration
  *
  * Key invariants:
  *  - No ASYNCIFY: the main loop runs via emscripten_set_main_loop() callback.
@@ -32,8 +42,8 @@ import { LOG_PREFIX } from "./types";
 // ── QEMU WASM module asset imports ──────────────────────────────────────────
 // The bundler resolves these to the qemu-wasm/ directory.
 
-import qemuWasmModule from "../qemu-wasm/qemu-system-i386-v5.wasm";
-import qemuJsGlue from "../qemu-wasm/qemu-system-i386-v5.cjs" with { type: "text" };
+import qemuWasmModule from "../qemu-wasm/qemu-system-i386.wasm";
+import qemuJsGlue from "../qemu-wasm/qemu-system-i386.js" with { type: "text" };
 
 // ── Emscripten FS subset ────────────────────────────────────────────────────
 
@@ -47,6 +57,7 @@ interface EmscriptenFS {
 }
 
 // ── QEMU Module interface (typed exports) ───────────────────────────────────
+// Only exports that actually exist in the QEMU WASM build.
 
 interface QEMUModule {
   callMain: (args: string[]) => void;
@@ -59,40 +70,40 @@ interface QEMUModule {
   _wasm_apic_set_id(id: number): void;
   _wasm_apic_inject_irq(vector: number, triggerMode: number): void;
   _wasm_apic_read_icr(icrLowPtr: number, icrHighPtr: number): number;
+  _wasm_apic_get_highest_irr(): number;
 
   // ── CPU control exports ───────────────────────────────────────────────
   _wasm_cpu_set_sipi_vector(vector: number): void;
   _wasm_cpu_resume(): void;
-  _wasm_cpu_halt(): void;
+  _wasm_cpu_get_halted(): number;
+  _wasm_cpu_get_eip(): number;
+  _wasm_cpu_interrupt(vector: number): void;
+  _wasm_cpu_flush_tlb(): void;
+  _wasm_cpu_flush_tlb_page(gpa: number): void;
 
   // ── Display exports ───────────────────────────────────────────────────
+  _wasm_display_init(): void;
   _wasm_get_display_surface_data(): number;
   _wasm_get_display_stride(): number;
   _wasm_get_display_width(): number;
   _wasm_get_display_height(): number;
-
-  // ── Memory / TLB exports ──────────────────────────────────────────────
-  _wasm_flush_tlb_page(gpa: number): void;
-  _wasm_get_heap_usage(): number;
-  _wasm_page_fault_handler(gpa: number): number;
-  _wasm_set_page_pool_base(base: number): void;
 
   // ── Emscripten lifecycle ──────────────────────────────────────────────
   _emscripten_cancel_main_loop?(): void;
   _malloc(size: number): number;
   _free(ptr: number): void;
 
-  // ── Module hooks (set before init) ────────────────────────────────────
+  // ── EM_ASM callbacks (set on Module before/during init) ───────────────
   preTick?: () => void;
   postTick?: () => void;
   onICRWrite?: (icrLow: number, icrHigh: number) => void;
+  onTlbMiss?: (gpa: number) => number;
   onDisplayUpdate?: (
     x: number, y: number, w: number, h: number,
     dataPtr: number, stride: number, surfaceWidth: number,
   ) => void;
   onDisplayResize?: (width: number, height: number) => void;
   onSerialChar?: (charCode: number) => void;
-  onPageFault?: (gpa: number) => number;
 }
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -178,15 +189,28 @@ export class QEMUWrapper {
     // Set APIC ID
     module._wasm_apic_set_id(config.apicId);
 
+    // Initialize the WASM display backend
+    module._wasm_display_init();
+
     // Allocate scratch buffer for ICR reads (2 x uint32 = 8 bytes)
     this.icrScratchPtr = module._malloc(8);
 
-    // Install hooks
-    this.installHooks(module, config);
+    // Wire up the SqlPageStore to WASM heap for demand-paged RAM.
+    // The page pool lives in the upper region of QEMU's WASM heap.
+    // We use INITIAL_MEMORY minus a safety margin as the pool base,
+    // since QEMU allocates from the bottom up via sbrk/malloc.
+    // The pool base is computed from HEAPU8 length to stay within bounds.
+    const heapLen = module.HEAPU8.byteLength;
+    const poolSize = config.sqlPageStore.maxFrameCount * 4096;
+    const poolBase = heapLen - poolSize;
+    config.sqlPageStore.setWasmHeap(module.HEAPU8, poolBase);
+
+    this.running = true;
 
     console.log(
       `${LOG_PREFIX} QEMU Core ${config.apicId} initialized ` +
-      `(BSP=${config.isBSP}, heap=${config.wasmHeapMB}MB)`,
+      `(BSP=${config.isBSP}, heap=${config.wasmHeapMB}MB, ` +
+      `pool@0x${poolBase.toString(16)}, ${config.sqlPageStore.maxFrameCount} frames)`,
     );
   }
 
@@ -227,6 +251,14 @@ export class QEMUWrapper {
           this.handleICRWrite(icrLow, icrHigh);
         },
 
+        // TLB miss / page fault callback — SYNCHRONOUS.
+        // Called from patched cputlb.c via EM_ASM when QEMU's softmmu
+        // can't resolve a guest physical address. Returns the WASM heap
+        // offset of the page frame containing the data, or -1.
+        onTlbMiss: (gpa: number) => {
+          return this.handleTlbMiss(gpa);
+        },
+
         // Display update callback
         onDisplayUpdate: (
           x: number, y: number, w: number, h: number,
@@ -261,12 +293,6 @@ export class QEMUWrapper {
           this.displayWidth = width;
           this.displayHeight = height;
           this.displayDirty = true;
-        },
-
-        // Page fault callback — SYNCHRONOUS, called from QEMU's TLB miss handler.
-        // Returns the WASM heap offset of the page frame, or -1 if not available.
-        onPageFault: (gpa: number) => {
-          return this.handlePageFault(gpa);
         },
 
         // Pre/post tick hooks — called by patched main_loop_callback
@@ -313,7 +339,7 @@ export class QEMUWrapper {
         wasmBinary: qemuWasmModule,
       };
 
-      // Set up globalThis.Module — the CJS glue reads from it.
+      // Set up globalThis.Module — the JS glue reads from it.
       (globalThis as unknown as Record<string, unknown>).Module = moduleOverrides;
 
       // Execute the Emscripten JS glue code.
@@ -395,26 +421,6 @@ export class QEMUWrapper {
     }
   }
 
-  /**
-   * Install pre/post tick hooks and other runtime callbacks on the module.
-   */
-  private installHooks(module: QEMUModule, config: QEMUWrapperConfig): void {
-    // Module hooks are already set during loadModule via moduleOverrides.
-    // This method performs any post-init wiring that needs the module ref.
-
-    // Set page pool base address so QEMU's TLB miss handler knows where
-    // the swappable page frames live in the WASM heap.
-    if (typeof module._wasm_set_page_pool_base === "function") {
-      const heapUsage = module._wasm_get_heap_usage();
-      // Page pool starts after QEMU's own heap usage, aligned to 4KB
-      const poolBase = (heapUsage + 0xFFF) & ~0xFFF;
-      module._wasm_set_page_pool_base(poolBase);
-      config.sqlPageStore.setWasmHeap(module.HEAPU8, poolBase);
-    }
-
-    this.running = true;
-  }
-
   // ── Pre/Post Tick ─────────────────────────────────────────────────────
 
   /**
@@ -429,7 +435,7 @@ export class QEMUWrapper {
       this.config.sqlPageStore.pageOut(gpa, data);
       this.pendingPageFetches.delete(gpa);
       // Flush QEMU's TLB entry so next access sees the new data
-      this.module._wasm_flush_tlb_page(gpa);
+      this.module._wasm_cpu_flush_tlb_page(gpa);
     }
     this.resolvedPages.clear();
   }
@@ -512,11 +518,11 @@ export class QEMUWrapper {
     this.module._wasm_apic_inject_irq(vector, triggerMode);
   }
 
-  // ── Page Fault Handling ───────────────────────────────────────────────
+  // ── TLB Miss / Demand Paging ──────────────────────────────────────────
 
   /**
-   * Handle a synchronous page fault from QEMU's TLB miss handler.
-   * Called via EM_ASM in the patched cputlb.c.
+   * Handle a synchronous TLB miss from QEMU's softmmu.
+   * Called via EM_ASM in the patched cputlb.c (Module.onTlbMiss).
    *
    * Returns: WASM heap offset of the page frame (for TLB fill), or -1.
    *
@@ -524,7 +530,7 @@ export class QEMUWrapper {
    * (sql.exec is synchronous). This is the critical path that makes
    * demand-paged RAM work without ASYNCIFY.
    */
-  private handlePageFault(gpa: number): number {
+  private handleTlbMiss(gpa: number): number {
     if (!this.config) return -1;
 
     // Log for between-tick async prefetch of remote pages
@@ -548,11 +554,20 @@ export class QEMUWrapper {
   }
 
   /**
-   * Halt the CPU (INIT reset).
+   * Halt the CPU (INIT reset). Since there's no _wasm_cpu_halt export,
+   * we cancel the main loop to stop execution. The CPU will be
+   * re-started via handleSIPI() when SIPI arrives.
    */
   halt(): void {
     if (!this.module) return;
-    this.module._wasm_cpu_halt();
+    // Cancel the main loop to stop TB execution
+    if (typeof this.module._emscripten_cancel_main_loop === "function") {
+      try {
+        this.module._emscripten_cancel_main_loop();
+      } catch {
+        // best-effort
+      }
+    }
     this.running = false;
   }
 
@@ -563,6 +578,54 @@ export class QEMUWrapper {
     if (!this.module) return;
     this.module._wasm_cpu_resume();
     this.running = true;
+  }
+
+  /**
+   * Check if the CPU is in HLT state.
+   */
+  isCpuHalted(): boolean {
+    if (!this.module) return true;
+    return this.module._wasm_cpu_get_halted() !== 0;
+  }
+
+  /**
+   * Get the current EIP (instruction pointer).
+   */
+  getCpuEip(): number {
+    if (!this.module) return 0;
+    return this.module._wasm_cpu_get_eip();
+  }
+
+  /**
+   * Inject a CPU interrupt directly (not via APIC).
+   */
+  cpuInterrupt(vector: number): void {
+    if (!this.module) return;
+    this.module._wasm_cpu_interrupt(vector);
+  }
+
+  /**
+   * Flush the entire TLB.
+   */
+  flushTlb(): void {
+    if (!this.module) return;
+    this.module._wasm_cpu_flush_tlb();
+  }
+
+  /**
+   * Flush a single TLB entry for a guest physical address.
+   */
+  flushTlbPage(gpa: number): void {
+    if (!this.module) return;
+    this.module._wasm_cpu_flush_tlb_page(gpa);
+  }
+
+  /**
+   * Get the highest pending IRR vector.
+   */
+  getHighestIrr(): number {
+    if (!this.module) return -1;
+    return this.module._wasm_apic_get_highest_irr();
   }
 
   // ── Display ───────────────────────────────────────────────────────────
@@ -639,14 +702,14 @@ export class QEMUWrapper {
 
     const heap = this.module.HEAPU8;
     const result: Array<[number, ArrayBuffer]> = [];
-    const PAGE_SIZE = 4096;
+    const PG_SIZE = 4096;
 
     for (let i = 0; i < numPages; i++) {
-      const addr = startAddr + i * PAGE_SIZE;
-      if (addr + PAGE_SIZE > heap.byteLength) break;
+      const addr = startAddr + i * PG_SIZE;
+      if (addr + PG_SIZE > heap.byteLength) break;
 
-      const pageData = new ArrayBuffer(PAGE_SIZE);
-      new Uint8Array(pageData).set(heap.subarray(addr, addr + PAGE_SIZE));
+      const pageData = new ArrayBuffer(PG_SIZE);
+      new Uint8Array(pageData).set(heap.subarray(addr, addr + PG_SIZE));
       result.push([addr, pageData]);
     }
 
@@ -660,10 +723,10 @@ export class QEMUWrapper {
     if (!this.module) return;
 
     const heap = this.module.HEAPU8;
-    const PAGE_SIZE = 4096;
+    const PG_SIZE = 4096;
 
     for (const [addr, data] of pages) {
-      if (addr + PAGE_SIZE <= heap.byteLength) {
+      if (addr + PG_SIZE <= heap.byteLength) {
         heap.set(new Uint8Array(data), addr);
       }
     }
@@ -698,14 +761,6 @@ export class QEMUWrapper {
     this.config?.sqlPageStore.flushDirty();
 
     this.aborted = true;
-  }
-
-  /**
-   * Get current heap usage stats.
-   */
-  getHeapUsage(): number {
-    if (!this.module) return 0;
-    return this.module._wasm_get_heap_usage();
   }
 
   /**

@@ -90,6 +90,11 @@ export class SqlPageStore {
   /** Maximum number of frames in the pool. */
   private maxFrames: number;
 
+  /** Public read-only access to max frame count (used by QEMUWrapper to size pool). */
+  get maxFrameCount(): number {
+    return this.maxFrames;
+  }
+
   constructor(
     private readonly sql: SqlHandle,
     maxFrames: number = HOT_PAGES_MAX,

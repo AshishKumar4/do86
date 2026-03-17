@@ -349,7 +349,7 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
       totalFrames: number;
       accessCounter: number;
     } | null;
-    heapUsage: number;
+    cpuHalted: boolean;
   }> {
     return {
       apicId: this.apicId,
@@ -357,7 +357,7 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
       isBSP: this.isBSP,
       pageStats: this.pageCache?.stats ?? null,
       ramStats: this.sqlPageStore?.stats ?? null,
-      heapUsage: this.qemu?.getHeapUsage() ?? 0,
+      cpuHalted: this.qemu?.isCpuHalted() ?? true,
     };
   }
 
