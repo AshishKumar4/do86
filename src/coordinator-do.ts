@@ -5,9 +5,25 @@
  * - Accepts browser WebSocket connections (screen, keyboard, mouse)
  * - Manages per-core CpuCoreDO instances via RPC
  * - Holds the canonical page directory for memory coherence
- * - Routes inter-processor interrupts between cores
+ * - Routes inter-processor interrupts between cores via QEMU APIC bridge
  * - Hosts the IOAPIC for external interrupt routing
  * - Forwards BSP screen frames to browser clients
+ *
+ * QEMU migration notes:
+ *   - IPI routing uses the same IPIRouter / decodeICR infrastructure.
+ *     The difference is that CpuCoreDO now uses QEMUWrapper's bridge
+ *     exports (wasm_apic_inject_irq, wasm_apic_read_icr) instead of
+ *     direct WASM memory reads at v86 APIC struct offsets.
+ *   - The ICR-write-callback approach (Module.onICRWrite via EM_ASM
+ *     in patched apic_mem_write) means IPIs are push-based from cores
+ *     rather than poll-based. The coordinator's routeIPI() RPC entry
+ *     point is unchanged.
+ *   - AP boot uses wasm_cpu_set_sipi_vector + wasm_cpu_resume instead
+ *     of manual register patching. The coordinator still orchestrates
+ *     the INIT→SIPI sequence via IPIRouter callbacks.
+ *   - Display frames use the same 12-byte header format:
+ *     [width:u32, height:u32, bufferWidth:u32, rgba...]
+ *     QEMU's BGRA→RGBA conversion happens in QEMUWrapper.getScreenFrame().
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -27,6 +43,58 @@ export interface CoordinatorEnv {
   COORDINATOR: DurableObjectNamespace;
   CPU_CORE: DurableObjectNamespace;
   ASSETS: { fetch: (request: Request | string) => Promise<Response> };
+}
+
+// ── Core RPC stub interface ─────────────────────────────────────────────────
+// Typed interface for RPC calls to CpuCoreDO. The actual stub is untyped
+// (DurableObjectStub), but these methods match the CpuCoreDO class.
+
+interface CoreStubRPC {
+  init(config: {
+    apicId: number;
+    isBSP: boolean;
+    memorySizeBytes: number;
+    vgaMemorySizeBytes: number;
+    bios?: ArrayBuffer;
+    vgaBios?: ArrayBuffer;
+    disk?: ArrayBuffer;
+    diskDrive?: "fda" | "cdrom";
+  }, coordinatorId: string): Promise<{ status: string }>;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  initReset(): Promise<void>;
+  startupIPI(vector: number, memoryConfig: {
+    memorySizeBytes: number;
+    vgaMemorySizeBytes: number;
+    bios: ArrayBuffer;
+    vgaBios: ArrayBuffer;
+  }, trampolinePages: Map<number, ArrayBuffer>): Promise<void>;
+  injectInterrupt(ipi: IPIMessage): Promise<void>;
+  invalidatePage(physAddr: number): Promise<void>;
+  writeback(physAddr: number): Promise<ArrayBuffer>;
+  readPages(startAddr: number, numPages: number): Promise<Array<[number, ArrayBuffer]>>;
+  getScreenFrame(): Promise<ArrayBuffer | null>;
+  getTextScreen(): Promise<{ cols: number; rows: number; lines: string[] } | null>;
+  isGraphicalMode(): Promise<boolean>;
+  flushSerial(): Promise<string | null>;
+  sendKeyCode(code: number, isUp: boolean): Promise<void>;
+  sendMouseDelta(dx: number, dy: number): Promise<void>;
+  sendMouseClick(buttons: [boolean, boolean, boolean]): Promise<void>;
+  sendText(data: string): Promise<void>;
+  sendScancodes(codes: number[]): Promise<void>;
+  getStatus(): Promise<{
+    apicId: number;
+    state: string;
+    isBSP: boolean;
+    pageStats: Record<string, number> | null;
+    ramStats: Record<string, number> | null;
+    heapUsage: number;
+  }>;
+}
+
+/** Cast a DurableObjectStub to the typed RPC interface. */
+function coreRPC(stub: DurableObjectStub): CoreStubRPC {
+  return stub as unknown as CoreStubRPC;
 }
 
 // ── CoordinatorDO ────────────────────────────────────────────────────────────
@@ -149,7 +217,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     if (!this.cachedAssets) throw new Error("No assets loaded");
     this.booting = true;
     this.bootError = null;
-    this.broadcast(encodeStatus("booting: distributed SMP"));
+    this.broadcast(encodeStatus("booting: distributed SMP (QEMU)"));
 
     try {
       const bios = this.cachedAssets.get("bios");
@@ -197,62 +265,59 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       // Initialize memory coherence
       this.pageDir = new PageDirectory(memoryBytes);
 
-      // Initialize IPI routing
+      // Initialize IPI routing with QEMU APIC bridge callbacks
       this.ipiRouter = new IPIRouter(async (targetApicId, ipi) => {
         await this.deliverIPIToCore(targetApicId, ipi);
       });
 
+      // ── INIT callback: create AP core DO ────────────────────────────
       this.ipiRouter.onCoreCreate = async (apicId) => {
         await this.createCore(apicId, false);
-        // Initialize the AP core — it won't create an emulator yet,
-        // just sets up state and waits for SIPI
+        // Initialize the AP core — it creates its SqlPageStore and waits for SIPI
         const stub = this.coreStubs.get(apicId);
         if (stub) {
           const coordId = this.ctx.id.toString();
-          await (stub as any).init(
+          await coreRPC(stub).init(
             {
               apicId,
               isBSP: false,
               memorySizeBytes: this.memorySizeBytes,
               vgaMemorySizeBytes: this.vgaMemorySizeBytes,
+              bios: this.biosData!,
+              vgaBios: this.vgaBiosData!,
             },
             coordId,
           );
         }
       };
 
+      // ── SIPI callback: copy trampoline pages, start AP ──────────────
+      // With QEMU, the AP's QEMUWrapper.handleSIPI() calls
+      // wasm_cpu_set_sipi_vector + wasm_cpu_resume, which sets CS:IP to
+      // real mode at vector:0000 and unpauses the vCPU. The trampoline
+      // pages are written to WASM memory before SIPI is delivered.
       this.ipiRouter.onCoreSIPI = async (apicId, vector) => {
         const stub = this.coreStubs.get(apicId);
         if (!stub) return;
 
-        // The AP needs the trampoline code that BSP wrote to low memory.
-        // Fetch pages from BSP's WASM memory around the SIPI vector address.
-        // AqeousOS writes trampoline at (vector << 12) and data above it.
-        // We grab a generous range: 8 pages below the vector page through
-        // 16 pages above it (covers stack, GDT, IDT, pmode code).
+        // Fetch trampoline pages from BSP's QEMU WASM memory
         const bsp = this.coreStubs.get(0);
         const trampolinePages = new Map<number, ArrayBuffer>();
 
         if (bsp) {
           const baseAddr = vector * 0x1000;
-          // Fetch low memory pages 0x0000-0x20000 (first 128KB)
-          // This covers: IVT (0x0000), BDA (0x400), trampoline + stack area
-          // AqeousOS AP stacks start at 8192 (0x2000), vector is typically
-          // at (AP_stacks + coreIndex*8192 - 4096)
+          // Fetch low memory (0x0000-0x20000) — covers IVT, BDA, trampoline
           const lowMemPages = 32; // 32 pages = 128KB
-          const pages = await (bsp as any).readPages(0, lowMemPages) as Array<[number, ArrayBuffer]>;
+          const pages = await coreRPC(bsp).readPages(0, lowMemPages);
           for (const [addr, data] of pages) {
             trampolinePages.set(addr, data);
           }
 
-          // Also grab the specific trampoline page and surroundings
-          // in case the kernel placed them above 128KB
+          // Also grab pages around the SIPI vector if above 128KB
           if (baseAddr >= lowMemPages * 4096) {
-            const extraStart = baseAddr - 4096; // one page below
-            const extraPages = 8; // 8 pages (32KB)
-            const extra = await (bsp as any).readPages(
-              Math.max(0, extraStart), extraPages,
-            ) as Array<[number, ArrayBuffer]>;
+            const extraStart = Math.max(0, baseAddr - 4096);
+            const extraPages = 8;
+            const extra = await coreRPC(bsp).readPages(extraStart, extraPages);
             for (const [addr, data] of extra) {
               trampolinePages.set(addr, data);
             }
@@ -264,11 +329,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
           );
         }
 
-        await (stub as any).startupIPI(vector, {
+        // Deliver SIPI to the AP core — QEMUWrapper.handleSIPI() sets
+        // the SIPI vector via wasm_cpu_set_sipi_vector and resumes.
+        await coreRPC(stub).startupIPI(vector, {
           memorySizeBytes: this.memorySizeBytes,
           vgaMemorySizeBytes: this.vgaMemorySizeBytes,
-          bios: this.biosData,
-          vgaBios: this.vgaBiosData,
+          bios: this.biosData!,
+          vgaBios: this.vgaBiosData!,
         }, trampolinePages);
       };
 
@@ -281,20 +348,20 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       this.pageDir.assignAllToCore(0);
 
       // Create and boot BSP (Core 0)
-      console.log(`${LOG_PREFIX} Creating BSP (Core 0)`);
+      console.log(`${LOG_PREFIX} Creating BSP (Core 0) with QEMU`);
       await this.createCore(0, true);
 
-      // Initialize BSP with full boot config
+      // Initialize BSP with full boot config (BIOS + disk)
       const bspStub = this.coreStubs.get(0);
       if (!bspStub) throw new Error("Failed to create BSP");
 
       const coordId = this.ctx.id.toString();
-      await (bspStub as any).init(
+      await coreRPC(bspStub).init(
         {
           apicId: 0,
           isBSP: true,
           memorySizeBytes: memoryBytes,
-          vgaMemorySizeBytes: vgaMemoryMB * 1024 * 1024,
+          vgaMemorySizeBytes: vgaMemoryBytes,
           bios: bios,
           vgaBios: vgaBios,
           disk: disk,
@@ -303,8 +370,9 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         coordId,
       );
 
-      // Start BSP execution
-      await (bspStub as any).start();
+      // Start BSP execution — QEMU's emscripten_set_main_loop is already
+      // registered; this just sets the core state to RUNNING.
+      await coreRPC(bspStub).start();
       this.ipiRouter.registerCore(0);
 
       // Free cached assets
@@ -312,11 +380,11 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
       this.booted = true;
       this.booting = false;
-      this.broadcast(encodeStatus(`running: distributed SMP (${this.numCores} cores)`));
+      this.broadcast(encodeStatus(`running: distributed SMP QEMU (${this.numCores} cores)`));
       this.startRenderLoop();
 
       console.log(
-        `${LOG_PREFIX} Distributed SMP VM booted: ${this.vmId} ` +
+        `${LOG_PREFIX} Distributed SMP VM booted (QEMU): ${this.vmId} ` +
         `(${this.numCores} cores, ${memorySizeMB}MB RAM)`,
       );
     } catch (err) {
@@ -333,16 +401,32 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   private async createCore(apicId: number, _isBSP: boolean): Promise<void> {
     const name = `vm-${this.vmId}-core-${apicId}`;
     const id = this.env.CPU_CORE.idFromName(name);
-    const stub = this.env.CPU_CORE.get(id, { locationHint: this.coreLocation as any });
+    const stub = this.env.CPU_CORE.get(id, {
+      locationHint: this.coreLocation as DurableObjectLocationHint,
+    });
     this.coreStubs.set(apicId, stub);
     console.log(`${LOG_PREFIX} Created core DO: ${name} (APIC ID ${apicId})`);
   }
 
-  private async getCoreStatuses(): Promise<any[]> {
-    const statuses = [];
+  private async getCoreStatuses(): Promise<Array<{
+    apicId: number;
+    state: string;
+    isBSP: boolean;
+    pageStats: Record<string, number> | null;
+    ramStats: Record<string, number> | null;
+    heapUsage: number;
+  } | { apicId: number; state: string; error: string }>> {
+    const statuses: Array<{
+      apicId: number;
+      state: string;
+      isBSP: boolean;
+      pageStats: Record<string, number> | null;
+      ramStats: Record<string, number> | null;
+      heapUsage: number;
+    } | { apicId: number; state: string; error: string }> = [];
     for (const [apicId, stub] of this.coreStubs) {
       try {
-        const status = await (stub as any).getStatus();
+        const status = await coreRPC(stub).getStatus();
         statuses.push(status);
       } catch (e) {
         statuses.push({ apicId, state: "error", error: String(e) });
@@ -351,16 +435,30 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     return statuses;
   }
 
-  // ── IPI delivery ──────────────────────────────────────────────────────
+  // ── IPI delivery (QEMU APIC bridge) ───────────────────────────────────
+  // The IPI routing protocol is identical to the v86 version.
+  // The difference is in how the target core handles it:
+  //   v86:  Direct write to APIC IRR bits in WASM linear memory
+  //   QEMU: CpuCoreDO.injectInterrupt() → wasm_apic_inject_irq()
 
   /**
-   * Called by cores via RPC when they write to LAPIC ICR.
+   * Called by cores via RPC when the guest writes to LAPIC ICR.
+   * This is the push-based path — QEMU's patched apic_mem_write calls
+   * Module.onICRWrite via EM_ASM, which fires onIPISend in QEMUWrapper,
+   * which calls this RPC method on the coordinator.
    */
   async routeIPI(ipi: IPIMessage): Promise<void> {
     if (!this.ipiRouter) return;
     await this.ipiRouter.route(ipi);
   }
 
+  /**
+   * Deliver an IPI to a target core via the QEMU APIC bridge.
+   *
+   * For FIXED/LOWEST_PRIORITY: calls injectInterrupt → wasm_apic_inject_irq
+   * For INIT: calls initReset → wasm_cpu_halt
+   * For SIPI: handled by IPIRouter.onCoreSIPI → startupIPI
+   */
   private async deliverIPIToCore(targetApicId: number, ipi: IPIMessage): Promise<void> {
     const stub = this.coreStubs.get(targetApicId);
     if (!stub) {
@@ -369,14 +467,14 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     }
 
     try {
-      // INIT IPI: reset the core to wait for SIPI
+      // INIT IPI: halt the core, wait for SIPI
       if (ipi.mode === DeliveryMode.INIT) {
-        await (stub as any).initReset();
+        await coreRPC(stub).initReset();
         return;
       }
 
-      // Standard IPI: inject into LAPIC IRR
-      await (stub as any).injectInterrupt(ipi);
+      // Standard IPI: inject into LAPIC via QEMU bridge
+      await coreRPC(stub).injectInterrupt(ipi);
     } catch (e) {
       console.error(`${LOG_PREFIX} IPI delivery to core ${targetApicId} failed:`, e);
     }
@@ -396,7 +494,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       // Need to get the dirty page from the owning core first
       const ownerStub = this.coreStubs.get(result.needsWritebackFrom);
       if (ownerStub) {
-        const dirtyData = await (ownerStub as any).writeback(physAddr);
+        const dirtyData = await coreRPC(ownerStub).writeback(physAddr);
         this.pageDir.acceptWriteback(physAddr, result.needsWritebackFrom, dirtyData);
         // Now retry the fetch
         const retryResult = this.pageDir.fetchPage(physAddr, requestingCore);
@@ -421,7 +519,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         const stub = this.coreStubs.get(coreId);
         if (stub) {
           try {
-            await (stub as any).invalidatePage(physAddr);
+            await coreRPC(stub).invalidatePage(physAddr);
           } catch (e) {
             console.error(`${LOG_PREFIX} Invalidation to core ${coreId} failed:`, e);
           }
@@ -461,14 +559,14 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     if (!bsp) return;
 
     try {
-      // Also drain serial output from BSP
-      const serialData = await (bsp as any).flushSerial() as string | null;
+      // Drain serial output from BSP
+      const serialData = await coreRPC(bsp).flushSerial();
       if (serialData) {
         this.broadcast(encodeSerialData(serialData));
       }
 
       // Check mode and render accordingly
-      const graphical = await (bsp as any).isGraphicalMode() as boolean;
+      const graphical = await coreRPC(bsp).isGraphicalMode();
 
       if (graphical) {
         await this.renderGraphicalFrame(bsp);
@@ -480,8 +578,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     }
   }
 
+  /**
+   * Render a graphical frame from the BSP's QEMU display.
+   * QEMUWrapper.getScreenFrame() returns RGBA data in the same format
+   * as the previous v86 implementation: [width:u32, height:u32, bufferWidth:u32, rgba...]
+   */
   private async renderGraphicalFrame(bsp: DurableObjectStub): Promise<void> {
-    const frameData = await (bsp as any).getScreenFrame() as ArrayBuffer | null;
+    const frameData = await coreRPC(bsp).getScreenFrame();
     if (!frameData) return;
 
     const view = new DataView(frameData);
@@ -523,10 +626,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     for (const ws of dead) this.sessions.delete(ws);
   }
 
+  /**
+   * Render text mode content from BSP.
+   * QEMU's text output goes through serial (stdio), so this may return
+   * null. In that case, text content is delivered via serial data messages.
+   */
   private async renderTextFrame(bsp: DurableObjectStub): Promise<void> {
-    const textData = await (bsp as any).getTextScreen() as {
-      cols: number; rows: number; lines: string[];
-    } | null;
+    const textData = await coreRPC(bsp).getTextScreen();
     if (!textData) return;
 
     const textContent = textData.lines.join("\n");
@@ -542,7 +648,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     try {
       if (message instanceof ArrayBuffer) return;
 
-      let msg: any;
+      let msg: Record<string, unknown>;
       try { msg = JSON.parse(message); }
       catch { return; }
 
@@ -553,32 +659,32 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       switch (msg.type) {
         case "keydown": {
           const code = msg.code as number;
-          await (bsp as any).sendKeyCode(code, false);
+          await coreRPC(bsp).sendKeyCode(code, false);
           break;
         }
         case "keyup": {
           const code = msg.code as number;
-          await (bsp as any).sendKeyCode(code, true);
+          await coreRPC(bsp).sendKeyCode(code, true);
           break;
         }
         case "mousemove":
-          await (bsp as any).sendMouseDelta(msg.dx as number, msg.dy as number);
+          await coreRPC(bsp).sendMouseDelta(msg.dx as number, msg.dy as number);
           break;
         case "mousedown":
         case "mouseup": {
           const idx = msg.button === 1 ? 1 : msg.button === 2 ? 2 : 0;
           this.mouseButtons[idx] = msg.type === "mousedown";
-          await (bsp as any).sendMouseClick([...this.mouseButtons]);
+          await coreRPC(bsp).sendMouseClick([...this.mouseButtons]);
           break;
         }
         case "text":
-          if (msg.data) await (bsp as any).sendText(msg.data as string);
+          if (msg.data) await coreRPC(bsp).sendText(msg.data as string);
           break;
         case "scancodes":
-          if (msg.codes) await (bsp as any).sendScancodes(msg.codes as number[]);
+          if (msg.codes) await coreRPC(bsp).sendScancodes(msg.codes as number[]);
           break;
         case "serial":
-          // TODO: serial input forwarding
+          // TODO: serial input forwarding via QEMU bridge
           break;
       }
     } catch { /* Never throw from WS handler */ }
