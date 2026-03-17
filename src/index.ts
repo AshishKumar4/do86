@@ -16,6 +16,8 @@ interface ImageDef {
    *  instead of the Worker sending the full binary via /init.
    *  If absent, the image is static-only (aqeous.iso served from ASSETS). */
   url?: string;
+  /** If true, never save/restore snapshots for this image (unstable OS) */
+  noSnapshot?: boolean;
 }
 
 // Memory budget: Durable Objects have a 128 MB total isolate limit.
@@ -25,7 +27,7 @@ interface ImageDef {
 const IMAGES: Record<string, ImageDef> = {
   kolibri:    { file: "kolibri.img",             drive: "fda",   memory: 32,  vgaMemory: 4, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: 48,  vgaMemory: 4, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system." },
+  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: 48,  vgaMemory: 4, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true },
   tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: 48,  vgaMemory: 4, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
   tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: 48,  vgaMemory: 4, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
@@ -143,6 +145,7 @@ export default {
             memory: imageDef.memory,
             vgaMemory: imageDef.vgaMemory,
             label: imageDef.label,
+            noSnapshot: imageDef.noSnapshot || false,
             ...(freshBoot ? { fresh: true } : {}),
           };
 

@@ -14,10 +14,12 @@ import {
 
 const pathMatch = location.pathname.match(/^\/s\/([a-zA-Z0-9_-]+)/);
 const sessionId = pathMatch?.[1] ?? null;
-const imageParam = new URLSearchParams(location.search).get("image") || "";
+const params = new URLSearchParams(location.search);
+const imageParam = params.get("image") || "";
+const freshParam = params.get("fresh") === "1";
 
-// Strip ?image= from the address bar — only needed for the first WS handshake
-if (imageParam) history.replaceState(null, "", location.pathname);
+// Strip query params from the address bar — only needed for the first WS handshake
+if (imageParam || freshParam) history.replaceState(null, "", location.pathname);
 
 // ── DOM ──────────────────────────────────────────────────────────────────────
 
@@ -420,8 +422,12 @@ function connect() {
 
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   let wsUrl = `${protocol}//${location.host}/s/${sessionId}`;
-  if (firstConnect && imageParam) {
-    wsUrl += `?image=${encodeURIComponent(imageParam)}`;
+  if (firstConnect) {
+    const wsParams = new URLSearchParams();
+    if (imageParam) wsParams.set("image", imageParam);
+    if (freshParam) wsParams.set("fresh", "1");
+    const qs = wsParams.toString();
+    if (qs) wsUrl += `?${qs}`;
     firstConnect = false;
   }
 
