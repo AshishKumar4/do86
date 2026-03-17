@@ -39,12 +39,6 @@ import type { IPIMessage } from "./ipi-handler";
 import { decodeICR } from "./ipi-handler";
 import { LOG_PREFIX } from "./types";
 
-// ── QEMU WASM module asset imports ──────────────────────────────────────────
-// The bundler resolves these to the qemu-wasm/ directory.
-
-import qemuWasmModule from "../qemu-wasm/qemu-system-i386.wasm";
-import qemuJsGlue from "../qemu-wasm/qemu-system-i386.js" with { type: "text" };
-
 // ── Emscripten FS subset ────────────────────────────────────────────────────
 
 interface EmscriptenFS {
@@ -119,6 +113,10 @@ export interface QEMUWrapperConfig {
   wasmHeapMB: number;
   /** SQLite-backed cold page store for demand-paged RAM. */
   sqlPageStore: SqlPageStore;
+  /** QEMU WASM binary (fetched from R2, cached in SQLite). */
+  wasmBinary: ArrayBuffer;
+  /** Emscripten JS glue code as a string (fetched from R2, cached in SQLite). */
+  jsGlue: string;
   /** SeaBIOS binary (required). */
   biosData: ArrayBuffer;
   /** VGA BIOS binary (required). */
@@ -335,16 +333,17 @@ export class QEMUWrapper {
           reject(new Error(`QEMU aborted: ${what}`));
         },
 
-        // Provide pre-compiled WASM module
-        wasmBinary: qemuWasmModule,
+        // Provide WASM binary (raw ArrayBuffer from R2/SQLite cache).
+        // Emscripten accepts either ArrayBuffer or WebAssembly.Module.
+        wasmBinary: new Uint8Array(config.wasmBinary),
       };
 
       // Set up globalThis.Module — the JS glue reads from it.
       (globalThis as unknown as Record<string, unknown>).Module = moduleOverrides;
 
-      // Execute the Emscripten JS glue code.
+      // Execute the Emscripten JS glue code (fetched from R2/SQLite cache).
       // eslint-disable-next-line no-new-func
-      const fn = new Function(qemuJsGlue);
+      const fn = new Function(config.jsGlue);
       fn();
     });
   }

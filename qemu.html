@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>do86 — QEMU Browser</title>
+  </head>
+  <body>
+    <header>
+      <a href="/">&#8592; do86</a>
+      <span id="status">loading QEMU...</span>
+    </header>
+    <div id="display-container">
+      <canvas id="screen" width="720" height="400"></canvas>
+    </div>
+    <script type="module" src="/src/client/qemu-boot.ts"></script>
+  </body>
+</html>

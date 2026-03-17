@@ -55,8 +55,6 @@ interface CoreStubRPC {
     isBSP: boolean;
     memorySizeBytes: number;
     vgaMemorySizeBytes: number;
-    bios?: ArrayBuffer;
-    vgaBios?: ArrayBuffer;
     disk?: ArrayBuffer;
     diskDrive?: "fda" | "cdrom";
   }, coordinatorId: string): Promise<{ status: string }>;
@@ -66,8 +64,6 @@ interface CoreStubRPC {
   startupIPI(vector: number, memoryConfig: {
     memorySizeBytes: number;
     vgaMemorySizeBytes: number;
-    bios: ArrayBuffer;
-    vgaBios: ArrayBuffer;
   }, trampolinePages: Map<number, ArrayBuffer>): Promise<void>;
   injectInterrupt(ipi: IPIMessage): Promise<void>;
   invalidatePage(physAddr: number): Promise<void>;
@@ -132,9 +128,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   private bootError: string | null = null;
   private cachedAssets: Map<string, ArrayBuffer> | null = null;
 
-  // ── Cached BIOS binaries (needed for AP core creation after boot) ────
-  private biosData: ArrayBuffer | null = null;
-  private vgaBiosData: ArrayBuffer | null = null;
+  // ── Memory config (needed for AP core creation after boot) ──────────
   private memorySizeBytes: number = 0;
   private vgaMemorySizeBytes: number = 0;
 
@@ -220,10 +214,6 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     this.broadcast(encodeStatus("booting: distributed SMP (QEMU)"));
 
     try {
-      const bios = this.cachedAssets.get("bios");
-      const vgaBios = this.cachedAssets.get("vgaBios");
-      if (!bios || !vgaBios) throw new Error("Missing BIOS assets");
-
       // Parse metadata
       let memorySizeMB = 32;
       let vgaMemoryMB = 8;
@@ -254,11 +244,9 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       }
       if (!disk) throw new Error("No disk image: not provided inline and no URL configured");
 
-      // Cache BIOS binaries for AP creation later
+      // Cache memory config for AP creation later
       const memoryBytes = memorySizeMB * 1024 * 1024;
       const vgaMemoryBytes = vgaMemoryMB * 1024 * 1024;
-      this.biosData = bios;
-      this.vgaBiosData = vgaBios;
       this.memorySizeBytes = memoryBytes;
       this.vgaMemorySizeBytes = vgaMemoryBytes;
 
@@ -273,7 +261,8 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       // ── INIT callback: create AP core DO ────────────────────────────
       this.ipiRouter.onCoreCreate = async (apicId) => {
         await this.createCore(apicId, false);
-        // Initialize the AP core — it creates its SqlPageStore and waits for SIPI
+        // Initialize the AP core — it creates its SqlPageStore and waits for SIPI.
+        // BIOS/WASM binaries are fetched by the core DO itself from R2.
         const stub = this.coreStubs.get(apicId);
         if (stub) {
           const coordId = this.ctx.id.toString();
@@ -283,8 +272,6 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
               isBSP: false,
               memorySizeBytes: this.memorySizeBytes,
               vgaMemorySizeBytes: this.vgaMemorySizeBytes,
-              bios: this.biosData!,
-              vgaBios: this.vgaBiosData!,
             },
             coordId,
           );
@@ -331,11 +318,10 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
         // Deliver SIPI to the AP core — QEMUWrapper.handleSIPI() sets
         // the SIPI vector via wasm_cpu_set_sipi_vector and resumes.
+        // BIOS/WASM binaries are fetched by the core DO itself from R2.
         await coreRPC(stub).startupIPI(vector, {
           memorySizeBytes: this.memorySizeBytes,
           vgaMemorySizeBytes: this.vgaMemorySizeBytes,
-          bios: this.biosData!,
-          vgaBios: this.vgaBiosData!,
         }, trampolinePages);
       };
 
@@ -351,7 +337,8 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       console.log(`${LOG_PREFIX} Creating BSP (Core 0) with QEMU`);
       await this.createCore(0, true);
 
-      // Initialize BSP with full boot config (BIOS + disk)
+      // Initialize BSP with boot config (disk image).
+      // BIOS/WASM binaries are fetched by the core DO itself from R2.
       const bspStub = this.coreStubs.get(0);
       if (!bspStub) throw new Error("Failed to create BSP");
 
@@ -362,8 +349,6 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
           isBSP: true,
           memorySizeBytes: memoryBytes,
           vgaMemorySizeBytes: vgaMemoryBytes,
-          bios: bios,
-          vgaBios: vgaBios,
           disk: disk,
           diskDrive: diskDrive,
         },

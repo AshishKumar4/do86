@@ -28,6 +28,12 @@
       }
     ]
   },
+  "r2_buckets": [
+    {
+      "binding": "ASSETS_BUCKET",
+      "bucket_name": "do86-assets"
+    }
+  ],
   "limits": {
     "cpu_ms": 300000
   },

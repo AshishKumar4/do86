@@ -6,17 +6,15 @@
  * Communicates with the CoordinatorDO via RPC for memory coherence and
  * IPI routing.
  *
- * Replaces the previous v86-based implementation with QEMU v5 (Emscripten,
- * no ASYNCIFY). Key differences:
- *   - APIC access via exported C functions (not WASM memory offsets)
- *   - Demand-paged RAM via SqlPageStore (SQLite-backed, synchronous)
- *   - Display via QEMU's display callback system
- *   - AP boot via wasm_cpu_set_sipi_vector + wasm_cpu_resume
+ * QEMU WASM binary (~12MB), JS glue (~160K), and BIOS ROMs are fetched from
+ * an R2 bucket (ASSETS_BUCKET) on first boot and cached in DO SQLite via
+ * ChunkedBlobStore. Subsequent boots load from the local SQLite cache.
  */
 
 import { DurableObject } from "cloudflare:workers";
 import { QEMUWrapper, type QEMUWrapperConfig } from "./qemu-wrapper";
 import { SqlPageStore } from "./sql-page-store";
+import { SqliteStorage, ChunkedBlobStore } from "./sqlite-storage";
 import { CorePageCache, CorePageState, PAGE_SIZE } from "./memory-coherence";
 import { type IPIMessage, DeliveryMode } from "./ipi-handler";
 import { LOG_PREFIX } from "./types";
@@ -33,20 +31,26 @@ export const enum CoreState {
 }
 
 // ── Core Configuration ──────────────────────────────────────────────────────
+// BIOS and WASM binaries are no longer passed in config — the DO fetches them
+// from R2 and caches locally. Only disk image and memory config come from the
+// coordinator.
 
 export interface CoreConfig {
   apicId: number;
   isBSP: boolean;
   memorySizeBytes: number;
   vgaMemorySizeBytes: number;
-  /** SeaBIOS binary (required for both BSP and AP). */
-  bios: ArrayBuffer;
-  /** VGA BIOS binary (required for both BSP and AP). */
-  vgaBios: ArrayBuffer;
   /** Disk image (BSP only). */
   disk?: ArrayBuffer;
   diskDrive?: "fda" | "cdrom";
 }
+
+// ── R2 asset keys ───────────────────────────────────────────────────────────
+
+const R2_QEMU_WASM = "qemu-system-i386-v6.wasm";
+const R2_QEMU_JS   = "qemu-system-i386-v6.js";
+const R2_BIOS      = "bios-256k.bin";
+const R2_VGA_BIOS  = "vgabios-stdvga.bin";
 
 // ── QEMU tuning defaults ────────────────────────────────────────────────────
 
@@ -61,6 +65,16 @@ const HOT_PAGES_MAX = 8192; // 32MB
 export interface CpuCoreEnv {
   COORDINATOR: DurableObjectNamespace;
   CPU_CORE: DurableObjectNamespace;
+  ASSETS_BUCKET: R2Bucket;
+}
+
+// ── Cached QEMU assets (loaded once per DO lifetime) ────────────────────────
+
+interface QemuAssets {
+  wasmBinary: ArrayBuffer;
+  jsGlue: string;
+  biosData: ArrayBuffer;
+  vgaBiosData: ArrayBuffer;
 }
 
 // ── CpuCoreDO ────────────────────────────────────────────────────────────────
@@ -76,6 +90,9 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
   private sqlPageStore: SqlPageStore | null = null;
   private serialBuffer: string = "";
 
+  // ── QEMU asset cache (in-memory, loaded once per DO wake) ─────────────
+  private qemuAssets: QemuAssets | null = null;
+
   // ── Memory coherence ──────────────────────────────────────────────────
   private pageCache: CorePageCache | null = null;
 
@@ -87,6 +104,79 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
 
   constructor(ctx: DurableObjectState, env: CpuCoreEnv) {
     super(ctx, env);
+  }
+
+  // ── R2 + SQLite asset loading ─────────────────────────────────────────
+
+  /**
+   * Load QEMU WASM binary, JS glue, and BIOS ROMs.
+   *
+   * Strategy:
+   *   1. Check DO SQLite cache (ChunkedBlobStore) for each asset.
+   *   2. If cached, load from SQLite (fast, no network).
+   *   3. If not cached, fetch from R2 bucket and store in SQLite.
+   *
+   * All four assets are required. Throws on any failure.
+   */
+  private async loadQemuAssets(): Promise<QemuAssets> {
+    if (this.qemuAssets) return this.qemuAssets;
+
+    const sqlHandle = this.ctx.storage.sql as unknown as SqlHandle;
+    const blobStore = new ChunkedBlobStore(
+      sqlHandle,
+      "qemu_asset_data",
+      "qemu_asset_meta",
+      512 * 1024, // 512KB chunks
+    );
+
+    const wasmBinary = await this.loadAsset(blobStore, R2_QEMU_WASM);
+    const jsGlueRaw = await this.loadAsset(blobStore, R2_QEMU_JS);
+    const biosData = await this.loadAsset(blobStore, R2_BIOS);
+    const vgaBiosData = await this.loadAsset(blobStore, R2_VGA_BIOS);
+
+    const jsGlue = new TextDecoder().decode(jsGlueRaw);
+
+    this.qemuAssets = { wasmBinary, jsGlue, biosData, vgaBiosData };
+
+    console.log(
+      `${LOG_PREFIX} Core ${this.apicId}: QEMU assets loaded ` +
+      `(wasm=${(wasmBinary.byteLength / 1024 / 1024).toFixed(1)}MB, ` +
+      `js=${(jsGlueRaw.byteLength / 1024).toFixed(0)}KB, ` +
+      `bios=${biosData.byteLength}, vga=${vgaBiosData.byteLength})`,
+    );
+
+    return this.qemuAssets;
+  }
+
+  /**
+   * Load a single asset: try SQLite cache first, then R2.
+   */
+  private async loadAsset(
+    blobStore: ChunkedBlobStore,
+    key: string,
+  ): Promise<ArrayBuffer> {
+    // Try SQLite cache
+    const cached = blobStore.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    // Fetch from R2
+    console.log(`${LOG_PREFIX} Core ${this.apicId}: fetching ${key} from R2`);
+    const obj = await this.env.ASSETS_BUCKET.get(key);
+    if (!obj) {
+      throw new Error(`R2 asset not found: ${key}`);
+    }
+    const data = await obj.arrayBuffer();
+
+    // Cache in SQLite for subsequent boots
+    blobStore.put(key, data);
+    console.log(
+      `${LOG_PREFIX} Core ${this.apicId}: cached ${key} in SQLite ` +
+      `(${(data.byteLength / 1024).toFixed(0)}KB)`,
+    );
+
+    return data;
   }
 
   // ── RPC: Called by CoordinatorDO ───────────────────────────────────────
@@ -154,14 +244,12 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
    * This is where AP cores begin their journey.
    *
    * @param vector  SIPI vector (start address = vector * 0x1000)
-   * @param memoryConfig  Memory configuration + BIOS binaries
+   * @param memoryConfig  Memory configuration (BIOS binaries fetched from R2 by this DO)
    * @param trampolinePages  Low-memory pages copied from BSP, keyed by page-aligned address.
    */
   async startupIPI(vector: number, memoryConfig: {
     memorySizeBytes: number;
     vgaMemorySizeBytes: number;
-    bios: ArrayBuffer;
-    vgaBios: ArrayBuffer;
   }, trampolinePages: Map<number, ArrayBuffer>): Promise<void> {
     const startAddr = vector * 0x1000;
     console.log(
@@ -246,12 +334,6 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
   /**
    * Get graphical screen frame data (BSP only).
    * Returns null if not in graphical mode or no display data.
-   *
-   * Returns an ArrayBuffer with 12-byte header:
-   *   [width:u32, height:u32, bufferWidth:u32, rgba...]
-   *
-   * Same format as the previous v86 implementation for compatibility
-   * with CoordinatorDO's render pipeline.
    */
   async getScreenFrame(): Promise<ArrayBuffer | null> {
     if (!this.qemu || !this.isBSP) return null;
@@ -261,14 +343,8 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
 
   /**
    * Get text screen content. Returns null if in graphical mode.
-   * Note: QEMU's text mode output goes through serial (stdio),
-   * not through a separate text-mode adapter like v86.
    */
   async getTextScreen(): Promise<{ cols: number; rows: number; lines: string[] } | null> {
-    // QEMU in nographic mode uses serial for text output.
-    // We don't have a separate text mode adapter — serial output
-    // is captured in serialBuffer and sent as serial data.
-    // Return null to signal that the coordinator should use serial data instead.
     return null;
   }
 
@@ -291,45 +367,23 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
   }
 
   // ── Input forwarding ──────────────────────────────────────────────────
-  // QEMU handles keyboard/mouse through its device models.
-  // In nographic mode, input goes through the serial port.
-  // For graphical mode, we'd need to inject PS/2 scancodes.
-  // The existing methods are maintained for API compatibility.
 
-  /**
-   * Forward keyboard scancode to this core's QEMU.
-   * TODO: Implement PS/2 keyboard injection via QEMU bridge export.
-   */
   async sendKeyCode(_code: number, _isUp: boolean): Promise<void> {
     // Stub — QEMU keyboard injection requires additional bridge exports
-    // (wasm_keyboard_inject_scancode). For now, input flows through serial.
   }
 
-  /**
-   * Send mouse movement delta.
-   * TODO: Implement PS/2 mouse injection via QEMU bridge export.
-   */
   async sendMouseDelta(_dx: number, _dy: number): Promise<void> {
-    // Stub — mouse injection needs wasm_mouse_inject_delta
+    // Stub
   }
 
-  /**
-   * Send mouse button state.
-   */
   async sendMouseClick(_buttons: [boolean, boolean, boolean]): Promise<void> {
     // Stub
   }
 
-  /**
-   * Send text string (types it via serial).
-   */
   async sendText(_data: string): Promise<void> {
     // TODO: Inject text via QEMU's serial input
   }
 
-  /**
-   * Send raw scancodes.
-   */
   async sendScancodes(_codes: number[]): Promise<void> {
     // Stub
   }
@@ -366,20 +420,16 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
   /**
    * Create and boot the BSP QEMU instance.
    *
-   * Steps:
-   *  1. Create QEMUWrapper with full boot config (BIOS, disk)
-   *  2. QEMU's callMain() registers the emscripten_set_main_loop callback
-   *  3. The JS event loop drives QEMU execution automatically
-   *  4. Set APIC ID = 0 for BSP
+   * Fetches QEMU WASM binary, JS glue, and BIOS ROMs from R2 (with SQLite
+   * cache) then creates the QEMUWrapper.
    */
   private async createBSPEmulator(config: CoreConfig): Promise<void> {
-    if (!config.bios || !config.vgaBios) {
-      throw new Error("BSP requires bios and vgaBios");
-    }
-
     if (!this.sqlPageStore) {
       throw new Error("SqlPageStore not initialized");
     }
+
+    // Load QEMU assets from R2 / SQLite cache
+    const assets = await this.loadQemuAssets();
 
     const wrapperConfig: QEMUWrapperConfig = {
       apicId: config.apicId,
@@ -387,8 +437,10 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
       memorySizeMB: Math.ceil(config.memorySizeBytes / (1024 * 1024)),
       wasmHeapMB: WASM_HEAP_MB,
       sqlPageStore: this.sqlPageStore,
-      biosData: config.bios,
-      vgaBiosData: config.vgaBios,
+      wasmBinary: assets.wasmBinary,
+      jsGlue: assets.jsGlue,
+      biosData: assets.biosData,
+      vgaBiosData: assets.vgaBiosData,
       diskData: config.disk,
       diskDrive: config.diskDrive,
       onSerialOutput: (char: string) => {
@@ -422,15 +474,13 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
   /**
    * Create a QEMU instance for an Application Processor.
    *
-   * Strategy: Start QEMU with -S (paused). Copy trampoline pages from BSP.
-   * When SIPI arrives, call handleSIPI(vector) which sets CS:IP and resumes.
+   * Fetches QEMU assets from R2/SQLite cache (same as BSP).
+   * Starts QEMU with -S (paused), copies trampoline pages from BSP.
    */
   private async createAPEmulator(
     memoryConfig: {
       memorySizeBytes: number;
       vgaMemorySizeBytes: number;
-      bios: ArrayBuffer;
-      vgaBios: ArrayBuffer;
     },
     trampolinePages: Map<number, ArrayBuffer>,
   ): Promise<void> {
@@ -438,14 +488,19 @@ export class CpuCoreDO extends DurableObject<CpuCoreEnv> {
       throw new Error("SqlPageStore not initialized");
     }
 
+    // Load QEMU assets from R2 / SQLite cache
+    const assets = await this.loadQemuAssets();
+
     const wrapperConfig: QEMUWrapperConfig = {
       apicId: this.apicId,
       isBSP: false,
       memorySizeMB: Math.ceil(memoryConfig.memorySizeBytes / (1024 * 1024)),
       wasmHeapMB: WASM_HEAP_MB,
       sqlPageStore: this.sqlPageStore,
-      biosData: memoryConfig.bios,
-      vgaBiosData: memoryConfig.vgaBios,
+      wasmBinary: assets.wasmBinary,
+      jsGlue: assets.jsGlue,
+      biosData: assets.biosData,
+      vgaBiosData: assets.vgaBiosData,
       // No disk for AP
       onSerialOutput: (char: string) => {
         this.serialBuffer += char;

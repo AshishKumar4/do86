@@ -7,6 +7,7 @@ export interface Env {
   COORDINATOR: DurableObjectNamespace;
   CPU_CORE: DurableObjectNamespace;
   ASSETS: { fetch: (request: Request | string) => Promise<Response> };
+  ASSETS_BUCKET: R2Bucket;
 }
 
 interface ImageDef {
@@ -139,12 +140,8 @@ export default {
         const { running } = await statusResp.json<{ running: boolean }>();
 
         if (!running) {
-          // Fetch BIOS ROMs
-          const [bios, vgaBios] = await Promise.all([
-            getAsset(env, "/assets/seabios.bin", request.url),
-            getAsset(env, "/assets/vgabios.bin", request.url),
-          ]);
-
+          // BIOS/WASM binaries are fetched by CpuCoreDO from R2 — no need
+          // to send them from the Worker. Only metadata + disk go here.
           const meta: Record<string, any> = {
             imageKey,
             drive: imageDef.drive,
@@ -155,7 +152,7 @@ export default {
             numCores: 2, // Phase 3: distributed SMP (BSP + 1 AP)
           };
 
-          const assets: Record<string, ArrayBuffer> = { bios, vgaBios };
+          const assets: Record<string, ArrayBuffer> = {};
 
           // Get disk image — try local ASSETS first, fall back to remote URL
           try {
