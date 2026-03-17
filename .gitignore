@@ -12,3 +12,4 @@ package-lock.json
 public/assets/v86.wasm
 images/
 public/assets/kolibri.img
+wrangler.dev.jsonc
