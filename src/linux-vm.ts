@@ -329,7 +329,7 @@ export class LinuxVM extends DurableObject<Env> {
   private getJitBlockCount(): Record<string, unknown> {
     try {
       const emu = this.emulator as any;
-      const cpu = emu?.cpu;
+      const cpu = emu?.v86?.cpu;
       if (!cpu) return { error: "no cpu" };
       const wm = cpu.wm;
       if (!wm) return { error: "no wm" };
