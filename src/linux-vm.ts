@@ -388,7 +388,11 @@ export class LinuxVM extends DurableObject<Env> {
         fastboot: true,
         acpi: true,
         boot_order: drive === "cdrom" ? BOOT_ORDER_CDROM_FIRST : BOOT_ORDER_HDA_FIRST,
-        cpu_count: 4,
+        // cpu_count: stratum WASM supports SMP via smp_init(). Start with 2 CPUs
+        // (BSP + 1 AP) — conservative for the DO's 128MB budget. Each AP adds
+        // cooperative round-robin ticks per main loop iteration; increase to 4
+        // only after verifying memory headroom in production.
+        cpu_count: 2,
       };
 
       if (drive === "fda") v86Config.fda = { buffer: disk };
