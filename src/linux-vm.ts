@@ -148,6 +148,10 @@ export class LinuxVM extends DurableObject<Env> {
   // Any dirty detection immediately renders and resets the counter.
   private _cleanTicks = 0;
   private _adaptiveSkips = 0;  // perf counter: frames skipped due to idle
+  private _textSent = 0;       // text frames actually broadcast
+  private _textEmpty = 0;      // text mode: getTextScreen returned empty
+  private _textSame = 0;       // text mode: content unchanged
+  private _vgaNull = 0;        // getVga() returned null
 
   // ── Storage state ───────────────────────────────────────────────────────
   private storage: SqliteStorage | null = null;
@@ -378,6 +382,12 @@ export class LinuxVM extends DurableObject<Env> {
       pixelsOk:       p.pixelsOk,
       deltaNull:      p.deltaNull,
       svgaDirtyPages: p.svgaDirtyPages,
+      // Text mode rendering
+      textSent:      this._textSent,
+      textEmpty:     this._textEmpty,
+      textSame:      this._textSame,
+      vgaNull:       this._vgaNull,
+      graphicalMode: this.getVga()?.graphical_mode ?? null,
       // Yield health
       yieldDead:     this._yieldDead,
       yieldError:    this._yieldError || null,
@@ -1103,7 +1113,7 @@ export class LinuxVM extends DurableObject<Env> {
 
       const vga = this.getVga();
 
-    if (!vga) return;
+    if (!vga) { this._vgaNull++; return; }
 
     if (vga.graphical_mode) {
       // Adaptive idle skip: when 3+ consecutive clean ticks, only check every
@@ -1178,6 +1188,7 @@ export class LinuxVM extends DurableObject<Env> {
 
       const textRows = this.screenAdapter.getTextScreen();
       if (textRows.length === 0) {
+        this._textEmpty++;
         this._cleanTicks++;
         this._perf.renderMs += performance.now() - _rfT0;
         return;
@@ -1185,12 +1196,14 @@ export class LinuxVM extends DurableObject<Env> {
 
       const textContent = textRows.join("\n");
       if (textContent === this.lastTextContent) {
+        this._textSame++;
         this._cleanTicks++;
         this._perf.renderMs += performance.now() - _rfT0;
         return;
       }
       this._cleanTicks = 0;
       this.lastTextContent = textContent;
+      this._textSent++;
 
       this._perf.renderMs += performance.now() - _rfT0;
       this.broadcast(encodeTextScreen(
