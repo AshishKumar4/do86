@@ -60,7 +60,14 @@ const VM_CONFIG = {
   VGA_MB:         8,
   /** Logical RAM reported to guest BIOS/CMOS (MB).
    *  GPAs in [RESIDENT_MB, LOGICAL_MB) are demand-paged from DO SQLite. */
-  LOGICAL_MB:   256,
+  // LOGICAL_MB must equal WASM_MB (not larger) because SeaBIOS places ACPI tables
+  // near the top of logical RAM (logical_memory_size - ~7KB).  If logical RAM
+  // exceeds the WASM physical allocation (memory_size), those writes hit the MMIO
+  // no-op handler (addr >= memory_size triggers in_mapped_range), the ACPI tables
+  // are silently dropped, and KolibriOS loops forever scanning for a valid RSDT.
+  // Demand-paging still helps: the OS can use the 32–64 MB region (hot pool)
+  // without growing WASM — it just can't exceed 64 MB total.
+  LOGICAL_MB:    64,   // must equal WASM_MB
   /** SMP CPU count: 1 = BSP only, 2 = BSP + 1 AP.
    *  Each AP adds cooperative ticks; increase only after measuring headroom. */
   CPU_COUNT:      2,
@@ -430,11 +437,41 @@ export class LinuxVM extends DurableObject<Env> {
         return syntheticTime;
       };
 
+      // ── SqlPageStore: created BEFORE new V86() so the swap hook is live ───────
+      // SeaBIOS runs during cpu.init() which is called synchronously inside the
+      // V86 constructor chain (wasm_fn → new v86() → continue_init → v86.init).
+      // emulator-loaded fires AFTER cpu.init() completes — too late to catch BIOS
+      // writes to demand-paged pages (e.g. ACPI tables near top of logical RAM).
+      // Fix: create SqlPageStore here, wire swap_page_in in wasm_fn so it is live
+      // from the first WASM instruction.
+      const HOT_POOL_BASE = VM_CONFIG.RESIDENT_MB * 1024 * 1024;
+      const pageStore = new SqlPageStore(
+        this.ctx.storage.sql as any,
+        VM_CONFIG.PAGE_STORE,
+      );
+      pageStore.init();
+
       const v86Config: Record<string, any> = {
         wasm_fn: async (importObj: any) => {
           console.log(`${LOG_PREFIX} wasm_fn: calling WebAssembly.instantiate`);
           const instance = await WebAssembly.instantiate(v86WasmModule, importObj);
           console.log(`${LOG_PREFIX} wasm_fn: WebAssembly.instantiate complete, exports=${Object.keys(instance.exports).length}`);
+
+          // Wire swap hook NOW — WASM memory is live, cpu.init() hasn't run yet.
+          // We store the Memory object (not a snapshot Uint8Array) because
+          // allocate_memory() during cpu.init() grows WASM memory, detaching
+          // any previously-created ArrayBuffer view.
+          const wasmMem = instance.exports.memory as WebAssembly.Memory;
+          pageStore.setWasmMemory(wasmMem, HOT_POOL_BASE);
+          // Wrap the swap_page_in import so ALL calls — including during BIOS —
+          // land in SqlPageStore directly (cpu doesn't exist yet at this point).
+          if (importObj.env) {
+            importObj.env.swap_page_in = (gpa: number, forWriting: number): number => {
+              return pageStore.swapPageIn(gpa, forWriting);
+            };
+          }
+          console.log(`${LOG_PREFIX} wasm_fn: swap_page_in wired to SqlPageStore (pre-BIOS, pre-cpu)`);
+
           return instance.exports;
         },
         disable_jit: false,
@@ -507,46 +544,32 @@ export class LinuxVM extends DurableObject<Env> {
           console.log(`${LOG_PREFIX} emulator-loaded fired`);
           clearTimeout(timeout);
 
-          // ── SQLite demand-paging hook ─────────────────────────────────────────
-          // Wire SqlPageStore to cpu._swap_page_in_hook so that swap_page_in()
-          // WASM imports (from do_page_walk) are served synchronously from DO SQLite.
-          //
-          // HOT_POOL_BASE = RESIDENT_MB bytes — must match PAGED_THRESHOLD in
-          // stratum/src/rust/cpu/memory.rs (both are 32 MB).
-          const HOT_POOL_BASE = VM_CONFIG.RESIDENT_MB * 1024 * 1024;
-          const poolSizeMB    = VM_CONFIG.HOT_FRAMES * 4096 / 1024 / 1024;
-
+          // ── SqlPageStore post-init: give the CPU reference for TLB flushing ────
+          // The store and its swap hook were wired inside wasm_fn (before cpu.init /
+          // BIOS ran). Here we just hand it the cpu object for full_clear_tlb().
           try {
             const cpu = (this.emulator as any).v86?.cpu;
-            if (cpu && cpu.wasm_memory?.buffer) {
-              const pageStore = new SqlPageStore(
-                this.ctx.storage.sql as any,
-                VM_CONFIG.PAGE_STORE,
-              );
-              pageStore.init();
-
-              const wasmHeap = new Uint8Array(cpu.wasm_memory.buffer);
-              pageStore.setWasmHeap(wasmHeap, HOT_POOL_BASE);
+            if (cpu) {
               pageStore.setCpu(cpu);
-
-              // Install hook — called by cpu.swap_page_in(gpa, forWriting) (WASM import).
+              // Also wire the cpu-side hook so future TLB misses (after BIOS) go
+              // through cpu.swap_page_in() → cpu._swap_page_in_hook path too.
               cpu._swap_page_in_hook = (gpa: number, forWriting: number): number =>
                 pageStore.swapPageIn(gpa, forWriting);
-
+              const poolSizeMB = VM_CONFIG.HOT_FRAMES * 4096 / 1024 / 1024;
               console.log(
                 `${LOG_PREFIX} SqlPageStore ready: ` +
                 `resident=${VM_CONFIG.RESIDENT_MB}MB ` +
                 `hot_pool=${HOT_POOL_BASE.toString(16)}h–` +
                 `${(HOT_POOL_BASE + VM_CONFIG.HOT_FRAMES * 4096).toString(16)}h ` +
                 `(${VM_CONFIG.HOT_FRAMES} frames × 4KB = ${poolSizeMB}MB) ` +
-                `logical=${VM_CONFIG.LOGICAL_MB}MB`,
+                `logical=${VM_CONFIG.LOGICAL_MB}MB` +
+                ` swapIns=${pageStore.stats.swapIns}(pre-run)`,
               );
             } else {
-              console.warn(`${LOG_PREFIX} SqlPageStore: cpu or wasm_memory not available — demand-paging disabled`);
+              console.warn(`${LOG_PREFIX} SqlPageStore: cpu not available after emulator-loaded`);
             }
           } catch (e) {
-            console.error(`${LOG_PREFIX} SqlPageStore init failed (non-fatal):`, e);
-            // Non-fatal: guest runs with resident RAM only (no demand-paging).
+            console.error(`${LOG_PREFIX} SqlPageStore post-init failed (non-fatal):`, e);
           }
 
           const vga = this.getVga();
@@ -859,13 +882,13 @@ export class LinuxVM extends DurableObject<Env> {
    private _dbgFirstPixels = false;
    private _dbgFirstEncNull = false;
    private renderFrame(): void {
-    this._renderCount++;
-    if (!this.emulator || !this.screenAdapter || this.sessions.size === 0) return;
+     this._renderCount++;
+     if (!this.emulator || !this.screenAdapter || this.sessions.size === 0) return;
 
-    const vga = this.getVga();
+     const vga = this.getVga();
 
-    // Periodic VGA state dump — every 50 frames regardless of outcome
-    if (this._renderCount % 50 === 0) {
+     // Periodic VGA state dump — every 50 frames regardless of outcome
+     if (this._renderCount % 50 === 0) {
       if (!vga) {
         console.log(`${LOG_PREFIX} renderFrame #${this._renderCount}: no vga device`);
       } else {

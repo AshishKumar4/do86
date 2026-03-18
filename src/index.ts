@@ -32,8 +32,10 @@ interface ImageDef {
 //   ──────────────────────────────────
 //   Total              ~102 MB ← safe headroom below 128 MB limit
 //
-// Guest sees 256 MB via CMOS/e820 (VM_CONFIG.LOGICAL_MB).
-// GPAs [32 MB, 256 MB) are demand-paged from DO SQLite via swap_page_in.
+// Guest sees 64 MB via CMOS/e820 (VM_CONFIG.LOGICAL_MB = WASM_MB).
+// LOGICAL_MB must equal WASM_MB: SeaBIOS places ACPI tables at ~logical_memory_size-7KB;
+// if that exceeds WASM allocation, writes hit MMIO no-op and KolibriOS loops on RSDT.
+// GPAs [32 MB, 64 MB) are demand-paged from DO SQLite via swap_page_in.
 // linux4 (text-only, no demand-paging) uses a smaller budget: 32 MB RAM, 2 MB VGA.
 //
 // memory/vgaMemory values in IMAGES are the values passed as memory_size to v86.

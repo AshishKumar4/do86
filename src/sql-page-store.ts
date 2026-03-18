@@ -103,8 +103,13 @@ export class SqlPageStore {
 
   // ── WASM heap ─────────────────────────────────────────────────────────────
 
-  /** Uint8Array view into WASM linear memory. */
-  private wasmHeap: Uint8Array | null = null;
+  /**
+   * The WebAssembly.Memory object.  We hold this (not a Uint8Array snapshot)
+   * because WASM memory may grow after construction (allocate_memory during
+   * cpu.init grows the heap), detaching any previously-created ArrayBuffer view.
+   * Accessing .buffer on each operation always gives the current backing buffer.
+   */
+  private wasmMemory: WebAssembly.Memory | null = null;
 
   /** Byte offset in WASM heap where the frame pool starts (== PAGED_THRESHOLD). */
   private poolBase = 0;
@@ -151,14 +156,31 @@ export class SqlPageStore {
   }
 
   /**
-   * Set the WASM heap view and hot pool base offset.
-   * Must be called after the WASM module is instantiated and before swapPageIn.
+   * Set the WebAssembly.Memory object and hot pool base offset.
    *
-   * @param heap      Uint8Array over the full WASM linear memory buffer.
+   * Must be called as soon as the WASM instance is created (inside wasm_fn,
+   * before cpu.init() / BIOS runs) so that swap_page_in calls during BIOS
+   * execution land in valid memory.
+   *
+   * We store the Memory object (not a Uint8Array snapshot) because
+   * allocate_memory() during cpu.init() may grow WASM linear memory, which
+   * detaches the old ArrayBuffer.  Accessing memory.buffer on each operation
+   * always yields the current, non-detached view.
+   *
+   * @param memory    WebAssembly.Memory for this WASM instance.
    * @param poolBase  Byte offset where the frame pool starts (== PAGED_THRESHOLD).
    */
+  setWasmMemory(memory: WebAssembly.Memory, poolBase: number): void {
+    this.wasmMemory = memory;
+    this.poolBase = poolBase;
+  }
+
+  /**
+   * @deprecated Use setWasmMemory(). Kept for compatibility — wraps the
+   * Uint8Array in a synthetic Memory-like object.
+   */
   setWasmHeap(heap: Uint8Array, poolBase: number): void {
-    this.wasmHeap = heap;
+    this.wasmMemory = { buffer: heap.buffer } as unknown as WebAssembly.Memory;
     this.poolBase = poolBase;
   }
 
@@ -187,7 +209,7 @@ export class SqlPageStore {
     const pageGpa = gpa & ~(PAGE_SIZE - 1);
     this._swapIns++;
 
-    // Fast path: page already in hot pool — refresh ref bit and return offset
+    // Fast path: page already tracked in hot pool — refresh ref bit and return offset
     const existing = this.frameMap.get(pageGpa);
     if (existing !== undefined) {
       this.frameRef[existing] = 1;
@@ -195,7 +217,28 @@ export class SqlPageStore {
       return this.poolBase + existing * PAGE_SIZE;
     }
 
-    // Slow path: allocate a frame (may evict)
+    // Identity path: GPA falls within the hot pool's WASM allocation.
+    //
+    // The hot pool occupies mem8[poolBase .. poolBase + maxFrames*PAGE_SIZE).
+    // GPAs in this range are already backed by mem8 at the exact same offset
+    // (allocate_memory() in WASM allocates a flat contiguous block: mem8[0..memory_size)).
+    // Real-mode BIOS writes go directly to mem8[gpa] without paging — they land
+    // at the correct physical offset.  If we allocated a new frame here we would
+    // zero-fill it, clobbering the BIOS data.  Instead, register the page at its
+    // natural WASM offset so the TLB entry points directly to the existing data.
+    const hotPoolEnd = this.poolBase + this.cfg.maxFrames * PAGE_SIZE;
+    if (pageGpa < hotPoolEnd) {
+      // Find which frame slot this GPA maps to within the pool
+      const frameIdx = (pageGpa - this.poolBase) / PAGE_SIZE;
+      this.frameGpa[frameIdx]   = pageGpa;
+      this.frameRef[frameIdx]   = 1;
+      this.frameDirty[frameIdx] = forWriting ? 1 : 0;
+      this.frameMap.set(pageGpa, frameIdx);
+      this.usedFrames++;
+      return pageGpa; // WASM offset == GPA for the pool region
+    }
+
+    // SQLite path: GPA is above memory_size — allocate a frame and load from SQLite
     const frame = this.allocateFrame();
     if (frame < 0) return -1;
 
@@ -203,11 +246,12 @@ export class SqlPageStore {
     const data = this.readFromSql(pageGpa);
     const offset = this.poolBase + frame * PAGE_SIZE;
 
-    if (this.wasmHeap) {
+    const heap = this.heap;
+    if (heap) {
       if (data) {
-        this.wasmHeap.set(data, offset);
+        heap.set(data, offset);
       } else {
-        this.wasmHeap.fill(0, offset, offset + PAGE_SIZE);
+        heap.fill(0, offset, offset + PAGE_SIZE);
       }
     }
 
@@ -226,11 +270,12 @@ export class SqlPageStore {
    * SYNCHRONOUS.
    */
   flushDirty(): void {
-    if (!this.wasmHeap) return;
+    const heap = this.heap;
+    if (!heap) return;
     for (let i = 0; i < this.cfg.maxFrames; i++) {
       if (this.frameDirty[i] && this.frameGpa[i] >= 0) {
         const offset = this.poolBase + i * PAGE_SIZE;
-        this.writeToSql(this.frameGpa[i], this.wasmHeap.subarray(offset, offset + PAGE_SIZE));
+        this.writeToSql(this.frameGpa[i], heap.subarray(offset, offset + PAGE_SIZE));
         this.frameDirty[i] = 0;
       }
     }
@@ -297,9 +342,10 @@ export class SqlPageStore {
     }
 
     // Flush dirty frame to SQLite before reuse
-    if (this.frameDirty[evicted] && this.wasmHeap) {
+    const heap = this.heap;
+    if (this.frameDirty[evicted] && heap) {
       const offset = this.poolBase + evicted * PAGE_SIZE;
-      this.writeToSql(this.frameGpa[evicted], this.wasmHeap.subarray(offset, offset + PAGE_SIZE));
+      this.writeToSql(this.frameGpa[evicted], heap.subarray(offset, offset + PAGE_SIZE));
       this.frameDirty[evicted] = 0;
     }
 
@@ -352,6 +398,17 @@ export class SqlPageStore {
       ? data
       : data.subarray(0, Math.min(data.length, PAGE_SIZE));
     this.sql.exec(`INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES (?, ?)`, gpa, blob);
+  }
+
+  // ── Internal helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Always returns a fresh Uint8Array view over the current WASM memory buffer.
+   * WASM memory may grow (via allocate_memory during cpu.init), which detaches
+   * older ArrayBuffer views.  Accessing .buffer each time is O(1) and safe.
+   */
+  private get heap(): Uint8Array | null {
+    return this.wasmMemory ? new Uint8Array(this.wasmMemory.buffer) : null;
   }
 
   // ── Stats ─────────────────────────────────────────────────────────────────
