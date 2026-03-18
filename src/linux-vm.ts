@@ -787,6 +787,11 @@ export class LinuxVM extends DurableObject<Env> {
                 return;
               }
               // Async yield: break to event loop.
+              // Render at each async boundary — setInterval can't fire during
+              // synchronous yield batches (WASM + page faults monopolize the
+              // event loop for hundreds of ms in page-fault-heavy boots).
+              try { this.renderFrame(); } catch (_) {}
+
               if (t > 10) {
                 setTimeout(() => {
                   try { v86Internal.yield_callback(tick); }
