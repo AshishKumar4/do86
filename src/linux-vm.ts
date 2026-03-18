@@ -705,8 +705,9 @@ export class LinuxVM extends DurableObject<Env> {
                 v86Internal.yield_callback(tick);
                 return;
               }
-              // Batch boundary: render, then schedule next batch via setTimeout.
-              try { this.renderFrame(); } catch (_) {}
+              // Async yield: break to event loop. NO rendering here —
+              // rendering is on its own fixed-cadence setInterval (see startRenderLoop).
+              // This keeps yield throughput high and rendering decoupled.
               if (t > 10) {
                 setTimeout(() => v86Internal.yield_callback(tick), Math.min(t, 40));
               } else {
@@ -860,38 +861,55 @@ export class LinuxVM extends DurableObject<Env> {
   }
 
   private restartRenderLoop(): void {
-    // Rendering is driven by the yield override — no setInterval needed.
-    // FPS adaptation still tracks frame sizes (adjustFrameRate) but no longer
-    // controls an interval timer.
+    this.startRenderLoop();
   }
 
+  /** Fixed-cadence render loop at 8fps (125ms).
+   *
+   *  Decoupled from the yield override so rendering happens at a steady rate
+   *  regardless of how fast/slow the CPU yields.  Each tick:
+   *    1. Calls screen_fill_buffer() which drains the WASM dirty bitmap
+   *    2. Checks post-fill min/max to see if any pages were dirty
+   *    3. Encodes + sends a frame if pixels changed
+   *
+   *  For idle guests the bitmap is empty most ticks → cheap no-op.
+   *  For active guests dirty pages accumulate between ticks and are batch-processed.
+   *
+   *  Every KEYFRAME_EVERY ticks, a full keyframe is forced so that idle desktops
+   *  still deliver ≥5fps.  This also forces svga_mark_dirty() so the fill has data.
+   */
+  private static readonly KEYFRAME_EVERY = 2; // every 2nd tick = ~4fps forced keyframes
+  private _renderTick = 0;
+
   private startRenderLoop(): void {
-    // No-op: rendering is driven by the yield override (every 32nd yield and
-    // on idle). Any previously-running interval is cleaned up if present.
     if (this.renderInterval) {
       clearInterval(this.renderInterval);
-      this.renderInterval = null;
     }
+    this.renderInterval = setInterval(() => {
+      this._renderTick++;
+      if (this._renderTick % LinuxVM.KEYFRAME_EVERY === 0) {
+        // Periodically force a full dirty + keyframe.  svga_mark_dirty() sets all
+        // bits in the WASM bitmap so screen_fill_buffer will produce a full convert.
+        // needsKeyframe ensures the delta encoder emits output even if content
+        // hasn't changed, guaranteeing the client receives ≥4fps.
+        try {
+          const vga = this.getVga();
+          if (vga?.graphical_mode && vga?.svga_enabled) {
+            vga.cpu.svga_mark_dirty();
+          }
+          for (const state of this.sessions.values()) {
+            state.needsKeyframe = true;
+          }
+        } catch { /* non-fatal */ }
+      }
+      try { this.renderFrame(); } catch (_) {}
+    }, 125); // 8 fps
   }
 
   private startStatsInterval(): void {
     if (this._statsInterval) clearInterval(this._statsInterval);
     this._statsInterval = setInterval(() => {
-      if (!this.booted) return;
-
-      // Force a full VGA redraw every 10s so idle guests (HLT-heavy, no user
-      // input) still send at least one frame per stats period.
-      // svga_mark_dirty() fills the WASM dirty bitmap → next render will see
-      // min_offset=0, max_offset=vga_size → getVgaPixels skips the early-out
-      // → screen_fill_buffer processes all pages → pixels captured → frame sent.
-      try {
-        const vga = this.getVga();
-        if (vga?.graphical_mode && vga?.svga_enabled) {
-          (this.emulator as any)?.v86?.cpu?.svga_mark_dirty?.();
-        }
-      } catch { /* non-fatal */ }
-
-      if (this.sessions.size === 0) return;
+      if (!this.booted || this.sessions.size === 0) return;
       try {
         const stats = this.collectStats();
         this.broadcast(encodeStats(stats));
@@ -955,11 +973,17 @@ export class LinuxVM extends DurableObject<Env> {
       }
     }
 
-    // Skip rendering when the screen hasn't changed.
+    // ── Dirty detection and pixel fill ──────────────────────────────────
     //
-    // Legacy VGA mode: diff_addr_min/max are JS-side flags set by port writes.
-    // We can check these BEFORE calling screen_fill_buffer because they're
-    // incrementally updated by each write, not output from the fill itself.
+    // Legacy VGA: diff_addr_min/max are JS-side counters updated on every
+    // port write.  Safe to check before fill.
+    //
+    // SVGA: the authoritative dirty state is the WASM dirty bitmap, read by
+    // svga_fill_pixel_buffer() inside screen_fill_buffer().  We always call
+    // screen_fill_buffer(), then read the WASM output (min/max_offset) to
+    // decide whether the fill found any dirty pages.
+    //
+    // At 8fps (125ms interval), this call runs ≤8 times/s — negligible cost.
     if (!vga.svga_enabled) {
       if (vga.diff_addr_min >= vga.diff_addr_max) {
         this._dbgPixelsNullReason = `legacy_not_dirty(${vga.diff_addr_min}..${vga.diff_addr_max})`;
@@ -967,25 +991,15 @@ export class LinuxVM extends DurableObject<Env> {
       }
     }
 
-    // SVGA mode: always call screen_fill_buffer(). It runs svga_fill_pixel_buffer
-    // in WASM which iterates the dirty bitmap (O(bitmap_size) — cheap even when
-    // empty). It processes any dirty pages, writes pixels to dest_buffer, then
-    // CLEARS the bitmap. After the call, svga_dirty_bitmap_min/max_offset hold
-    // the CURRENT fill's results:
-    //   - Dirty pages found:   min < max  → real screen changes to encode
-    //   - No dirty pages:      min = 0xFFFFFFFF → nothing changed, skip encoding
-    //
-    // We CANNOT check min/max BEFORE the call because they hold STALE values
-    // from the previous fill. Between fills, mark_dirty() updates the bitmap
-    // but does NOT update min/max_offset. Checking stale values would miss
-    // dirty pages that arrived since the last fill.
+    // screen_fill_buffer processes the WASM dirty bitmap, writes RGBA to
+    // dest_buffer, then clears the bitmap.  Cheap even when bitmap is empty.
     vga.screen_fill_buffer();
 
-    // Now check: did this fill find any dirty pages?
+    // For SVGA: check post-fill output to see if any pages were dirty.
+    // min_offset = 0xFFFFFFFF means iter_dirty_pages found nothing.
     if (vga.svga_enabled) {
       const minOff = cpu.svga_dirty_bitmap_min_offset[0];
       if (minOff === 0xFFFFFFFF) {
-        // Empty fill — bitmap had no dirty pages. Skip pixel read and encoding.
         this._dbgPixelsNullReason = "svga_bitmap_empty";
         this._perf.notDirty++;
         return null;
@@ -1021,28 +1035,7 @@ export class LinuxVM extends DurableObject<Env> {
        return;
      }
 
-     const vga = this.getVga();
-
-     // Periodic VGA state dump — every 50 frames regardless of outcome
-     if (this._renderCount % 50 === 0) {
-      if (!vga) {
-        console.log(`${LOG_PREFIX} renderFrame #${this._renderCount}: no vga device`);
-      } else {
-        console.log(
-          `${LOG_PREFIX} renderFrame #${this._renderCount}` +
-          ` graphical=${vga.graphical_mode} svga=${vga.svga_enabled}` +
-          ` w=${vga.screen_width} h=${vga.screen_height}` +
-          ` vw=${vga.virtual_width} vh=${vga.virtual_height}` +
-          ` offset=${vga.dest_buffet_offset}` +
-          ` diff=${vga.diff_addr_min}..${vga.diff_addr_max}` +
-          ` svgaBitmap=${vga.cpu?.svga_dirty_bitmap_min_offset?.[0]?.toString(16) ?? '?'}..${vga.cpu?.svga_dirty_bitmap_max_offset?.[0]?.toString(16) ?? '?'}` +
-          ` wasmBuf=${vga.cpu?.wasm_memory?.buffer?.byteLength ?? 'none'}` +
-          ` imgData=${vga.image_data ? 'yes' : 'null'}` +
-          ` sessions=${this.sessions.size}` +
-          ` lastNullReason=${this._dbgPixelsNullReason ?? 'none'}`
-        );
-      }
-    }
+      const vga = this.getVga();
 
     if (!vga) return;
 
@@ -1111,12 +1104,10 @@ export class LinuxVM extends DurableObject<Env> {
     const dead: WebSocket[] = [];
 
     for (const [ws, state] of this.sessions.entries()) {
-      if (state.lastSendTime > 0 && now - state.lastSendTime < 20) {
-        state.droppedFrames++;
-        this.framesSkippedBackpressure++;
-        if (state.droppedFrames > 5) state.needsKeyframe = true;
-        continue;
-      }
+      // At 8fps fixed cadence, backpressure gating is unnecessary — we produce
+      // at most 8 frames/s per client.  Removed the old 20ms rate limit that was
+      // designed for the 532/s yield-driven render loop.
+      // (Previously: if lastSendTime > 0 && now - lastSendTime < 20 → skip)
 
       let data = result.data;
       if (state.needsKeyframe && result.isDelta) {

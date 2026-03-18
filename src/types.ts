@@ -61,6 +61,7 @@ export interface VgaDevice {
     wasm_memory: WebAssembly.Memory;
     svga_dirty_bitmap_min_offset: Uint32Array;
     svga_dirty_bitmap_max_offset: Uint32Array;
+    svga_mark_dirty(): void;
   };
   screen: any;
   graphical_mode: boolean;
