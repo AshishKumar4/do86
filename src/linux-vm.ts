@@ -326,18 +326,23 @@ export class LinuxVM extends DurableObject<Env> {
   // ── Stats collection ──────────────────────────────────────────────────
 
   
-  private getJitBlockCount(): number {
+  private getJitBlockCount(): Record<string, unknown> {
     try {
-      const cpu = (this.emulator as any)?.cpu;
-      if (!cpu?.wm?.wasm_table) return -1;
-      const table = cpu.wm.wasm_table;
-      const offset = cpu.wm.exports?.WASM_TABLE_OFFSET ?? 0;
-      let count = 0;
-      for (let i = 0; i < 900; i++) {
-        if (table.get(i + offset) !== null) count++;
+      const emu = this.emulator as any;
+      const cpu = emu?.cpu;
+      if (!cpu) return { error: "no cpu" };
+      const wm = cpu.wm;
+      if (!wm) return { error: "no wm" };
+      const table = wm.wasm_table;
+      if (!table) return { error: "no wasm_table", wmKeys: Object.keys(wm).slice(0, 10) };
+      const tableLen = table.length;
+      let filled = 0;
+      for (let i = 0; i < tableLen; i++) {
+        try { if (table.get(i) !== null) filled++; } catch { break; }
       }
-      return count;
-    } catch { return -1; }
+      const seenCode = cpu.seen_code ? Object.keys(cpu.seen_code).length : -1;
+      return { tableLen, filled, seenCode };
+    } catch (e: any) { return { error: e.message }; }
   }
 
   private collectStats(): Record<string, unknown> {
@@ -376,7 +381,7 @@ export class LinuxVM extends DurableObject<Env> {
       // Page store
       pageStore:   ps,
       // JIT
-      jitBlocks:   this.getJitBlockCount(),
+      jit:         this.getJitBlockCount(),
     };
   }
 
