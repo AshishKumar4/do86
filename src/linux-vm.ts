@@ -22,35 +22,51 @@ import type { Env } from "./index";
 // All tunable memory / paging parameters live here.  Change these values to
 // reshape the DO memory budget without touching boot logic.
 //
-// DO isolate memory budget (128 MB hard limit):
-//   WASM resident RAM : RESIDENT_MB  = 32 MB
-//   WASM hot pool     : HOT_POOL_MB  = 32 MB   (HOT_FRAMES × 4 KB)
-//   VGA SVGA buffer   : VGA_MB       =  8 MB
-//   WASM heap overhead:              ~ 20 MB   (JIT cache, TLB tables, etc.)
-//   JS heap           :              ~ 10 MB   (emulator objects, WS sessions)
-//   ──────────────────────────────────────
-//   Total                            ~102 MB   ← safe below 128 MB limit
+// WASM linear memory layout:
+//   mem8[0 .. RESIDENT_MB)                        — always-resident guest RAM
+//   mem8[RESIDENT_MB .. RESIDENT_MB + HOT_POOL_MB) — hot page frame pool
+//   WASM_MB = RESIDENT_MB + HOT_POOL_MB            — total mem8 allocation
 //
-// Guest sees LOGICAL_MB via CMOS/e820.  GPAs in [RESIDENT_MB, LOGICAL_MB)
-// are demand-paged from DO SQLite via the swap_page_in WASM import hook.
+// *** CRITICAL: memory_size passed to v86 MUST equal WASM_MB (not RESIDENT_MB).
+// in_mapped_range(addr) returns true when addr >= memory_size.  If memory_size
+// were set to RESIDENT_MB (32 MB), every frame offset the hot pool returns would
+// be ≥ memory_size, triggering the MMIO path instead of direct mem8 access.
+// Setting memory_size = WASM_MB (64 MB) keeps all hot pool offsets below the
+// threshold, so in_mapped_range() correctly returns false for them.
+//
+// DO isolate memory budget (128 MB hard limit):
+//   WASM mem8 (resident + pool): WASM_MB   = 64 MB  (allocated by allocate_memory)
+//   VGA SVGA buffer             : VGA_MB   =  8 MB  (svga_allocate_memory, separate)
+//   WASM heap overhead          :          ~ 20 MB  (JIT code cache, TLB tables)
+//   JS heap                     :          ~ 10 MB  (emulator objects, WS sessions)
+//   ──────────────────────────────────────────────
+//   Total                                  ~102 MB  ← safe below 128 MB limit
+//
+// Guest sees LOGICAL_MB via CMOS/e820 (demand-paged by SqlPageStore).
 // RESIDENT_MB must equal PAGED_THRESHOLD in stratum/src/rust/cpu/memory.rs.
 const VM_CONFIG = {
-  /** Physical WASM allocation: resident guest RAM (bytes). */
+  /** GPA threshold: below this, pages are always resident in mem8[0..RESIDENT_MB).
+   *  MUST match PAGED_THRESHOLD in stratum/src/rust/cpu/memory.rs. */
   RESIDENT_MB:   32,
-  /** Hot page frame pool size (frames).  Each frame = 4 KB.
-   *  Pool occupies mem8[RESIDENT_MB .. RESIDENT_MB + HOT_FRAMES×4KB]. */
-  HOT_FRAMES:    8192,   // 8192 × 4 KB = 32 MB hot window
-  /** VGA SVGA framebuffer size (MB). */
+  /** Hot page frame pool: number of 4 KB frames.
+   *  Pool occupies mem8[RESIDENT_MB .. RESIDENT_MB + HOT_FRAMES×4KB).
+   *  HOT_POOL_MB = HOT_FRAMES × 4 / 1024 = 32 MB. */
+  HOT_FRAMES:    8192,
+  /** Total WASM linear memory allocation (MB): RESIDENT_MB + HOT_POOL_MB.
+   *  This is the value passed as memory_size to v86.  Must cover the full
+   *  hot pool so in_mapped_range() never fires for pool frame offsets. */
+  WASM_MB:       64,   // = RESIDENT_MB(32) + HOT_FRAMES×4KB/1MB(32)
+  /** VGA SVGA framebuffer size (MB), allocated separately by svga_allocate_memory. */
   VGA_MB:         8,
   /** Logical RAM reported to guest BIOS/CMOS (MB).
-   *  Pages above RESIDENT_MB are demand-paged from SQLite. */
+   *  GPAs in [RESIDENT_MB, LOGICAL_MB) are demand-paged from DO SQLite. */
   LOGICAL_MB:   256,
   /** SMP CPU count: 1 = BSP only, 2 = BSP + 1 AP.
    *  Each AP adds cooperative ticks; increase only after measuring headroom. */
   CPU_COUNT:      2,
   /** PageStore tuning forwarded to SqlPageStore constructor. */
   PAGE_STORE: {
-    maxFrames:    8192,  // must match HOT_FRAMES
+    maxFrames:    8192,  // must equal HOT_FRAMES above
     maxEvictScan: 256,
   } satisfies Partial<PageStoreConfig>,
 } as const;
@@ -70,23 +86,23 @@ interface ImageDef {
   noSnapshot?: boolean;
 }
 
-// memory/vgaMemory in IMAGES are the WASM-physical allocations (MB) passed to v86.
-// With demand-paging active these equal RESIDENT_MB / VGA_MB from VM_CONFIG.
-// linux4 is text-only and uses a smaller budget; all other images share the default.
-const { RESIDENT_MB, VGA_MB } = VM_CONFIG;
+// memory/vgaMemory in IMAGES are the values passed as memory_size/vga_memory_size to v86.
+// For demand-paged images: memory = WASM_MB (full WASM allocation including hot pool).
+// linux4 is text-only, no demand-paging, smaller budget.
+const { WASM_MB, VGA_MB } = VM_CONFIG;
 const IMAGES: Record<string, ImageDef> = {
-  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "KolibriOS",
+  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: WASM_MB, vgaMemory: VGA_MB, label: "KolibriOS",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "AqeousOS",      noSnapshot: true },
-  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "TinyCore 15",
+  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "AqeousOS",      noSnapshot: true },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 15",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
-  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "TinyCore 11",
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 11",
                 url: "http://tinycorelinux.net/11.x/x86/release/TinyCore-11.1.iso" },
-  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "DSL Linux",
+  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "DSL Linux",
                 url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
-  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "HelenOS",
+  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "HelenOS",
                 url: "https://www.helenos.org/releases/HelenOS-0.14.1-ia32.iso" },
-  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,          vgaMemory: 2,      label: "Linux 4 (Text)",
+  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,      vgaMemory: 2,      label: "Linux 4 (Text)",
                 url: "https://copy.sh/v86/images/linux4.iso" },
 };
 
@@ -284,7 +300,7 @@ export class LinuxVM extends DurableObject<Env> {
       if (!bios || !vgaBios) throw new Error("Missing BIOS assets");
 
       let imageKey = "kolibri", drive: "fda" | "cdrom" = "cdrom";
-      let memorySizeMB = 32, vgaMemoryMB = 2, label = "Linux";
+      let memorySizeMB = VM_CONFIG.WASM_MB, vgaMemoryMB = VM_CONFIG.VGA_MB, label = "Linux";
       let diskUrl: string | null = null;
       let diskFile: string | null = null;
 
@@ -424,12 +440,13 @@ export class LinuxVM extends DurableObject<Env> {
         disable_jit: false,
         bios: { buffer: bios },
         vga_bios: { buffer: vgaBios },
+        // memory_size = WASM_MB (resident + hot pool) so in_mapped_range() never
+        // fires for hot pool frame offsets.  See VM_CONFIG for full explanation.
         memory_size:         memorySizeMB * 1024 * 1024,
         vga_memory_size:     vgaMemoryMB  * 1024 * 1024,
         // logical_memory_size: what the guest BIOS/CMOS reports (VM_CONFIG.LOGICAL_MB).
-        // WASM only allocates memory_size (VM_CONFIG.RESIDENT_MB); the upper range
-        // is demand-paged from DO SQLite via the swap_page_in WASM import hook wired
-        // in the emulator-loaded listener below.
+        // GPAs ≥ RESIDENT_MB are demand-paged from DO SQLite via the swap_page_in
+        // WASM import hook wired in the emulator-loaded listener below.
         logical_memory_size: VM_CONFIG.LOGICAL_MB * 1024 * 1024,
         autostart: false,
         disable_speaker: true,

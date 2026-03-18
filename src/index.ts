@@ -23,24 +23,28 @@ interface ImageDef {
 // ── DO memory budget ─────────────────────────────────────────────────────────
 // Cloudflare Durable Objects have a 128 MB total isolate memory limit.
 // Demand-paging layout (all tunable in linux-vm.ts VM_CONFIG):
-//   Resident guest RAM:  32 MB  (WASM mem8[0..32MB], always hot)
-//   Hot page frame pool: 32 MB  (WASM mem8[32MB..64MB], 8192 × 4 KB frames)
-//   VGA SVGA buffer:      8 MB  (svga_allocate_memory, outside mem8)
-//   WASM heap overhead:  ~20 MB (JIT code cache, TLB tables, CPU structs)
-//   JS heap:             ~10 MB (emulator objects, WS sessions, delta encoder)
-//   ──────────────────────────
-//   Total:              ~102 MB ← safe headroom below 128 MB limit
+//   WASM mem8 total    : 64 MB  (memory_size passed to v86; MUST cover full hot pool)
+//     ↳ Resident RAM   : 32 MB  (mem8[0..32MB], PAGED_THRESHOLD in Rust)
+//     ↳ Hot pool       : 32 MB  (mem8[32MB..64MB], 8192 × 4 KB frames)
+//   VGA SVGA buffer    :  8 MB  (svga_allocate_memory, separate allocation)
+//   WASM heap overhead : ~20 MB (JIT code cache, TLB tables, CPU structs)
+//   JS heap            : ~10 MB (emulator objects, WS sessions, delta encoder)
+//   ──────────────────────────────────
+//   Total              ~102 MB ← safe headroom below 128 MB limit
 //
 // Guest sees 256 MB via CMOS/e820 (VM_CONFIG.LOGICAL_MB).
 // GPAs [32 MB, 256 MB) are demand-paged from DO SQLite via swap_page_in.
-// linux4 (text-only) uses a reduced budget: 32 MB RAM, 2 MB VGA.
+// linux4 (text-only, no demand-paging) uses a smaller budget: 32 MB RAM, 2 MB VGA.
 //
-// memory/vgaMemory values in IMAGES are the WASM physical allocations (MB)
-// sent to v86 — not what the guest OS sees.  To change the shared default,
-// edit VM_CONFIG in linux-vm.ts; this table stays in sync via the constants below.
+// memory/vgaMemory values in IMAGES are the values passed as memory_size to v86.
+// For demand-paged images this is WASM_MB = 64 MB (must include the hot pool).
+// To change the shared default, edit VM_CONFIG in linux-vm.ts.
 
-/** Shared default memory/VGA allocation for demand-paged images (MB). */
-const DEFAULT_MEMORY_MB  = 32; // == VM_CONFIG.RESIDENT_MB + VM_CONFIG.HOT_FRAMES×4KB/1MB
+/** Shared default memory/VGA allocation for demand-paged images (MB).
+ *  memory = WASM_MB = RESIDENT_MB + HOT_POOL_MB = 64 MB (full mem8 allocation).
+ *  Must match VM_CONFIG.WASM_MB in linux-vm.ts — see that file for the full explanation
+ *  of why memory_size must cover the hot pool, not just the resident window. */
+const DEFAULT_MEMORY_MB  = 64; // == VM_CONFIG.WASM_MB (resident 32 MB + hot pool 32 MB)
 const DEFAULT_VGA_MB     =  8; // == VM_CONFIG.VGA_MB
 
 const IMAGES: Record<string, ImageDef> = {
