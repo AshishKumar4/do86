@@ -5,7 +5,7 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
   throw Error('Dynamic require of "' + x + '" is not supported');
 });
 
-// src/const.js
+// stratum/src/const.js
 var LOG_ALL = -1;
 var LOG_CPU = 2;
 var LOG_FPU = 4;
@@ -113,7 +113,7 @@ var MIXER_SRC_MASTER = 0;
 var MIXER_SRC_PCSPEAKER = 1;
 var MIXER_SRC_DAC = 2;
 
-// src/log.js
+// stratum/src/log.js
 if (typeof DEBUG === "undefined") {
   globalThis.DEBUG = true;
 }
@@ -130,7 +130,7 @@ function do_the_log(message) {
     console.log(message);
   }
 }
-var dbg_log = (function() {
+var dbg_log = function() {
   if (!DEBUG) {
     return function() {
     };
@@ -167,7 +167,7 @@ var dbg_log = (function() {
     }
   }
   return dbg_log_;
-})();
+}();
 function dbg_trace(level) {
   if (!DEBUG) return;
   dbg_log(Error().stack, level);
@@ -188,7 +188,7 @@ function dbg_assert_failed(msg) {
   }
 }
 
-// src/lib.js
+// stratum/src/lib.js
 function pads(str, len) {
   str = str || str === 0 ? str + "" : "";
   return str.padEnd(len, " ");
@@ -644,7 +644,7 @@ function get_charmap(encoding) {
   return encoding && CHARMAPS[encoding] ? CHARMAPS[encoding] : CHARMAPS.cp437;
 }
 
-// src/buffer.js
+// stratum/src/buffer.js
 var BLOCK_SIZE = 256;
 var ASYNC_SAFE = false;
 function SyncBuffer(buffer) {
@@ -1033,7 +1033,7 @@ function buffer_from_object(obj, zstd_decompress_worker) {
   }
 }
 
-// src/dma.js
+// stratum/src/dma.js
 function DMA(cpu) {
   this.cpu = cpu;
   this.channel_page = new Uint8Array(8);
@@ -1321,7 +1321,7 @@ DMA.prototype.flipflop_read = function(dword) {
   }
 };
 
-// src/io.js
+// stratum/src/io.js
 var LOG_ALL_IO = false;
 function IO(cpu) {
   this.ports = [];
@@ -1624,7 +1624,7 @@ IO.prototype.get_port_description = function(addr) {
   }
 };
 
-// src/bus.js
+// stratum/src/bus.js
 var Bus = {};
 function BusConnector() {
   this.listeners = {};
@@ -1674,7 +1674,7 @@ Bus.create = function() {
   return [c0, c1];
 };
 
-// src/sb16.js
+// stratum/src/sb16.js
 var DSP_COPYRIGHT = "COPYRIGHT (C) CREATIVE TECHNOLOGY LTD, 1992.";
 var DSP_NO_COMMAND = 0;
 var DSP_BUFSIZE = 64;
@@ -2747,7 +2747,7 @@ function audio_clip(value, low, high) {
   return (value < low) * low + (value > high) * high + (low <= value && value <= high) * value;
 }
 
-// src/acpi.js
+// stratum/src/acpi.js
 var PMTIMER_FREQ_SECONDS = 3579545;
 function ACPI(cpu) {
   this.cpu = cpu;
@@ -3071,7 +3071,7 @@ ACPI.prototype.set_state = function(state) {
   this.gpe = state[3];
 };
 
-// src/pit.js
+// stratum/src/pit.js
 var OSCILLATOR_FREQ = 1193.1816666;
 function PIT(cpu, bus) {
   this.cpu = cpu;
@@ -3282,7 +3282,7 @@ PIT.prototype.dump = function() {
   dbg_log("counter0 ticks every " + time + "ms (reload=" + reload + ")");
 };
 
-// src/uart.js
+// stratum/src/uart.js
 var DLAB = 128;
 var UART_IER_MSI = 8;
 var UART_IER_THRI = 2;
@@ -3556,7 +3556,7 @@ UART.prototype.set_modem_status = function(status) {
   this.modem_status |= delta;
 };
 
-// src/pci.js
+// stratum/src/pci.js
 var PCI_CONFIG_ADDRESS = 3320;
 var PCI_CONFIG_DATA = 3324;
 function PCI(cpu) {
@@ -4084,7 +4084,7 @@ PCI.prototype.lower_irq = function(pci_id) {
   this.cpu.device_lower_irq(irq);
 };
 
-// src/ne2k.js
+// stratum/src/ne2k.js
 var NE2K_LOG_VERBOSE = false;
 var NE2K_LOG_PACKETS = false;
 var E8390_CMD = 0;
@@ -4999,7 +4999,7 @@ Ne2k.prototype.get_page = function() {
   return this.cr >> 6 & 3;
 };
 
-// src/virtio.js
+// stratum/src/virtio.js
 var VIRTIO_PCI_VENDOR_ID = 6900;
 var VIRTIO_PCI_CAP_VENDOR = 9;
 var VIRTIO_PCI_CAP_LENGTH = 16;
@@ -5986,7 +5986,7 @@ VirtQueueBufferChain.prototype.set_next_blob = function(src_buffer) {
   return src_offset;
 };
 
-// lib/marshall.js
+// stratum/lib/marshall.js
 var textde = new TextDecoder();
 var texten = new TextEncoder();
 function Marshall(typelist, input, struct, offset) {
@@ -6101,7 +6101,7 @@ function Unmarshall(typelist, struct, state) {
   return output;
 }
 
-// src/virtio_console.js
+// stratum/src/virtio_console.js
 var VIRTIO_CONSOLE_DEVICE_READY = 0;
 var VIRTIO_CONSOLE_DEVICE_ADD = 1;
 var VIRTIO_CONSOLE_PORT_READY = 3;
@@ -6333,7 +6333,7 @@ VirtioConsole.prototype.Ack = function(queue_id, bufchain) {
   this.virtio.queues[queue_id].flush_replies();
 };
 
-// src/ps2.js
+// stratum/src/ps2.js
 var PS2_LOG_VERBOSE = false;
 function PS2(cpu, bus) {
   this.cpu = cpu;
@@ -6842,7 +6842,7 @@ PS2.prototype.port64_write = function(write_byte) {
   }
 };
 
-// src/elf.js
+// stratum/src/elf.js
 var ELF_MAGIC = 1179403647;
 var types = DataView.prototype;
 var U8 = { size: 1, get: types.getUint8, set: types.setUint8 };
@@ -7009,7 +7009,7 @@ function view_slice(view2, offset, length) {
   return new DataView(view2.buffer, view2.byteOffset + offset, length);
 }
 
-// src/rtc.js
+// stratum/src/rtc.js
 var CMOS_RTC_SECONDS = 0;
 var CMOS_RTC_SECONDS_ALARM = 1;
 var CMOS_RTC_MINUTES = 2;
@@ -7285,7 +7285,7 @@ RTC.prototype.cmos_write = function(index, value) {
   this.cmos_data[index] = value;
 };
 
-// src/floppy.js
+// stratum/src/floppy.js
 var FDC_IRQ_CHANNEL = 6;
 var FDC_DMA_CHANNEL = 2;
 var CMOS_FDD_TYPE_NO_DRIVE = 0;
@@ -8266,7 +8266,7 @@ FloppyDrive.prototype.set_state = function(state) {
   }
 };
 
-// src/ide.js
+// stratum/src/ide.js
 var CDROM_SECTOR_SIZE = 2048;
 var HD_SECTOR_SIZE = 512;
 var BUS_MASTER_BASE = 46080;
@@ -10461,7 +10461,7 @@ IDEInterface.prototype.set_state = function(state) {
   this.medium_changed = false;
 };
 
-// src/lapic_stub.js
+// stratum/src/lapic_stub.js
 var LAPIC_ID = 32;
 var LAPIC_VERSION = 48;
 var LAPIC_TPR = 128;
@@ -10743,7 +10743,7 @@ function register_lapic_mmio(cpu, io) {
   dbg_log("LAPIC MMIO stub registered at 0xFEE00000 (JS fallback)");
 }
 
-// src/ahci_protocol.js
+// stratum/src/ahci_protocol.js
 var FIS_TYPE_REG_D2H = 52;
 var FIS_TYPE_DEV_BITS = 161;
 var ATA_CMD_READ_DMA2 = 200;
@@ -11638,7 +11638,7 @@ var AHCICommandProcessor = class {
   }
 };
 
-// src/ahci_smp_integration.js
+// stratum/src/ahci_smp_integration.js
 var CPU_BUFFER_SIZE = 480 * 1024;
 var SHARED_BUFFER_SIZE = 960 * 1024;
 var SLOTS_PER_CPU = 4;
@@ -12051,7 +12051,7 @@ var AHCIDMAManager = class {
   }
 };
 
-// src/ahci_msi.js
+// stratum/src/ahci_msi.js
 var MSI_ENABLE = 1 << 0;
 var MSI_64BIT_ADDR_CAP = 1 << 7;
 var MSI_PER_VECTOR_MASK_CAP = 1 << 8;
@@ -12376,7 +12376,7 @@ var AHCIMSIManager = class {
   }
 };
 
-// src/ahci_virtual_disk.js
+// stratum/src/ahci_virtual_disk.js
 var DISK_TYPE_RAM = "ram";
 var DISK_TYPE_DURABLE = "durable";
 var DISK_TYPE_BUFFER = "buffer";
@@ -12947,7 +12947,7 @@ var VirtualDiskManager = class {
   }
 };
 
-// src/ahci.js
+// stratum/src/ahci.js
 var AHCI_MEM_ADDRESS = 4271898624;
 var AHCI_MEM_SIZE = 4096;
 var AHCI_MAX_PORTS = 32;
@@ -13805,7 +13805,7 @@ AHCIController.prototype.set_state = function(state) {
   }
 };
 
-// src/virtio_net.js
+// stratum/src/virtio_net.js
 var MTU_DEFAULT = 1500;
 var VIRTIO_NET_F_MAC = 5;
 var VIRTIO_NET_F_CTRL_VQ = 17;
@@ -13996,7 +13996,7 @@ VirtioNet.prototype.Ack = function(queue_id, bufchain) {
   this.virtio.queues[queue_id].flush_replies();
 };
 
-// src/browser/screen.js
+// stratum/src/browser/screen.js
 var DEBUG_SCREEN_LAYERS = DEBUG && false;
 function ScreenAdapter(options, screen_fill_buffer) {
   const screen_container = options.container;
@@ -14581,7 +14581,7 @@ function ScreenAdapter(options, screen_fill_buffer) {
   this.init();
 }
 
-// src/browser/dummy_screen.js
+// stratum/src/browser/dummy_screen.js
 function DummyScreenAdapter(options) {
   var graphic_image_data, cursor_row = 0, cursor_col = 0, graphical_mode_width = 0, graphical_mode_height = 0, is_graphical = false, text_mode_data, text_mode_width = 0, text_mode_height = 0, charmap = get_charmap(options?.encoding);
   this.put_char = function(row, col, chr, blinking, bg_color, fg_color) {
@@ -14641,7 +14641,7 @@ function DummyScreenAdapter(options) {
   this.set_size_text(80, 25);
 }
 
-// src/vga.js
+// stratum/src/vga.js
 var VGA_BANK_SIZE = 64 * 1024;
 var MAX_XRES = 2560;
 var MAX_YRES = 1600;
@@ -16361,7 +16361,7 @@ VGAScreen.prototype.set_font_page = function() {
   this.complete_redraw();
 };
 
-// src/virtio_balloon.js
+// stratum/src/virtio_balloon.js
 var VIRTIO_BALLOON_F_STATS_VQ = 1;
 var VIRTIO_BALLOON_F_FREE_PAGE_HINT = 3;
 var STAT_NAMES = [
@@ -16538,7 +16538,7 @@ VirtioBalloon.prototype.GetStats = function(data) {
 VirtioBalloon.prototype.Reset = function() {
 };
 
-// src/browser/filestorage.js
+// stratum/src/browser/filestorage.js
 function FileStorageInterface() {
 }
 FileStorageInterface.prototype.read = function(sha256sum, offset, count, file_size) {
@@ -16603,7 +16603,7 @@ ServerFileStorageWrapper.prototype.uncache = function(sha256sum) {
   this.storage.uncache(sha256sum);
 };
 
-// lib/filesystem.js
+// stratum/lib/filesystem.js
 var S_IFMT = 61440;
 var S_IFSOCK = 49152;
 var S_IFLNK = 40960;
@@ -17771,7 +17771,7 @@ FS.prototype.read_file = function(file) {
   return this.Read(p.id, 0, inode.size);
 };
 
-// lib/9p.js
+// stratum/lib/9p.js
 var TRACK_FILENAMES = false;
 var VIRTIO_9P_F_MOUNT_TAG = 0;
 var VIRTIO_9P_MAX_TAGLEN = 254;
@@ -18644,7 +18644,7 @@ Virtio9pProxy.prototype.change_proxy = function(url) {
   }
 };
 
-// src/kernel.js
+// stratum/src/kernel.js
 var LINUX_BOOT_HDR_SETUP_SECTS = 497;
 var LINUX_BOOT_HDR_SYSSIZE = 500;
 var LINUX_BOOT_HDR_VIDMODE = 506;
@@ -18802,7 +18802,7 @@ function make_linux_boot_rom(real_mode_segment, heap_end) {
   return data8;
 }
 
-// src/cpu.js
+// stratum/src/cpu.js
 var DUMP_GENERATED_WASM = false;
 var DUMP_UNCOMPILED_ASSEMBLY = false;
 function CPU(bus, wm, stop_idling) {
@@ -20420,7 +20420,7 @@ CPU.prototype.dump_wasm = function(buffer) {
   }
 };
 
-// src/state.js
+// stratum/src/state.js
 var STATE_VERSION = 6;
 var STATE_MAGIC = 2255914614 | 0;
 var STATE_INDEX_MAGIC = 0;
@@ -20644,7 +20644,139 @@ function restore_state(cpu, state) {
   }
 }
 
-// src/browser/print_stats.js
+// stratum/src/main.js
+function v86(bus, wasm) {
+  this.running = false;
+  this.stopping = false;
+  this.idle = true;
+  this.tick_counter = 0;
+  this.worker = null;
+  this.cpu = new CPU(bus, wasm, () => {
+    this.idle && this.next_tick(0);
+  });
+  this.bus = bus;
+  this.register_yield();
+}
+v86.prototype.run = function() {
+  this.stopping = false;
+  if (!this.running) {
+    this.running = true;
+    this.bus.send("emulator-started");
+  }
+  this.next_tick(0);
+};
+v86.prototype.do_tick = function() {
+  if (this.stopping || !this.running) {
+    this.stopping = this.running = false;
+    this.bus.send("emulator-stopped");
+    return;
+  }
+  this.idle = false;
+  const t = this.cpu.main_loop();
+  this.next_tick(t);
+};
+v86.prototype.next_tick = function(t) {
+  const tick = ++this.tick_counter;
+  this.idle = true;
+  this.yield(t, tick);
+};
+v86.prototype.yield_callback = function(tick) {
+  if (tick === this.tick_counter) {
+    this.do_tick();
+  }
+};
+v86.prototype.stop = function() {
+  if (this.running) {
+    this.stopping = true;
+  }
+};
+v86.prototype.destroy = function() {
+  this.unregister_yield();
+};
+v86.prototype.restart = function() {
+  this.cpu.reset_cpu();
+  this.cpu.load_bios();
+};
+v86.prototype.init = function(settings) {
+  this.cpu.init(settings, this.bus);
+  this.bus.send("emulator-ready");
+};
+if (typeof process !== "undefined") {
+  v86.prototype.yield = function(t, tick) {
+    if (t < 1) {
+      global.setImmediate((tick2) => this.yield_callback(tick2), tick);
+    } else {
+      setTimeout((tick2) => this.yield_callback(tick2), t, tick);
+    }
+  };
+  v86.prototype.register_yield = function() {
+  };
+  v86.prototype.unregister_yield = function() {
+  };
+} else if (globalThis["scheduler"] && typeof globalThis["scheduler"]["postTask"] === "function" && location.href.includes("use-scheduling-api")) {
+  v86.prototype.yield = function(t, tick) {
+    t = Math.max(0, t);
+    globalThis["scheduler"]["postTask"](() => this.yield_callback(tick), { delay: t });
+  };
+  v86.prototype.register_yield = function() {
+  };
+  v86.prototype.unregister_yield = function() {
+  };
+} else if (typeof Worker !== "undefined") {
+  let the_worker = function() {
+    let timeout;
+    globalThis.onmessage = function(e) {
+      const t = e.data.t;
+      timeout = timeout && clearTimeout(timeout);
+      if (t < 1) postMessage(e.data.tick);
+      else timeout = setTimeout(() => postMessage(e.data.tick), t);
+    };
+  };
+  v86.prototype.register_yield = function() {
+    const url = URL.createObjectURL(new Blob(["(" + the_worker.toString() + ")()"], { type: "text/javascript" }));
+    this.worker = new Worker(url);
+    this.worker.onmessage = (e) => this.yield_callback(e.data);
+    URL.revokeObjectURL(url);
+  };
+  v86.prototype.yield = function(t, tick) {
+    this.worker.postMessage({ t, tick });
+  };
+  v86.prototype.unregister_yield = function() {
+    this.worker && this.worker.terminate();
+    this.worker = null;
+  };
+} else {
+  v86.prototype.yield = function(t) {
+    setTimeout(() => {
+      this.do_tick();
+    }, t);
+  };
+  v86.prototype.register_yield = function() {
+  };
+  v86.prototype.unregister_yield = function() {
+  };
+}
+v86.prototype.save_state = function() {
+  return save_state(this.cpu);
+};
+v86.prototype.restore_state = function(state) {
+  return restore_state(this.cpu, state);
+};
+if (typeof performance === "object" && performance.now) {
+  v86.microtick = performance.now.bind(performance);
+} else if (typeof __require === "function") {
+  const { performance: performance2 } = __require("perf_hooks");
+  v86.microtick = performance2.now.bind(performance2);
+} else if (typeof process === "object" && process.hrtime) {
+  v86.microtick = function() {
+    var t = process.hrtime();
+    return t[0] * 1e3 + t[1] / 1e6;
+  };
+} else {
+  v86.microtick = Date.now;
+}
+
+// stratum/src/browser/print_stats.js
 function stats_to_string(cpu) {
   return print_misc_stats(cpu) + print_instruction_counts(cpu);
 }
@@ -20879,7 +21011,7 @@ function print_instruction_counts_offset(cpu, compiled, jit_exit, unguarded_regi
   return text;
 }
 
-// src/browser/speaker.js
+// stratum/src/browser/speaker.js
 var DAC_QUEUE_RESERVE = 0.2;
 var AUDIOBUFFER_MINIMUM_SAMPLING_RATE = 8e3;
 function SpeakerAdapter(bus) {
@@ -21540,7 +21672,7 @@ SpeakerDACDebugger.prototype.download_csv = function(history_id) {
   dump_file(csv_rows.join("\n"), "dacdata.csv");
 };
 
-// src/browser/network.js
+// stratum/src/browser/network.js
 function NetworkAdapter(url, bus, id) {
   this.bus = bus;
   this.socket = void 0;
@@ -21630,7 +21762,7 @@ NetworkAdapter.prototype.change_proxy = function(url) {
   }
 };
 
-// src/browser/fake_network.js
+// stratum/src/browser/fake_network.js
 var ETHERTYPE_IPV4 = 2048;
 var ETHERTYPE_ARP = 2054;
 var ETHERTYPE_IPV6 = 34525;
@@ -22805,7 +22937,7 @@ function handle_udp_echo(packet, adapter) {
   adapter.receive(make_packet(adapter.eth_encoder_buf, reply));
 }
 
-// src/browser/fetch_network.js
+// stratum/src/browser/fetch_network.js
 function FetchNetworkAdapter(bus, config) {
   config = config || {};
   this.bus = bus;
@@ -23018,7 +23150,7 @@ FetchNetworkAdapter.prototype.receive = function(data) {
   this.bus.send("net" + this.id + "-receive", new Uint8Array(data));
 };
 
-// src/browser/wisp_network.js
+// stratum/src/browser/wisp_network.js
 function WispNetworkAdapter(wisp_url, bus, config) {
   this.register_ws(wisp_url);
   this.last_stream = 1;
@@ -23203,7 +23335,7 @@ WispNetworkAdapter.prototype.receive = function(data) {
   this.bus.send("net" + this.id + "-receive", new Uint8Array(data));
 };
 
-// src/browser/keyboard.js
+// stratum/src/browser/keyboard.js
 var SHIFT_SCAN_CODE = 42;
 var SCAN_CODE_RELEASE = 128;
 var PLATFOM_WINDOWS = typeof window !== "undefined" && window.navigator.platform.toString().toLowerCase().search("win") >= 0;
@@ -23753,7 +23885,7 @@ function KeyboardAdapter(bus) {
   }
 }
 
-// src/browser/mouse.js
+// stratum/src/browser/mouse.js
 function MouseAdapter(bus, screen_container) {
   const SPEED_FACTOR = 1;
   var left_down = false, right_down = false, middle_down = false, last_x = 0, last_y = 0, mouse = this;
@@ -23935,7 +24067,7 @@ function MouseAdapter(bus, screen_container) {
   }
 }
 
-// src/browser/serial.js
+// stratum/src/browser/serial.js
 function TextAreaAdapter(element) {
   var serial = this;
   this.enabled = true;
@@ -24120,7 +24252,7 @@ function VirtioConsoleAdapterXtermJS(element, bus, xterm_lib) {
 Reflect.setPrototypeOf(VirtioConsoleAdapterXtermJS.prototype, XtermJSAdapter.prototype);
 Reflect.setPrototypeOf(VirtioConsoleAdapterXtermJS, XtermJSAdapter);
 
-// src/browser/inbrowser_network.js
+// stratum/src/browser/inbrowser_network.js
 function InBrowserNetworkAdapter(bus, config) {
   const id = config.id || 0;
   this.bus = bus;
@@ -24146,7 +24278,7 @@ InBrowserNetworkAdapter.prototype.destroy = function() {
   }
 };
 
-// src/browser/starter.js
+// stratum/src/browser/starter.js
 function V86(options) {
   if (typeof options.log_level === "number") {
     set_log_level(options.log_level);
@@ -25064,140 +25196,7 @@ if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
 } else if (typeof importScripts === "function") {
   self["V86"] = V86;
 }
-
-// src/main.js
-function v86(bus, wasm) {
-  this.running = false;
-  this.stopping = false;
-  this.idle = true;
-  this.tick_counter = 0;
-  this.worker = null;
-  this.cpu = new CPU(bus, wasm, () => {
-    this.idle && this.next_tick(0);
-  });
-  this.bus = bus;
-  this.register_yield();
-}
-v86.prototype.run = function() {
-  this.stopping = false;
-  if (!this.running) {
-    this.running = true;
-    this.bus.send("emulator-started");
-  }
-  this.next_tick(0);
-};
-v86.prototype.do_tick = function() {
-  if (this.stopping || !this.running) {
-    this.stopping = this.running = false;
-    this.bus.send("emulator-stopped");
-    return;
-  }
-  this.idle = false;
-  const t = this.cpu.main_loop();
-  this.next_tick(t);
-};
-v86.prototype.next_tick = function(t) {
-  const tick = ++this.tick_counter;
-  this.idle = true;
-  this.yield(t, tick);
-};
-v86.prototype.yield_callback = function(tick) {
-  if (tick === this.tick_counter) {
-    this.do_tick();
-  }
-};
-v86.prototype.stop = function() {
-  if (this.running) {
-    this.stopping = true;
-  }
-};
-v86.prototype.destroy = function() {
-  this.unregister_yield();
-};
-v86.prototype.restart = function() {
-  this.cpu.reset_cpu();
-  this.cpu.load_bios();
-};
-v86.prototype.init = function(settings) {
-  this.cpu.init(settings, this.bus);
-  this.bus.send("emulator-ready");
-};
-if (typeof process !== "undefined") {
-  v86.prototype.yield = function(t, tick) {
-    if (t < 1) {
-      global.setImmediate((tick2) => this.yield_callback(tick2), tick);
-    } else {
-      setTimeout((tick2) => this.yield_callback(tick2), t, tick);
-    }
-  };
-  v86.prototype.register_yield = function() {
-  };
-  v86.prototype.unregister_yield = function() {
-  };
-} else if (globalThis["scheduler"] && typeof globalThis["scheduler"]["postTask"] === "function" && location.href.includes("use-scheduling-api")) {
-  v86.prototype.yield = function(t, tick) {
-    t = Math.max(0, t);
-    globalThis["scheduler"]["postTask"](() => this.yield_callback(tick), { delay: t });
-  };
-  v86.prototype.register_yield = function() {
-  };
-  v86.prototype.unregister_yield = function() {
-  };
-} else if (typeof Worker !== "undefined") {
-  let the_worker = function() {
-    let timeout;
-    globalThis.onmessage = function(e) {
-      const t = e.data.t;
-      timeout = timeout && clearTimeout(timeout);
-      if (t < 1) postMessage(e.data.tick);
-      else timeout = setTimeout(() => postMessage(e.data.tick), t);
-    };
-  };
-  v86.prototype.register_yield = function() {
-    const url = URL.createObjectURL(new Blob(["(" + the_worker.toString() + ")()"], { type: "text/javascript" }));
-    this.worker = new Worker(url);
-    this.worker.onmessage = (e) => this.yield_callback(e.data);
-    URL.revokeObjectURL(url);
-  };
-  v86.prototype.yield = function(t, tick) {
-    this.worker.postMessage({ t, tick });
-  };
-  v86.prototype.unregister_yield = function() {
-    this.worker && this.worker.terminate();
-    this.worker = null;
-  };
-} else {
-  v86.prototype.yield = function(t) {
-    setTimeout(() => {
-      this.do_tick();
-    }, t);
-  };
-  v86.prototype.register_yield = function() {
-  };
-  v86.prototype.unregister_yield = function() {
-  };
-}
-v86.prototype.save_state = function() {
-  return save_state(this.cpu);
-};
-v86.prototype.restore_state = function(state) {
-  return restore_state(this.cpu, state);
-};
-if (typeof performance === "object" && performance.now) {
-  v86.microtick = performance.now.bind(performance);
-} else if (typeof __require === "function") {
-  const { performance: performance2 } = __require("perf_hooks");
-  v86.microtick = performance2.now.bind(performance2);
-} else if (typeof process === "object" && process.hrtime) {
-  v86.microtick = function() {
-    var t = process.hrtime();
-    return t[0] * 1e3 + t[1] / 1e6;
-  };
-} else {
-  v86.microtick = Date.now;
-}
 export {
-  V86,
-  v86
+  V86
 };
 //# sourceMappingURL=libv86.mjs.map

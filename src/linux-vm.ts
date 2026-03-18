@@ -468,14 +468,26 @@ export class LinuxVM extends DurableObject<Env> {
           // any previously-created ArrayBuffer view.
           const wasmMem = instance.exports.memory as WebAssembly.Memory;
           pageStore.setWasmMemory(wasmMem, HOT_POOL_BASE);
-          // Wrap the swap_page_in import so ALL calls — including during BIOS —
-          // land in SqlPageStore directly (cpu doesn't exist yet at this point).
+
+          // Wire pool_* WASM exports (page_pool.rs) so the JS Clock eviction
+          // reads/clears reference bits from the authoritative WASM REF_MAP,
+          // and pool_register/pool_unregister keep FRAME_MAP in sync after
+          // every SQLite load or eviction.
+          pageStore.setWasmExports(instance.exports as Record<string, unknown>);
+
+          // Wrap the swap_page_in import.  In do_page_walk, pool_lookup (pure WASM)
+          // runs first; this import is called ONLY on a cold miss (page not yet in
+          // pool).  The JS handler loads from SQLite and calls pool_register so
+          // subsequent TLB misses for the same page are handled in WASM (no FFI).
           if (importObj.env) {
             importObj.env.swap_page_in = (gpa: number, forWriting: number): number => {
               return pageStore.swapPageIn(gpa, forWriting);
             };
           }
-          console.log(`${LOG_PREFIX} wasm_fn: swap_page_in wired to SqlPageStore (pre-BIOS, pre-cpu)`);
+          console.log(`${LOG_PREFIX} wasm_fn: swap_page_in wired; pool_* exports=${
+            ["pool_register","pool_unregister","pool_get_ref","pool_clear_ref","pool_reset"]
+              .filter(k => typeof (instance.exports as any)[k] === "function").length
+          }/5 found`);
 
           return instance.exports;
         },
