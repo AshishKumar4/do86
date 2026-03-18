@@ -171,6 +171,11 @@ export class LinuxVM extends DurableObject<Env> {
     renderMs:    0,   // cumulative ms spent in renderFrame()
     framesSent:  0,   // binary frames delivered to ≥1 client
     bootTimeMs:  0,   // performance.now() at boot complete
+    // render pipeline breakdown (reset each boot)
+    pixelsNull:  0,   // getVgaPixels() returned null
+    pixelsOk:    0,   // getVgaPixels() returned valid data
+    deltaNull:   0,   // encode() returned null (no changed tiles)
+    notDirty:    0,   // skipped because screenAdapter.dirty=false
   };
   private _pageStore: SqlPageStore | null = null;
   private _statsInterval: ReturnType<typeof setInterval> | null = null;
@@ -335,6 +340,11 @@ export class LinuxVM extends DurableObject<Env> {
       framesSent:  p.framesSent,
       rendersPerSec: uptimeMs > 0 ? +(p.renders / (uptimeMs / 1000)).toFixed(1) : 0,
       framesPerSec:  uptimeMs > 0 ? +(p.framesSent / (uptimeMs / 1000)).toFixed(2) : 0,
+      // render pipeline breakdown
+      notDirty:    p.notDirty,
+      pixelsNull:  p.pixelsNull,
+      pixelsOk:    p.pixelsOk,
+      deltaNull:   p.deltaNull,
       // Page store
       pageStore:   ps,
     };
@@ -490,7 +500,7 @@ export class LinuxVM extends DurableObject<Env> {
       };
 
       // Reset perf counters for this boot
-      this._perf = { yields: 0, syncYields: 0, renders: 0, renderMs: 0, framesSent: 0, bootTimeMs: 0 };
+      this._perf = { yields: 0, syncYields: 0, renders: 0, renderMs: 0, framesSent: 0, bootTimeMs: 0, pixelsNull: 0, pixelsOk: 0, deltaNull: 0, notDirty: 0 };
 
       // ── SqlPageStore: created BEFORE new V86() so the swap hook is live ───────
       // SeaBIOS runs during cpu.init() which is called synchronously inside the
@@ -656,6 +666,11 @@ export class LinuxVM extends DurableObject<Env> {
             // initial put_char() calls. Calling complete_redraw() again after
             // assigning our adapter re-pumps the current VGA state into it.
             try { vga.complete_redraw?.(); } catch (_) {}
+            // complete_redraw() calls svga_mark_dirty() which sets the VGA dirty
+            // bitmap, but does NOT call screen.update_buffer() — so screenAdapter.dirty
+            // stays false. Set it directly so getVgaPixels() will call screen_fill_buffer()
+            // on the first yield, which reads the dirty bitmap and calls update_buffer().
+            if (this.screenAdapter) this.screenAdapter.dirty = true;
           }
           this.emulator!.run();
 
@@ -862,11 +877,24 @@ export class LinuxVM extends DurableObject<Env> {
   private startStatsInterval(): void {
     if (this._statsInterval) clearInterval(this._statsInterval);
     this._statsInterval = setInterval(() => {
-      if (!this.booted || this.sessions.size === 0) return;
+      if (!this.booted) return;
+
+      // Force a full VGA redraw every 10s so idle guests (HLT-heavy, no user
+      // input) still send at least one frame per stats period.
+      // svga_mark_dirty() sets all dirty bits → next screen_fill_buffer() call
+      // produces a full-frame update regardless of guest VGA activity.
+      try {
+        const vga = this.getVga();
+        if (vga?.graphical_mode && vga?.svga_enabled) {
+          (this.emulator as any)?.v86?.cpu?.svga_mark_dirty?.();
+          if (this.screenAdapter) this.screenAdapter.dirty = true;
+        }
+      } catch { /* non-fatal */ }
+
+      if (this.sessions.size === 0) return;
       try {
         const stats = this.collectStats();
         this.broadcast(encodeStats(stats));
-        // Also log to console every 10s for wrangler tail visibility
         console.log(`${LOG_PREFIX} STATS ${JSON.stringify(stats)}`);
       } catch { /* non-fatal */ }
     }, 10_000);
@@ -928,17 +956,36 @@ export class LinuxVM extends DurableObject<Env> {
     }
 
     // Skip rendering when the screen hasn't changed.
-    // SVGA mode: svga_dirty_bitmap_min/max_offset are *output* values written by
-    // the wasm svga_fill_pixel_buffer() call inside screen_fill_buffer — they are
-    // not pre-set input dirty flags. Reading them before the call gives last frame's
-    // range, not a "has anything changed" signal. So for SVGA we always call
-    // screen_fill_buffer() and let v86's own update_buffer/screen.set_buffer handle
-    // the no-op when nothing changed.
+    //
+    // SVGA mode: screen_fill_buffer() calls svga_fill_pixel_buffer() (WASM) which
+    // reads the VGA dirty bitmap (set by mmap_write* when the guest writes to
+    // VGA_LFB_ADDRESS), copies changed pages to dest_buffer, then CLEARS the bitmap.
+    // On the first call after a guest write this works correctly and sets
+    // screenAdapter.dirty=true via update_buffer(). On the second call (< 2ms later)
+    // the bitmap is already clear → no pages → update_buffer never called →
+    // dirty stays false. Calling screen_fill_buffer() 554×/s while dirty=false
+    // just reads the same stale pixels every time, producing deltaNull on every call.
+    //
+    // Fix: use screenAdapter.dirty as the gate for SVGA. Only call screen_fill_buffer()
+    // when the adapter has been signalled dirty (meaning a guest VGA write landed).
+    // Reset dirty BEFORE screen_fill_buffer() so that writes arriving while we render
+    // are not lost (they will set dirty again and be captured on the next render).
+    //
     // Legacy VGA mode: diff_addr_min/max are JS-side flags set by port writes;
     // min >= max means no pixels changed since the last reset_diffs().
-    if (!vga.svga_enabled && vga.diff_addr_min >= vga.diff_addr_max) {
-      this._dbgPixelsNullReason = `legacy_not_dirty(${vga.diff_addr_min}..${vga.diff_addr_max})`;
-      return null;
+    if (vga.svga_enabled) {
+      if (!this.screenAdapter!.dirty) {
+        this._dbgPixelsNullReason = "svga_not_dirty";
+        return null;
+      }
+      // Clear dirty flag BEFORE calling screen_fill_buffer so we don't lose
+      // concurrent guest writes (they will set dirty=true again).
+      this.screenAdapter!.dirty = false;
+    } else {
+      if (vga.diff_addr_min >= vga.diff_addr_max) {
+        this._dbgPixelsNullReason = `legacy_not_dirty(${vga.diff_addr_min}..${vga.diff_addr_max})`;
+        return null;
+      }
     }
 
     // screen_fill_buffer() renders pixels and calls reset_diffs() internally.
@@ -996,7 +1043,12 @@ export class LinuxVM extends DurableObject<Env> {
 
     if (vga.graphical_mode) {
       const frame = this.getVgaPixels(vga);
-      if (!frame) return;
+      if (!frame) {
+        this._perf.pixelsNull++;
+        if (this._dbgPixelsNullReason === "svga_not_dirty") this._perf.notDirty++;
+        return;
+      }
+      this._perf.pixelsOk++;
 
       // First successful pixel read — log it once
       if (!this._dbgFirstPixels) {
@@ -1020,12 +1072,14 @@ export class LinuxVM extends DurableObject<Env> {
         for (const state of this.sessions.values()) state.needsKeyframe = true;
         return;
       }
-      // First time encoder returns null (changedCount === 0) — log once
-      if (!result && !this._dbgFirstEncNull) {
-        this._dbgFirstEncNull = true;
-        console.log(`${LOG_PREFIX} encode returned null (no changed tiles) — forceKeyframe=${anyNeedsKeyframe} w=${frame.width} h=${frame.height}`);
+      if (!result) {
+        this._perf.deltaNull++;
+        if (!this._dbgFirstEncNull) {
+          this._dbgFirstEncNull = true;
+          console.log(`${LOG_PREFIX} encode returned null (no changed tiles) — forceKeyframe=${anyNeedsKeyframe} w=${frame.width} h=${frame.height}`);
+        }
+        return;
       }
-      if (!result) return;
 
       this.adjustFrameRate(result.data.byteLength);
       this._perf.renderMs += performance.now() - _rfT0;
