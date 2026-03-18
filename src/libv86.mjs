@@ -11138,10 +11138,7 @@ var AHCICommandProcessor = class {
       const entry = prdt_entries[0];
       const dest_addr = entry.dba.low;
       const xfer_size = Math.min(512, entry.dbc);
-      const mem8 = this.controller.cpu.mem8;
-      for (let i = 0; i < xfer_size; i++) {
-        mem8[dest_addr + i] = identify_bytes[i];
-      }
+      this.controller.cpu.dma_write(dest_addr, identify_bytes, xfer_size);
       cmd_header.prdbc = xfer_size;
     }
     this.complete_command_success(slot);
@@ -11168,7 +11165,7 @@ var AHCICommandProcessor = class {
     }
     const disk_offset = lba * this.sector_size;
     const transfer_size = count * this.sector_size;
-    const mem8 = this.controller.cpu.mem8;
+    const cpu = this.controller.cpu;
     const prdt_entries = this.get_prdt_entries(cmd_header);
     let transferred = 0;
     let disk_pos = disk_offset;
@@ -11181,10 +11178,11 @@ var AHCICommandProcessor = class {
       const src_end = Math.min(disk_pos + size, disk.data.length);
       const copy_len = src_end - disk_pos;
       if (copy_len > 0) {
-        mem8.set(disk.data.subarray(disk_pos, src_end), memory_addr);
+        cpu.dma_write(memory_addr, disk.data.subarray(disk_pos, src_end), copy_len);
       }
       if (copy_len < size) {
-        mem8.fill(0, memory_addr + copy_len, memory_addr + size);
+        const zeros = new Uint8Array(size - copy_len);
+        cpu.dma_write(memory_addr + copy_len, zeros);
       }
       transferred += size;
       disk_pos += size;
@@ -11211,7 +11209,7 @@ var AHCICommandProcessor = class {
     }
     const disk_offset = lba * this.sector_size;
     const transfer_size = count * this.sector_size;
-    const mem8 = this.controller.cpu.mem8;
+    const cpu = this.controller.cpu;
     const prdt_entries = this.get_prdt_entries(cmd_header);
     let transferred = 0;
     let disk_pos = disk_offset;
@@ -11224,7 +11222,8 @@ var AHCICommandProcessor = class {
       const dest_end = Math.min(disk_pos + size, disk.data.length);
       const copy_len = dest_end - disk_pos;
       if (copy_len > 0) {
-        disk.data.set(mem8.subarray(memory_addr, memory_addr + copy_len), disk_pos);
+        const guest_data = cpu.dma_read(memory_addr, copy_len);
+        disk.data.set(guest_data, disk_pos);
       }
       transferred += size;
       disk_pos += size;
@@ -11277,9 +11276,8 @@ var AHCICommandProcessor = class {
     if (clb === 0) {
       return null;
     }
-    const mem8 = this.controller.cpu.mem8;
     const entry_addr = clb + slot * 32;
-    const cmd_list_buffer = mem8.subarray(entry_addr, entry_addr + 32);
+    const cmd_list_buffer = this.controller.cpu.dma_read(entry_addr, 32);
     return new AHCICommandHeader(slot, cmd_list_buffer, 0);
   }
   /**
@@ -11298,8 +11296,7 @@ var AHCICommandProcessor = class {
     }
     const prdtl = cmd_header.prdtl;
     const tbl_size = 128 + prdtl * 16;
-    const mem8 = this.controller.cpu.mem8;
-    return mem8.subarray(ctba.low, ctba.low + tbl_size);
+    return this.controller.cpu.dma_read(ctba.low, tbl_size);
   }
   /**
    * Execute ATA command
@@ -11387,10 +11384,7 @@ var AHCICommandProcessor = class {
       const entry = prdt_entries[0];
       const dest_addr = entry.dba.low;
       const xfer_size = Math.min(512, entry.dbc);
-      const mem8 = this.controller.cpu.mem8;
-      for (let i = 0; i < xfer_size; i++) {
-        mem8[dest_addr + i] = identify_bytes[i];
-      }
+      this.controller.cpu.dma_write(dest_addr, identify_bytes, xfer_size);
       cmd_header.prdbc = xfer_size;
     }
     this.complete_command_success(slot);
@@ -11551,11 +11545,11 @@ var AHCICommandProcessor = class {
   create_d2h_fis(lba = 0, count = 0) {
     const fb = this.port.fb;
     if (!fb) return;
-    const mem8 = this.controller.cpu.mem8;
     const fis_addr = fb + 64;
-    const fis_buf = mem8.subarray(fis_addr, fis_addr + 20);
+    const fis_buf = new Uint8Array(20);
     const fis = new RegisterFIS_D2H(fis_buf, 0);
     fis.set_success(lba, count);
+    this.controller.cpu.dma_write(fis_addr, fis_buf);
     dbg_log("AHCI Port " + this.port_num + ": Wrote D2H Register FIS to " + h(fis_addr), LOG_DISK);
   }
   /**
@@ -11565,17 +11559,18 @@ var AHCICommandProcessor = class {
   create_sdb_fis(slot) {
     const fb = this.port.fb;
     if (!fb) return;
-    const mem8 = this.controller.cpu.mem8;
     const fis_addr = fb + 88;
-    mem8[fis_addr + 0] = FIS_TYPE_DEV_BITS;
-    mem8[fis_addr + 1] = 64;
-    mem8[fis_addr + 2] = ATA_STATUS_DRDY | ATA_STATUS_DSC;
-    mem8[fis_addr + 3] = 0;
+    const buf = new Uint8Array(8);
+    buf[0] = FIS_TYPE_DEV_BITS;
+    buf[1] = 64;
+    buf[2] = ATA_STATUS_DRDY | ATA_STATUS_DSC;
+    buf[3] = 0;
     const sact_clear = ~(1 << slot) >>> 0;
-    mem8[fis_addr + 4] = sact_clear & 255;
-    mem8[fis_addr + 5] = sact_clear >> 8 & 255;
-    mem8[fis_addr + 6] = sact_clear >> 16 & 255;
-    mem8[fis_addr + 7] = sact_clear >> 24 & 255;
+    buf[4] = sact_clear & 255;
+    buf[5] = sact_clear >> 8 & 255;
+    buf[6] = sact_clear >> 16 & 255;
+    buf[7] = sact_clear >> 24 & 255;
+    this.controller.cpu.dma_write(fis_addr, buf);
     dbg_log("AHCI Port " + this.port_num + ": Wrote Set Device Bits FIS for slot " + slot + " to " + h(fis_addr), LOG_DISK);
   }
   /**
@@ -11609,11 +11604,11 @@ var AHCICommandProcessor = class {
   create_error_fis(error_code) {
     const fb = this.port.fb;
     if (!fb) return;
-    const mem8 = this.controller.cpu.mem8;
     const fis_addr = fb + 64;
-    const fis_buf = mem8.subarray(fis_addr, fis_addr + 20);
+    const fis_buf = new Uint8Array(20);
     const fis = new RegisterFIS_D2H(fis_buf, 0);
     fis.set_error(error_code);
+    this.controller.cpu.dma_write(fis_addr, fis_buf);
     dbg_log("AHCI Port " + this.port_num + ": Wrote error D2H FIS (err=" + h(error_code) + ") to " + h(fis_addr), LOG_DISK);
   }
   /**
@@ -11937,10 +11932,8 @@ var AHCIDMAManager = class {
    */
   async copy_from_memory(memory_addr, buffer, size) {
     dbg_log("AHCI DMA: Copying " + size + " bytes from mem " + h(memory_addr) + " to DMA buffer", LOG_DISK);
-    const mem8 = this.cpu.mem8;
-    for (let i = 0; i < size; i++) {
-      buffer[i] = mem8[memory_addr + i];
-    }
+    const data = this.cpu.dma_read(memory_addr, size);
+    buffer.set(data.subarray(0, size));
   }
   /**
    * Copy data from DMA buffer to memory
@@ -11950,10 +11943,7 @@ var AHCIDMAManager = class {
    */
   async copy_to_memory(buffer, memory_addr, size) {
     dbg_log("AHCI DMA: Copying " + size + " bytes from DMA buffer to mem " + h(memory_addr), LOG_DISK);
-    const mem8 = this.cpu.mem8;
-    for (let i = 0; i < size; i++) {
-      mem8[memory_addr + i] = buffer[i];
-    }
+    this.cpu.dma_write(memory_addr, buffer, size);
   }
   /**
    * Simulate disk read operation
@@ -18937,6 +18927,68 @@ CPU.prototype.swap_page_in = function(gpa, for_writing) {
   }
   return -1;
 };
+CPU.prototype.resolveGPA = function(gpa) {
+  const page_gpa = gpa & ~4095;
+  const page_off = gpa & 4095;
+  if (page_gpa < this.memory_size[0]) {
+    return gpa;
+  }
+  if (this.pool_lookup) {
+    const frame2 = this.pool_lookup(page_gpa);
+    if (frame2 > 0) {
+      return frame2 + page_off;
+    }
+  }
+  const frame = this.swap_page_in(page_gpa, 0);
+  if (frame > 0) {
+    return frame + page_off;
+  }
+  return -1;
+};
+CPU.prototype.dma_read = function(gpa, size) {
+  const result = new Uint8Array(size);
+  let pos = 0;
+  while (pos < size) {
+    const page_offset = gpa + pos & 4095;
+    const chunk = Math.min(size - pos, 4096 - page_offset);
+    const resolved = this.resolveGPA(gpa + pos);
+    if (resolved >= 0 && resolved + chunk <= this.mem8.length) {
+      result.set(this.mem8.subarray(resolved, resolved + chunk), pos);
+    }
+    pos += chunk;
+  }
+  return result;
+};
+CPU.prototype.dma_write = function(gpa, data, size) {
+  if (size === void 0) size = data.length;
+  let pos = 0;
+  while (pos < size) {
+    const page_offset = gpa + pos & 4095;
+    const chunk = Math.min(size - pos, 4096 - page_offset);
+    const page_gpa = gpa + pos & ~4095;
+    let resolved;
+    if (page_gpa < this.memory_size[0]) {
+      resolved = gpa + pos;
+    } else {
+      if (this.pool_lookup) {
+        const frame = this.pool_lookup(page_gpa);
+        if (frame > 0) {
+          resolved = frame + page_offset;
+        }
+      }
+      if (resolved === void 0) {
+        const frame = this.swap_page_in(page_gpa, 1);
+        if (frame > 0) {
+          resolved = frame + page_offset;
+        }
+      }
+    }
+    if (resolved !== void 0 && resolved >= 0 && resolved + chunk <= this.mem8.length) {
+      this.mem8.set(data.subarray(pos, pos + chunk), resolved);
+    }
+    pos += chunk;
+  }
+};
 CPU.prototype.write_blob = function(blob, offset) {
   dbg_assert(blob && blob.length >= 0);
   if (blob.length) {
@@ -19025,6 +19077,7 @@ CPU.prototype.wasm_patch = function() {
   this.zstd_free_ctx = get_import("zstd_free_ctx");
   this.zstd_read = get_import("zstd_read");
   this.zstd_read_free = get_import("zstd_read_free");
+  this.pool_lookup = get_optional_import("pool_lookup");
   this.smp_init = get_optional_import("smp_init");
   this.smp_cpu_loop = get_optional_import("smp_cpu_loop");
   this.smp_is_enabled = get_optional_import("smp_is_enabled");

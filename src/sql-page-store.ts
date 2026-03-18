@@ -290,7 +290,15 @@ export class SqlPageStore {
     if (frame < 0) return -1;
 
     const offset = this.poolBase + frame * PAGE_SIZE;
-    const data   = this.readFromSql(pageGpa);
+
+    // Check pending writes first — a page may have been evicted (dirty data
+    // queued for microtask flush) but not yet written to SQLite.  If we read
+    // from SQLite we'd get stale/null data, silently corrupting guest state.
+    let data: Uint8Array | null = this.takePendingWrite(pageGpa);
+    if (!data) {
+      data = this.readFromSql(pageGpa);
+    }
+
     const heap   = this.heap;
     if (heap) {
       if (data) {
@@ -487,6 +495,26 @@ export class SqlPageStore {
       : data.subarray(0, Math.min(data.length, PAGE_SIZE));
     this.sql.exec(`INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES (?, ?)`, gpa, blob);
     this._sqlWriteMs += performance.now() - t0;
+  }
+
+  /**
+   * Extract a page from the pending write queue, if present.
+   * Returns the page data and removes it from the queue, or null if not found.
+   *
+   * Called by swapPageIn to recover dirty data that was evicted but not yet
+   * flushed to SQLite (microtask hasn't fired).  Without this, re-loading an
+   * evicted page reads stale/null data from SQLite — silent data corruption.
+   */
+  private takePendingWrite(gpa: number): Uint8Array | null {
+    for (let i = 0; i < this._pendingWrites.length; i++) {
+      if (this._pendingWrites[i].gpa === gpa) {
+        const entry = this._pendingWrites[i];
+        // Remove from queue — splice is fine since pending writes are small (<64)
+        this._pendingWrites.splice(i, 1);
+        return entry.data;
+      }
+    }
+    return null;
   }
 
   /**
