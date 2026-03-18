@@ -30,7 +30,7 @@ export const CACHE_DEVICE = "cache";
 export const BOOT_ORDER_CDROM_FIRST = 0x213;
 export const BOOT_ORDER_HDA_FIRST = 0x312;
 export const EMULATOR_LOAD_TIMEOUT_MS = 30_000;
-export const SNAPSHOT_DELAY_FAST_MS = 2_000;   // KolibriOS — gate input until snapshot captures clean boot state
+export const SNAPSHOT_DELAY_FAST_MS = 30_000;  // KolibriOS — must be long enough for OS to fully boot before snapshot
 export const SNAPSHOT_DELAY_SLOW_MS = 60_000;  // Heavier OSes
 
 // ── Log prefix ──────────────────────────────────────────────────────────────
