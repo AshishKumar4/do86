@@ -698,10 +698,11 @@ export class LinuxVM extends DurableObject<Env> {
               console.log(
                 `${LOG_PREFIX} SqlPageStore ready: ` +
                 `resident=${VM_CONFIG.RESIDENT_MB}MB ` +
+                `wasm=${memorySizeMB}MB ` +
+                `logical=${logicalMemoryMB}MB ` +
                 `hot_pool=${HOT_POOL_BASE.toString(16)}h–` +
                 `${(HOT_POOL_BASE + VM_CONFIG.HOT_FRAMES * 4096).toString(16)}h ` +
                 `(${VM_CONFIG.HOT_FRAMES} frames × 4KB = ${poolSizeMB}MB) ` +
-                `logical=${VM_CONFIG.LOGICAL_MB}MB` +
                 ` swapIns=${pageStore.stats.swapIns}(pre-run)`,
               );
             } else {
