@@ -102,7 +102,7 @@ const { WASM_MB, VGA_MB } = VM_CONFIG;
 const IMAGES: Record<string, ImageDef> = {
   kolibri:    { file: "kolibri.img",             drive: "fda",   memory: WASM_MB, vgaMemory: VGA_MB, label: "KolibriOS",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: WASM_MB, vgaMemory: VGA_MB, label: "AqeousOS", noSnapshot: true, ahciDiskSize: 32 },
+  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: WASM_MB, vgaMemory: VGA_MB, label: "AqeousOS", noSnapshot: true },
   tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 15",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
   tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 11",

@@ -57,7 +57,7 @@ const DEFAULT_VGA_MB     =  8; // == VM_CONFIG.VGA_MB
 const IMAGES: Record<string, ImageDef> = {
   kolibri:    { file: "kolibri.img",             drive: "fda",   memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-    aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true, ahciDiskSize: 32 },
+    aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true },
   tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
   tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
