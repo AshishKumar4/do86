@@ -20,6 +20,113 @@
  * is in which frame, and the frame→GPA reverse map enables eviction.
  *
  * All public methods are SYNCHRONOUS. No async, no Promises.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * INTEGRATION RESEARCH — v86/stratum memory hook points
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * The core challenge: v86's Rust code reads/writes guest physical memory as
+ * `*mem8.offset(addr as isize)` — a direct raw pointer dereference in WASM
+ * linear memory. There is no page-fault trap, no OS kernel, no signal handler.
+ * The WASM sandbox makes OOB pointer writes a hard trap, not a catchable event.
+ *
+ * Three hook points were investigated (source: stratum/src/rust/cpu/memory.rs,
+ * stratum/src/cpu.js, stratum/src/rust/cpu/cpu.rs):
+ *
+ * ── Approach 1: MMIO registration via io.mmap_register() ────────────────────
+ *
+ *   HOW IT WORKS:
+ *   `io.mmap_register(addr, size, read8, write8, read32, write32)` registers
+ *   JS callbacks for a 128 KB-aligned address range (MMAP_BLOCK_SIZE = 0x20000).
+ *   The Rust `in_mapped_range(addr)` check is:
+ *     addr >= 0xA0000 && addr < 0xC0000  ||  addr >= *memory_size
+ *   Accesses that pass this test are dispatched to JS via the WASM import
+ *   `mmap_read8`/`mmap_write8` etc., which look up cpu.memory_map_read8[addr>>>17].
+ *   On CPU init, all addresses ≥ memory_size are already registered with a
+ *   no-op handler (io.js:40: `this.mmap_register(memory_size, MMAP_MAX - memory_size, ...)`).
+ *
+ *   CAN WE USE IT FOR SWAP?
+ *   Yes — but only for the address range ABOVE memory_size. The guest's page
+ *   tables must map guest-virtual addresses to physical addresses ≥ memory_size
+ *   so the Rust `in_mapped_range` check fires. Then our mmap_register handlers
+ *   can serve pages from SQLite synchronously (ctx.storage.sql.exec() is sync).
+ *   The constraint: memory_size must be small (≤ 32 MB) so that `*mem8` only
+ *   covers the hot window. All cold pages must live at physical GPA ≥ memory_size.
+ *   This requires the guest OS to cooperate — either the OS itself uses GPA
+ *   above memory_size (it won't, since the BIOS reports memory_size as total RAM),
+ *   or we fake a larger memory_size to the BIOS while keeping the WASM allocation
+ *   small and catching the OOB. The latter is not possible: WASM linear memory
+ *   has no guard pages and OOB access is a hard trap, not a fault we can intercept.
+ *
+ *   VERDICT: Viable only if we control the guest's physical memory map. For
+ *   standard OSes (KolibriOS, Linux) booting from BIOS-reported RAM, this is
+ *   not feasible without patching the BIOS E820 map and hoping the OS respects
+ *   the upper hole — which is fragile and OS-specific.
+ *
+ * ── Approach 2: TLB miss interception (translate_address / do_page_walk) ────
+ *
+ *   HOW IT WORKS:
+ *   In stratum/src/rust/cpu/cpu.rs, `translate_address()` converts guest-virtual
+ *   to guest-physical by walking page tables. On TLB miss it calls `do_page_walk`.
+ *   The TLB entry is:
+ *     tlb_entry = (phys_addr + mem8 as u32) as i32 ^ virt_page << 12 | flags
+ *   i.e. the TLB stores (host WASM offset) directly so that cache hits require
+ *   zero arithmetic. The fast path in JIT-compiled code is just a TLB lookup and
+ *   a raw memory read — there is no hook point between "TLB hit" and "mem access".
+ *
+ *   CAN WE INTERCEPT TLB MISSES?
+ *   `do_page_walk` is pure Rust, not exported to JS. It is not overridable without
+ *   recompiling the WASM. We could export a new WASM function `js_on_tlb_miss` as
+ *   a WASM import (Rust `extern "C"`) and call it from `do_page_walk` before
+ *   building the TLB entry, but this requires modifying stratum's Rust source.
+ *   Even then, the callback would have to synchronously provide the host WASM
+ *   offset for the page — meaning the page data must already be in WASM linear
+ *   memory. We're back to needing the hot pool in WASM memory, which means
+ *   memory_size must cover only hot pages.
+ *
+ *   VERDICT: Requires Rust source modification. Architecturally sound if we
+ *   want to pursue SQLite-backed swap: add `extern "C" fn js_tlb_miss(gpa: u32)`
+ *   to memory.rs, call it from `do_page_walk` before the TLB entry is stored,
+ *   swap in a hot page from SQLite in the JS callback, and return its WASM
+ *   offset. This is the cleanest long-term path.
+ *
+ * ── Approach 3: Shrink cpu.mem8 / trap out-of-bounds ────────────────────────
+ *
+ *   HOW IT WORKS:
+ *   `cpu.mem8` (cpu.js:1004) is a Uint8Array view into WASM linear memory at
+ *   the offset returned by `allocate_memory()`. Its size equals memory_size.
+ *   The idea: allocate a small WASM memory (e.g. 8 MB hot window), let the
+ *   emulator run, and catch the WASM trap when it accesses beyond mem8.length.
+ *
+ *   FATAL FLAW:
+ *   WebAssembly OOB memory access is a hard trap (WebAssembly.RuntimeError:
+ *   "memory access out of bounds") that terminates the WASM instance. It cannot
+ *   be caught from inside the WASM module, and catching it from JS (try/catch
+ *   around the WASM call) would require restarting the entire WASM instance —
+ *   losing all emulator state. This approach is completely unworkable.
+ *
+ *   VERDICT: Not viable.
+ *
+ * ── Recommended integration path ─────────────────────────────────────────────
+ *
+ *   SHORT TERM (current): Reduce memory_size to 48 MB (fits in DO budget).
+ *   SqlPageStore is used only for the HDA swap device (SQLiteBlockDevice), not
+ *   for guest RAM paging. This is what's deployed today.
+ *
+ *   MEDIUM TERM: Modify stratum's Rust to export a `js_tlb_miss(gpa: u32) -> u32`
+ *   WASM import hook called from `do_page_walk` (memory.rs / cpu.rs). The JS
+ *   callback (in linux-vm.ts) would:
+ *     1. Look up gpa in the hot map (SqlPageStore)
+ *     2. If cold, evict an LRU hot frame to SQLite, load the cold page into that
+ *        frame from SQLite (sync via ctx.storage.sql.exec)
+ *     3. Return the WASM linear memory byte offset of the hot frame
+ *   With memory_size = 8 MB (hot pool only), total WASM allocation stays small.
+ *   The guest BIOS E820 map must report the full logical RAM size (e.g. 256 MB)
+ *   even though WASM only backs 8 MB of it. The BIOS patch is ~10 lines in
+ *   stratum/src/cpu.js where the E820 table is written to guest memory.
+ *
+ *   This file (SqlPageStore) already implements the hot/cold LRU and SQLite I/O.
+ *   Wiring it to the TLB miss hook is the remaining work.
  */
 
 import type { SqlHandle } from "./types";
