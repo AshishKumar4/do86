@@ -608,10 +608,6 @@ export class LinuxVM extends DurableObject<Env> {
         // cpu_count: stratum WASM supports SMP via smp_init().
         // VM_CONFIG.CPU_COUNT = 2 (BSP + 1 AP) is conservative for the DO budget.
         cpu_count: VM_CONFIG.CPU_COUNT,
-        // Disable NE2K network adapter — no network_relay_url is configured, so
-        // KolibriOS sends DHCP requests into the void with exponential backoff,
-        // burning CPU cycles on retries. Setting type "none" skips NE2K/virtio init.
-        net_device: { type: "none" },
       };
 
       if (drive === "fda") v86Config.fda = { buffer: disk };
