@@ -12,8 +12,10 @@ import {
 
 // ── Session ──────────────────────────────────────────────────────────────────
 
-const pathMatch = location.pathname.match(/^\/s\/([a-zA-Z0-9_-]+)/);
-const sessionId = pathMatch?.[1] ?? null;
+const pathMatch = location.pathname.match(/^\/(s|smp)\/([a-zA-Z0-9_-]+)/);
+const pathPrefix = pathMatch?.[1] ?? "s";   // "s" or "smp"
+const sessionId = pathMatch?.[2] ?? null;
+const isSMP = pathPrefix === "smp";
 const params = new URLSearchParams(location.search);
 const imageParam = params.get("image") || "";
 const freshParam = params.get("fresh") === "1";
@@ -421,7 +423,7 @@ function connect() {
   pixelU32 = null;
 
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  let wsUrl = `${protocol}//${location.host}/s/${sessionId}`;
+  let wsUrl = `${protocol}//${location.host}/${pathPrefix}/${sessionId}`;
   if (firstConnect) {
     const wsParams = new URLSearchParams();
     if (imageParam) wsParams.set("image", imageParam);
@@ -429,6 +431,10 @@ function connect() {
     const qs = wsParams.toString();
     if (qs) wsUrl += `?${qs}`;
     firstConnect = false;
+  } else if (isSMP && imageParam) {
+    // SMP route always needs ?image on the WS URL — the server uses it
+    // to resolve the CoordinatorDO stub on every request (including reconnects)
+    wsUrl += `?image=${encodeURIComponent(imageParam)}`;
   }
 
   ws = new WebSocket(wsUrl);
