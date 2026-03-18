@@ -18809,6 +18809,7 @@ function CPU(bus, wm, stop_idling) {
   const memory = this.wm.exports.memory;
   this.wasm_memory = memory;
   this.memory_size = view(Uint32Array, memory, 812, 1);
+  this.wasm_logical_memory_size = view(Uint32Array, memory, 1132, 1);
   this.mem8 = new Uint8Array(0);
   this.mem32s = new Int32Array(this.mem8.buffer);
   this.segment_is_null = view(Uint8Array, memory, 724, 8);
@@ -19431,13 +19432,11 @@ CPU.prototype.create_memory = function(size, minimum_size) {
   dbg_assert((size & MMAP_BLOCK_SIZE - 1) === 0);
   console.assert(this.memory_size[0] === 0, "Expected uninitialised memory");
   this.memory_size[0] = size;
-  const alloc_size = Math.max(size, this._logical_memory_size || size);
-  const memory_offset = this.allocate_memory(alloc_size);
-  this.mem8 = view(Uint8Array, this.wasm_memory, memory_offset, alloc_size);
-  this.mem32s = view(Uint32Array, this.wasm_memory, memory_offset, alloc_size >> 2);
+  const memory_offset = this.allocate_memory(size);
+  this.mem8 = view(Uint8Array, this.wasm_memory, memory_offset, size);
+  this.mem32s = view(Uint32Array, this.wasm_memory, memory_offset, size >> 2);
 };
 CPU.prototype.init = function(settings, device_bus) {
-  this._logical_memory_size = settings.logical_memory_size || settings.memory_size || 64 * 1024 * 1024;
   this.create_memory(
     settings.memory_size || 64 * 1024 * 1024,
     settings.initrd ? 64 * 1024 * 1024 : 1024 * 1024
@@ -19448,6 +19447,7 @@ CPU.prototype.init = function(settings, device_bus) {
   settings.cpuid_level && this.set_cpuid_level(settings.cpuid_level);
   this.acpi_enabled[0] = +settings.acpi;
   this._logical_memory_size = settings.logical_memory_size || this.memory_size[0];
+  this.wasm_logical_memory_size[0] = this._logical_memory_size;
   this.reset_cpu();
   if (this.smp_init) {
     const cpu_count = settings.cpu_count | 0 || 1;
