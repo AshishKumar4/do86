@@ -14,10 +14,42 @@ import {
 import { DOScreenAdapter } from "./screen-adapter";
 import { DeltaEncoder, encodeSerialData, encodeStatus, encodeTextScreen } from "./delta-encoder";
 import { SqliteStorage, SqliteImageCache, SQLiteBlockDevice, unpackAssets } from "./sqlite-storage";
+import type { Env } from "./index";
+
+// ── Image registry (mirrored from index.ts for DO self-recovery) ─────────────
+// When the DO is evicted and a client reconnects, cachedAssets is gone.
+// The DO uses this table to re-fetch BIOS + disk from the ASSETS binding /
+// public CDN — same as the worker does during normal session init.
+
+interface ImageDef {
+  file: string;
+  drive: "fda" | "cdrom";
+  memory: number;
+  vgaMemory: number;
+  label: string;
+  url?: string;
+  noSnapshot?: boolean;
+}
+
+const IMAGES: Record<string, ImageDef> = {
+  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: 96, vgaMemory: 8, label: "KolibriOS",
+                url: "https://copy.sh/v86/images/kolibri.img" },
+  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: 96, vgaMemory: 8, label: "AqeousOS",      noSnapshot: true },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: 96, vgaMemory: 8, label: "TinyCore 15",
+                url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: 96, vgaMemory: 8, label: "TinyCore 11",
+                url: "http://tinycorelinux.net/11.x/x86/release/TinyCore-11.1.iso" },
+  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: 96, vgaMemory: 8, label: "DSL Linux",
+                url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
+  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: 96, vgaMemory: 8, label: "HelenOS",
+                url: "https://www.helenos.org/releases/HelenOS-0.14.1-ia32.iso" },
+  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,  vgaMemory: 2, label: "Linux 4 (Text)",
+                url: "https://copy.sh/v86/images/linux4.iso" },
+};
 
 // ── LinuxVM Durable Object ──────────────────────────────────────────────────
 
-export class LinuxVM extends DurableObject<unknown> {
+export class LinuxVM extends DurableObject<Env> {
   // ── Session state ───────────────────────────────────────────────────────
   private sessions = new Map<WebSocket, ClientState>();
   private mouseButtons: [boolean, boolean, boolean] = [false, false, false];
@@ -46,6 +78,10 @@ export class LinuxVM extends DurableObject<unknown> {
   private storage: SqliteStorage | null = null;
   private imageCache: SqliteImageCache | null = null;
   private swapDevice: SQLiteBlockDevice | null = null;
+
+  // ── Origin tracking (for post-eviction ASSETS.fetch recovery) ───────────
+  // Captured from the first request URL so selfLoadAssets() can build full URLs.
+  private workerOrigin: string | null = null;
 
   // ── Snapshot state ──────────────────────────────────────────────────────
   private snapshotSaved = false;
@@ -144,6 +180,18 @@ export class LinuxVM extends DurableObject<unknown> {
     // never evicted from memory while the v86 emulator is running.
     // ctx.acceptWebSocket() (hibernation API) would destroy all in-memory
     // emulator state on eviction.
+    //
+    // Capture imageKey and origin from the WS URL for post-eviction recovery.
+    // imageKey: used by selfLoadAssets() when cachedAssets is gone after eviction.
+    // workerOrigin: used to build valid ASSETS.fetch() URLs (e.g. /assets/seabios.bin).
+    const wsImageKey = url.searchParams.get("image") || null;
+    if (wsImageKey && !this.imageKey) {
+      this.imageKey = wsImageKey;
+    }
+    if (!this.workerOrigin) {
+      this.workerOrigin = url.origin;
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
@@ -877,8 +925,24 @@ export class LinuxVM extends DurableObject<unknown> {
           return;
         }
         if (!this.cachedAssets) {
-          this.wsSend(ws, encodeStatus("waiting_for_assets"));
-          return;
+          // ── Self-recovery after DO eviction ────────────────────────────
+          // cachedAssets is in-memory only; eviction wipes it.
+          // this.imageKey was either set from the last /init call or captured
+          // from the WS URL query param (?image=...) at upgrade time.
+          const recoveryKey = this.imageKey ?? "kolibri";
+
+          console.log(`${LOG_PREFIX} DO eviction recovery: reloading assets for ${recoveryKey}`);
+          this.wsSend(ws, encodeStatus(`recovering: ${recoveryKey}`));
+
+          try {
+            await this.selfLoadAssets(recoveryKey);
+          } catch (err) {
+            const msg = `Asset recovery failed: ${err}`;
+            console.error(`${LOG_PREFIX} ${msg}`);
+            this.wsSend(ws, encodeStatus("waiting_for_assets"));
+            return;
+          }
+          // Fall through — cachedAssets is now populated, boot proceeds below.
         }
         // Run boot fully awaited — keeps this handler alive until emulator-loaded fires
         await this.bootVM().catch((err) => {
@@ -968,6 +1032,102 @@ export class LinuxVM extends DurableObject<unknown> {
   /** Get the v86 VGA device, typed as VgaDevice */
   private getVga(): VgaDevice | null {
     return (this.emulator as any)?.v86?.cpu?.devices?.vga ?? null;
+  }
+
+  /**
+   * Self-recovery path for post-eviction boots.
+   *
+   * Replicates the asset-fetching logic from the Worker's `/init` path so the
+   * DO can rebuild `this.cachedAssets` without a round-trip through the Worker.
+   *
+   * BIOS files are fetched from the ASSETS binding (same origin, no 403 risk
+   * here because we're inside a WS message handler, not an upgrade handler).
+   * Disk images with a public `url` are fetched from the CDN directly.
+   * Inline-only images (aqeous, which has no `url`) cannot be self-recovered;
+   * those get a descriptive error so the client can reload the page.
+   */
+  private async selfLoadAssets(imageKey: string): Promise<void> {
+    const imageDef = IMAGES[imageKey] ?? IMAGES.kolibri;
+    const resolvedKey = IMAGES[imageKey] ? imageKey : "kolibri";
+
+    // ── Fetch BIOS files ───────────────────────────────────────────────
+    // ASSETS.fetch() works inside WS message handlers (not upgrade handlers).
+    const env = this.env as Env;
+    // Use the captured worker origin so ASSETS.fetch() gets a real URL.
+    // Falls back to a dummy base if origin wasn't captured yet (shouldn't happen).
+    const base = this.workerOrigin ?? "https://do86.workers.dev";
+
+    const fetchAsset = async (path: string): Promise<ArrayBuffer> => {
+      const resp = await env.ASSETS.fetch(new URL(path, base).toString());
+      if (!resp.ok) throw new Error(`ASSETS ${path}: ${resp.status}`);
+      return resp.arrayBuffer();
+    };
+
+    const [bios, vgaBios] = await Promise.all([
+      fetchAsset("/assets/seabios.bin"),
+      fetchAsset("/assets/vgabios.bin"),
+    ]);
+
+    // ── Resolve disk image ─────────────────────────────────────────────
+    const assets: Map<string, ArrayBuffer> = new Map();
+    assets.set("bios", bios);
+    assets.set("vgaBios", vgaBios);
+
+    // Check SQLite image cache first — avoids re-downloading on every eviction
+    this.ensureStorage();
+    const cacheName = imageDef.file || resolvedKey;
+    let disk: ArrayBuffer | null = null;
+
+    if (this.imageCache!.images.has(cacheName)) {
+      console.log(`${LOG_PREFIX} Self-recovery: cache hit for ${cacheName}`);
+      disk = this.imageCache!.images.get(cacheName) ?? null;
+    }
+
+    if (!disk) {
+      if (!imageDef.url) {
+        // Inline-only image (e.g. aqeous) — cannot self-recover without the
+        // Worker re-sending the binary. Tell the client to reload the page.
+        throw new Error(
+          `Image "${resolvedKey}" has no public URL and is not cached — reload the page to re-initialize`,
+        );
+      }
+
+      console.log(`${LOG_PREFIX} Self-recovery: fetching ${cacheName} from ${imageDef.url}`);
+      this.broadcast(encodeStatus(`downloading: ${imageDef.label}`));
+      const resp = await fetch(imageDef.url, { redirect: "follow" });
+      if (!resp.ok) {
+        throw new Error(`Disk fetch ${imageDef.url}: ${resp.status} ${resp.statusText}`);
+      }
+      disk = await resp.arrayBuffer();
+      const etag = resp.headers.get("etag") ?? undefined;
+      console.log(
+        `${LOG_PREFIX} Self-recovery: downloaded ${cacheName} ` +
+        `(${(disk.byteLength / 1024 / 1024).toFixed(1)} MB)`,
+      );
+
+      try {
+        this.imageCache!.images.put(cacheName, disk, { etag, fetchedAt: new Date().toISOString() });
+      } catch (e) {
+        console.error(`${LOG_PREFIX} Self-recovery: cache write failed (non-fatal):`, e);
+      }
+    }
+
+    // ── Build metadata (same shape the Worker POSTs in /init) ──────────
+    const meta: Record<string, unknown> = {
+      imageKey: resolvedKey,
+      drive: imageDef.drive,
+      memory: imageDef.memory,
+      vgaMemory: imageDef.vgaMemory,
+      label: imageDef.label,
+      noSnapshot: imageDef.noSnapshot ?? false,
+      // disk was resolved above, no need for diskUrl — pass it inline
+    };
+    assets.set("disk", disk);
+    assets.set("metadata", new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer);
+
+    this.cachedAssets = assets;
+    this.imageKey = resolvedKey;
+    console.log(`${LOG_PREFIX} Self-recovery complete for ${resolvedKey} — ${assets.size} assets loaded`);
   }
 
   /** Initialize SQLite storage + image cache (idempotent) */

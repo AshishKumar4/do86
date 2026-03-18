@@ -157,17 +157,34 @@ function setStatus(text: string) {
   } else if (
     text.startsWith("booting") ||
     text.startsWith("waiting_for_boot") ||
+    text.startsWith("recovering") ||
     text.startsWith("downloading") ||
     text.startsWith("mode:") ||
     text.startsWith("resize:")
   ) {
     statusEl.className = "booting";
+  } else if (text === "waiting_for_assets") {
+    statusEl.className = "";
   } else {
     statusEl.className = "";
   }
 
   // Drive the loading overlay from status messages
-  if (text.startsWith("downloading")) {
+  if (text === "waiting_for_assets") {
+    // DO is alive but lost its assets (eviction without self-recovery).
+    // Close and reconnect — the HTTP GET on reconnect will re-run /init.
+    loadingText.textContent = "Reconnecting\u2026";
+    loadingSub.textContent = "Session state lost. Reconnecting automatically\u2026";
+    showOverlay(loadingOverlay);
+    hideOverlay(reconnectOverlay);
+    // Close WS so the close handler fires and schedules connect() with backoff.
+    if (ws) { ws.close(); }
+  } else if (text.startsWith("recovering")) {
+    const what = text.replace("recovering:", "").trim() || "session";
+    loadingText.textContent = `Recovering ${what}\u2026`;
+    loadingSub.textContent = "DO was evicted — reloading assets automatically";
+    showOverlay(loadingOverlay);
+  } else if (text.startsWith("downloading")) {
     const what = text.replace("downloading:", "").trim() || "image";
     loadingText.textContent = `Downloading ${what}\u2026`;
     loadingSub.textContent = "This may take 10\u201330 seconds on first boot";
