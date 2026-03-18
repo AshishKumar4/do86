@@ -1,251 +1,161 @@
 /**
  * sql-page-store.ts — SQLite-backed demand-paged RAM for Durable Objects.
  *
- * Design:
- *   Hot pool:  Fixed number of 4KB page frames held in a JS Uint8Array.
- *              These are the pages the emulator can access at native speed.
- *   Cold store: All pages (including evicted hot pages) persisted in DO SQLite.
- *              `ctx.storage.sql.exec()` is SYNCHRONOUS — returns SqlStorageCursor,
- *              not a Promise. This is the critical enabler for demand-paged RAM
- *              without ASYNCIFY.
+ * Architecture
+ * ────────────
+ * WASM linear memory layout (configured by caller via PageStoreConfig):
+ *   mem8[0 .. poolBase)          — permanently resident guest RAM
+ *   mem8[poolBase .. poolBase + frames×4KB) — hot page frame pool
  *
- * Page fault flow (synchronous):
- *   1. Emulator memory miss → calls SqlPageStore.swapIn(gpa)
- *   2. swapIn checks hot map; if miss, reads from SQLite (sync!)
- *   3. If hot pool is full, evicts LRU frame → writes dirty page to SQLite
- *   4. Copies page data into the chosen frame buffer
- *   5. Returns the byte offset of the frame → emulator fills its TLB entry
+ * Guest sees logical_memory_size via CMOS/e820.  GPAs ≥ poolBase are
+ * demand-paged: cold pages live in DO SQLite (ram_pages table, 4 KB BLOBs),
+ * hot pages are resident in the frame pool and served via Clock eviction.
  *
- * LRU eviction uses a simple access counter. The hot map tracks which GPA
- * is in which frame, and the frame→GPA reverse map enables eviction.
+ * Clock eviction (second-chance FIFO)
+ * ────────────────────────────────────
+ * Each frame has a single "referenced" bit.  The clock hand sweeps frames
+ * in round-robin order:
+ *   - referenced: clear bit, advance
+ *   - unreferenced: evict (flush if dirty, reassign GPA)
  *
- * All public methods are SYNCHRONOUS. No async, no Promises.
+ * Compared to LRU:
+ *   + O(1) eviction — no sort, no linked-list rebalancing
+ *   + Very low per-access overhead (set one bit)
+ *   + Second-chance prevents thrashing on working sets slightly > pool size
  *
- * ═══════════════════════════════════════════════════════════════════════════
- * INTEGRATION RESEARCH — v86/stratum memory hook points
- * ═══════════════════════════════════════════════════════════════════════════
+ * forWriting parameter
+ * ────────────────────
+ * swapPageIn(gpa, forWriting) is called from do_page_walk via WASM import.
+ * When forWriting is non-zero the frame is immediately marked dirty.  This is
+ * correct because do_page_walk is building a writable TLB entry — the guest
+ * WILL write to this frame — marking dirty eagerly avoids a separate hook.
  *
- * The core challenge: v86's Rust code reads/writes guest physical memory as
- * `*mem8.offset(addr as isize)` — a direct raw pointer dereference in WASM
- * linear memory. There is no page-fault trap, no OS kernel, no signal handler.
- * The WASM sandbox makes OOB pointer writes a hard trap, not a catchable event.
+ * TLB flush on eviction
+ * ─────────────────────
+ * After evicting a frame, full_clear_tlb() is called once.  This invalidates
+ * ALL TLB entries (including global), forcing do_page_walk for subsequent
+ * accesses.  Cost: ~µs; paid at most once per eviction event.
  *
- * Three hook points were investigated (source: stratum/src/rust/cpu/memory.rs,
- * stratum/src/cpu.js, stratum/src/rust/cpu/cpu.rs):
- *
- * ── Approach 1: MMIO registration via io.mmap_register() ────────────────────
- *
- *   HOW IT WORKS:
- *   `io.mmap_register(addr, size, read8, write8, read32, write32)` registers
- *   JS callbacks for a 128 KB-aligned address range (MMAP_BLOCK_SIZE = 0x20000).
- *   The Rust `in_mapped_range(addr)` check is:
- *     addr >= 0xA0000 && addr < 0xC0000  ||  addr >= *memory_size
- *   Accesses that pass this test are dispatched to JS via the WASM import
- *   `mmap_read8`/`mmap_write8` etc., which look up cpu.memory_map_read8[addr>>>17].
- *   On CPU init, all addresses ≥ memory_size are already registered with a
- *   no-op handler (io.js:40: `this.mmap_register(memory_size, MMAP_MAX - memory_size, ...)`).
- *
- *   CAN WE USE IT FOR SWAP?
- *   Yes — but only for the address range ABOVE memory_size. The guest's page
- *   tables must map guest-virtual addresses to physical addresses ≥ memory_size
- *   so the Rust `in_mapped_range` check fires. Then our mmap_register handlers
- *   can serve pages from SQLite synchronously (ctx.storage.sql.exec() is sync).
- *   The constraint: memory_size must be small (≤ 32 MB) so that `*mem8` only
- *   covers the hot window. All cold pages must live at physical GPA ≥ memory_size.
- *   This requires the guest OS to cooperate — either the OS itself uses GPA
- *   above memory_size (it won't, since the BIOS reports memory_size as total RAM),
- *   or we fake a larger memory_size to the BIOS while keeping the WASM allocation
- *   small and catching the OOB. The latter is not possible: WASM linear memory
- *   has no guard pages and OOB access is a hard trap, not a fault we can intercept.
- *
- *   VERDICT: Viable only if we control the guest's physical memory map. For
- *   standard OSes (KolibriOS, Linux) booting from BIOS-reported RAM, this is
- *   not feasible without patching the BIOS E820 map and hoping the OS respects
- *   the upper hole — which is fragile and OS-specific.
- *
- * ── Approach 2: TLB miss interception (translate_address / do_page_walk) ────
- *
- *   HOW IT WORKS:
- *   In stratum/src/rust/cpu/cpu.rs, `translate_address()` converts guest-virtual
- *   to guest-physical by walking page tables. On TLB miss it calls `do_page_walk`.
- *   The TLB entry is:
- *     tlb_entry = (phys_addr + mem8 as u32) as i32 ^ virt_page << 12 | flags
- *   i.e. the TLB stores (host WASM offset) directly so that cache hits require
- *   zero arithmetic. The fast path in JIT-compiled code is just a TLB lookup and
- *   a raw memory read — there is no hook point between "TLB hit" and "mem access".
- *
- *   CAN WE INTERCEPT TLB MISSES?
- *   `do_page_walk` is pure Rust, not exported to JS. It is not overridable without
- *   recompiling the WASM. We could export a new WASM function `js_on_tlb_miss` as
- *   a WASM import (Rust `extern "C"`) and call it from `do_page_walk` before
- *   building the TLB entry, but this requires modifying stratum's Rust source.
- *   Even then, the callback would have to synchronously provide the host WASM
- *   offset for the page — meaning the page data must already be in WASM linear
- *   memory. We're back to needing the hot pool in WASM memory, which means
- *   memory_size must cover only hot pages.
- *
- *   VERDICT: Requires Rust source modification. Architecturally sound if we
- *   want to pursue SQLite-backed swap: add `extern "C" fn js_tlb_miss(gpa: u32)`
- *   to memory.rs, call it from `do_page_walk` before the TLB entry is stored,
- *   swap in a hot page from SQLite in the JS callback, and return its WASM
- *   offset. This is the cleanest long-term path.
- *
- * ── Approach 3: Shrink cpu.mem8 / trap out-of-bounds ────────────────────────
- *
- *   HOW IT WORKS:
- *   `cpu.mem8` (cpu.js:1004) is a Uint8Array view into WASM linear memory at
- *   the offset returned by `allocate_memory()`. Its size equals memory_size.
- *   The idea: allocate a small WASM memory (e.g. 8 MB hot window), let the
- *   emulator run, and catch the WASM trap when it accesses beyond mem8.length.
- *
- *   FATAL FLAW:
- *   WebAssembly OOB memory access is a hard trap (WebAssembly.RuntimeError:
- *   "memory access out of bounds") that terminates the WASM instance. It cannot
- *   be caught from inside the WASM module, and catching it from JS (try/catch
- *   around the WASM call) would require restarting the entire WASM instance —
- *   losing all emulator state. This approach is completely unworkable.
- *
- *   VERDICT: Not viable.
- *
- * ── Recommended integration path ─────────────────────────────────────────────
- *
- *   SHORT TERM (current): Reduce memory_size to 48 MB (fits in DO budget).
- *   SqlPageStore is used only for the HDA swap device (SQLiteBlockDevice), not
- *   for guest RAM paging. This is what's deployed today.
- *
- *   MEDIUM TERM: Modify stratum's Rust to export a `js_tlb_miss(gpa: u32) -> u32`
- *   WASM import hook called from `do_page_walk` (memory.rs / cpu.rs). The JS
- *   callback (in linux-vm.ts) would:
- *     1. Look up gpa in the hot map (SqlPageStore)
- *     2. If cold, evict an LRU hot frame to SQLite, load the cold page into that
- *        frame from SQLite (sync via ctx.storage.sql.exec)
- *     3. Return the WASM linear memory byte offset of the hot frame
- *   With memory_size = 8 MB (hot pool only), total WASM allocation stays small.
- *   The guest BIOS E820 map must report the full logical RAM size (e.g. 256 MB)
- *   even though WASM only backs 8 MB of it. The BIOS patch is ~10 lines in
- *   stratum/src/cpu.js where the E820 table is written to guest memory.
- *
- *   This file (SqlPageStore) already implements the hot/cold LRU and SQLite I/O.
- *   Wiring it to the TLB miss hook is the remaining work.
+ * All public methods are SYNCHRONOUS.  No async, no Promises.
+ * ctx.storage.sql.exec() is synchronous — returns SqlStorageCursor.
  */
 
 import type { SqlHandle } from "./types";
 import { LOG_PREFIX } from "./types";
 
-// ── Page size ───────────────────────────────────────────────────────────────
+// ── Page size (fixed by x86 architecture) ────────────────────────────────────
 
-/** x86 physical page size: 4 KB. */
 const PAGE_SIZE = 4096;
 
-// ── Constants ───────────────────────────────────────────────────────────────
+// ── PageStoreConfig ───────────────────────────────────────────────────────────
 
-/** Maximum number of hot page frames in WASM linear memory. */
-const HOT_PAGES_MAX = 8192; // 8192 × 4KB = 32MB hot window
+/**
+ * All tunable parameters for SqlPageStore.
+ * Pass a partial object to the constructor; unset fields use the defaults below.
+ */
+export interface PageStoreConfig {
+  /**
+   * Number of hot page frames.
+   * Each frame is PAGE_SIZE (4 KB).  More frames = larger resident hot window
+   * but more WASM linear memory consumed.
+   * Default: 8192  (8192 × 4 KB = 32 MB hot window)
+   */
+  maxFrames: number;
 
-/** Number of pages to evict in a batch when the hot pool is full. */
-const EVICT_BATCH = 256; // 256 × 4KB = 1MB per eviction batch
-
-/** Flush dirty pages to SQLite after this many writes accumulate. */
-const DIRTY_FLUSH_THRESHOLD = 512;
-
-// ── Hot Page Entry ──────────────────────────────────────────────────────────
-
-interface HotPageEntry {
-  /** Guest physical address (page-aligned). */
-  gpa: number;
-  /** Index into the page frame pool (0..HOT_PAGES_MAX-1). */
-  frameIndex: number;
-  /** Whether this frame has been modified since last SQLite flush. */
-  dirty: boolean;
-  /** Monotonic counter for LRU ordering. */
-  accessOrder: number;
+  /**
+   * Maximum number of frames the Clock hand scans in a single eviction call.
+   * Caps worst-case latency when the pool is fully referenced.  Two full sweeps
+   * (2 × maxFrames) is the theoretical worst case; this limit fires before that.
+   * Default: 256
+   */
+  maxEvictScan: number;
 }
 
-// ── SqlPageStore ────────────────────────────────────────────────────────────
+export const DEFAULT_PAGE_STORE_CONFIG: PageStoreConfig = {
+  maxFrames:    8192, // 8192 × 4 KB = 32 MB hot window
+  maxEvictScan: 256,
+};
+
+// ── SqlPageStore ──────────────────────────────────────────────────────────────
 
 export class SqlPageStore {
-  /**
-   * GPA → hot page entry. Only pages currently resident in WASM memory.
-   */
-  private hotPages = new Map<number, HotPageEntry>();
+  private readonly cfg: PageStoreConfig;
+
+  // ── Clock state ──────────────────────────────────────────────────────────
 
   /**
-   * Frame index → GPA. Reverse map for eviction: tells us which GPA
-   * a frame currently holds so we can flush it before reuse.
+   * frameGpa[i]   = GPA currently in frame i, or -1 if free.
+   * frameRef[i]   = referenced bit for Clock algorithm (0 or 1).
+   * frameDirty[i] = dirty bit: modified since last SQLite flush (0 or 1).
    */
-  private frameToGpa = new Map<number, number>();
+  private readonly frameGpa:   Int32Array;
+  private readonly frameRef:   Uint8Array;
+  private readonly frameDirty: Uint8Array;
 
-  /**
-   * Free frame indices (frames not currently mapped to any GPA).
-   * Initialized with all frame indices on construction.
-   */
-  private freeFrames: number[] = [];
+  /** O(1) reverse map: GPA → frame index.  Only contains live (used) entries. */
+  private readonly frameMap = new Map<number, number>();
 
-  /** Monotonic access counter for LRU. */
-  private accessCounter = 0;
+  /** Clock hand position (0 .. maxFrames-1). */
+  private clockHand = 0;
 
-  /** Count of dirty pages since last flush. */
-  private dirtyCount = 0;
+  /** Number of frames currently occupied. */
+  private usedFrames = 0;
 
-  /** Whether the SQLite schema has been created. */
-  private initialized = false;
+  // ── WASM heap ─────────────────────────────────────────────────────────────
 
-  /** WASM heap byte array — set by QEMUWrapper after module init. */
+  /** Uint8Array view into WASM linear memory. */
   private wasmHeap: Uint8Array | null = null;
 
-  /** Base offset in WASM heap where the page frame pool starts. */
+  /** Byte offset in WASM heap where the frame pool starts (== PAGED_THRESHOLD). */
   private poolBase = 0;
 
-  /** Maximum number of frames in the pool. */
-  private maxFrames: number;
+  // ── CPU reference (for TLB flush) ─────────────────────────────────────────
 
-  /**
-   * v86 CPU object reference — set by setCpu() after emulator-loaded fires.
-   * Used to call full_clear_tlb() after frame eviction so stale TLB entries
-   * that pointed to the evicted frames are invalidated before reuse.
-   */
   private cpu: { full_clear_tlb: () => void } | null = null;
 
-  /** Public read-only access to max frame count (used by QEMUWrapper to size pool). */
-  get maxFrameCount(): number {
-    return this.maxFrames;
-  }
+  // ── SQLite ────────────────────────────────────────────────────────────────
+
+  private schemaReady = false;
+
+  // ── Counters ──────────────────────────────────────────────────────────────
+
+  private _swapIns   = 0;
+  private _evictions = 0;
+  private _sqlReads  = 0;
+  private _sqlWrites = 0;
 
   constructor(
     private readonly sql: SqlHandle,
-    maxFrames: number = HOT_PAGES_MAX,
+    config: Partial<PageStoreConfig> = {},
   ) {
-    this.maxFrames = maxFrames;
-    // Initialize free frame list (all frames available)
-    for (let i = maxFrames - 1; i >= 0; i--) {
-      this.freeFrames.push(i);
-    }
+    this.cfg = { ...DEFAULT_PAGE_STORE_CONFIG, ...config };
+
+    this.frameGpa   = new Int32Array(this.cfg.maxFrames).fill(-1);
+    this.frameRef   = new Uint8Array(this.cfg.maxFrames);
+    this.frameDirty = new Uint8Array(this.cfg.maxFrames);
   }
 
+  // ── Setup ─────────────────────────────────────────────────────────────────
+
   /**
-   * Initialize the SQLite schema. Idempotent.
-   * SYNCHRONOUS — sql.exec() returns SqlStorageCursor, not Promise.
+   * Create the SQLite schema.  Idempotent — safe to call multiple times.
+   * SYNCHRONOUS.
    */
   init(): void {
-    if (this.initialized) return;
-
+    if (this.schemaReady) return;
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ram_pages (
-      gpa     INTEGER PRIMARY KEY,
-      data    BLOB NOT NULL,
-      dirty   INTEGER DEFAULT 0
+      gpa  INTEGER PRIMARY KEY,
+      data BLOB NOT NULL
     )`);
-
-    // Index for dirty page scans
-    this.sql.exec(
-      `CREATE INDEX IF NOT EXISTS idx_ram_dirty ON ram_pages(dirty) WHERE dirty = 1`,
-    );
-
-    this.initialized = true;
+    this.schemaReady = true;
   }
 
   /**
-   * Set the WASM heap reference and pool base offset.
-   * Called by QEMUWrapper after the Emscripten module is initialized.
+   * Set the WASM heap view and hot pool base offset.
+   * Must be called after the WASM module is instantiated and before swapPageIn.
+   *
+   * @param heap      Uint8Array over the full WASM linear memory buffer.
+   * @param poolBase  Byte offset where the frame pool starts (== PAGED_THRESHOLD).
    */
   setWasmHeap(heap: Uint8Array, poolBase: number): void {
     this.wasmHeap = heap;
@@ -253,339 +163,208 @@ export class SqlPageStore {
   }
 
   /**
-   * Set the v86 CPU reference so we can call full_clear_tlb() after eviction.
-   * Must be called after `emulator-loaded` fires (before swapIn is first used).
-   * Eviction invalidates the entire TLB to ensure no stale entries point to
-   * frames that have been reassigned to a different GPA.
+   * Set the v86 CPU reference for TLB invalidation after frame eviction.
+   * Must be called before the first swapPageIn().
    */
   setCpu(cpu: { full_clear_tlb: () => void }): void {
     this.cpu = cpu;
   }
 
-  // ── Core page operations (all SYNCHRONOUS) ────────────────────────────
+  // ── Core API ──────────────────────────────────────────────────────────────
 
   /**
-   * Swap a guest physical page into the hot pool (WASM linear memory).
-   * Returns the WASM heap byte offset of the page frame.
+   * Bring a guest page into the hot pool and return its WASM frame offset.
    *
-   * SYNCHRONOUS — this is the page fault handler called from QEMU's TLB miss.
-   * The entire path (SQLite read, eviction, memcpy) is synchronous.
+   * Called synchronously from the WASM swap_page_in import (via
+   * cpu._swap_page_in_hook).  The returned offset is substituted for `high`
+   * in do_page_walk's TLB entry — same encoding as a normal resident page.
    *
-   * @param gpa  Guest physical address (page-aligned)
-   * @returns    WASM heap byte offset of the page frame, or -1 on error
+   * @param gpa        Guest physical address (caller ensures page-aligned, ≥ poolBase).
+   * @param forWriting Non-zero when the TLB entry is for a write — frame marked dirty.
+   * @returns          WASM byte offset of the 4 KB frame, or -1 on error.
    */
-  swapIn(gpa: number): number {
-    const pageAligned = gpa & ~(PAGE_SIZE - 1);
+  swapPageIn(gpa: number, forWriting: number): number {
+    const pageGpa = gpa & ~(PAGE_SIZE - 1);
+    this._swapIns++;
 
-    // Check if already in hot pool
-    const existing = this.hotPages.get(pageAligned);
-    if (existing) {
-      existing.accessOrder = ++this.accessCounter;
-      return this.frameOffset(existing.frameIndex);
+    // Fast path: page already in hot pool — refresh ref bit and return offset
+    const existing = this.frameMap.get(pageGpa);
+    if (existing !== undefined) {
+      this.frameRef[existing] = 1;
+      if (forWriting) this.frameDirty[existing] = 1;
+      return this.poolBase + existing * PAGE_SIZE;
     }
 
-    // Allocate a frame (may evict)
-    const frameIndex = this.allocateFrame();
-    if (frameIndex < 0) return -1;
+    // Slow path: allocate a frame (may evict)
+    const frame = this.allocateFrame();
+    if (frame < 0) return -1;
 
-    // Read page data from SQLite (SYNCHRONOUS)
-    const data = this.readPageFromSql(pageAligned);
+    // Load page data from SQLite (or zero-fill if never written)
+    const data = this.readFromSql(pageGpa);
+    const offset = this.poolBase + frame * PAGE_SIZE;
 
-    // Copy into WASM memory
-    const offset = this.frameOffset(frameIndex);
-    if (this.wasmHeap && offset + PAGE_SIZE <= this.wasmHeap.byteLength) {
+    if (this.wasmHeap) {
       if (data) {
         this.wasmHeap.set(data, offset);
       } else {
-        // Zero page — never been written
         this.wasmHeap.fill(0, offset, offset + PAGE_SIZE);
       }
     }
 
-    // Register in hot map
-    const entry: HotPageEntry = {
-      gpa: pageAligned,
-      frameIndex,
-      dirty: false,
-      accessOrder: ++this.accessCounter,
-    };
-    this.hotPages.set(pageAligned, entry);
-    this.frameToGpa.set(frameIndex, pageAligned);
+    this.frameGpa[frame]   = pageGpa;
+    this.frameRef[frame]   = 1;
+    this.frameDirty[frame] = forWriting ? 1 : 0;
+    this.frameMap.set(pageGpa, frame);
+    this.usedFrames++;
 
     return offset;
   }
 
   /**
-   * Read a 4KB page from the hot cache or SQLite.
-   * Returns a copy of the page data.
-   *
+   * Flush all dirty frames to SQLite.
+   * Call before snapshot save to ensure guest RAM is fully persisted.
    * SYNCHRONOUS.
-   */
-  pageIn(gpa: number): Uint8Array {
-    const pageAligned = gpa & ~(PAGE_SIZE - 1);
-
-    // Check hot pool first
-    const hot = this.hotPages.get(pageAligned);
-    if (hot) {
-      hot.accessOrder = ++this.accessCounter;
-      const offset = this.frameOffset(hot.frameIndex);
-      if (this.wasmHeap) {
-        return this.wasmHeap.slice(offset, offset + PAGE_SIZE);
-      }
-    }
-
-    // Read from SQLite
-    const data = this.readPageFromSql(pageAligned);
-    return data ?? new Uint8Array(PAGE_SIZE);
-  }
-
-  /**
-   * Write a 4KB page into the hot cache. The page is marked dirty
-   * and will be flushed to SQLite on eviction or explicit flush.
-   *
-   * SYNCHRONOUS.
-   */
-  pageOut(gpa: number, data: Uint8Array): void {
-    const pageAligned = gpa & ~(PAGE_SIZE - 1);
-
-    // If already hot, update in place
-    const existing = this.hotPages.get(pageAligned);
-    if (existing) {
-      const offset = this.frameOffset(existing.frameIndex);
-      if (this.wasmHeap) {
-        this.wasmHeap.set(
-          data.subarray(0, Math.min(data.length, PAGE_SIZE)),
-          offset,
-        );
-      }
-      existing.dirty = true;
-      existing.accessOrder = ++this.accessCounter;
-      this.dirtyCount++;
-      this.flushIfNeeded();
-      return;
-    }
-
-    // Allocate new frame
-    const frameIndex = this.allocateFrame();
-    if (frameIndex < 0) {
-      // Fallback: write directly to SQLite
-      this.writePageToSql(pageAligned, data);
-      return;
-    }
-
-    // Copy into WASM memory
-    const offset = this.frameOffset(frameIndex);
-    if (this.wasmHeap) {
-      this.wasmHeap.set(
-        data.subarray(0, Math.min(data.length, PAGE_SIZE)),
-        offset,
-      );
-    }
-
-    const entry: HotPageEntry = {
-      gpa: pageAligned,
-      frameIndex,
-      dirty: true,
-      accessOrder: ++this.accessCounter,
-    };
-    this.hotPages.set(pageAligned, entry);
-    this.frameToGpa.set(frameIndex, pageAligned);
-
-    this.dirtyCount++;
-    this.flushIfNeeded();
-  }
-
-  /**
-   * Check if a page exists in the hot cache.
-   */
-  hasPage(gpa: number): boolean {
-    return this.hotPages.has(gpa & ~(PAGE_SIZE - 1));
-  }
-
-  /**
-   * Flush all dirty hot pages to SQLite.
-   *
-   * SYNCHRONOUS. Called periodically from QEMUWrapper.postTick()
-   * and on eviction.
    */
   flushDirty(): void {
     if (!this.wasmHeap) return;
-
-    for (const [, entry] of this.hotPages) {
-      if (entry.dirty) {
-        const offset = this.frameOffset(entry.frameIndex);
-        const data = this.wasmHeap.slice(offset, offset + PAGE_SIZE);
-        this.writePageToSql(entry.gpa, data);
-        entry.dirty = false;
+    for (let i = 0; i < this.cfg.maxFrames; i++) {
+      if (this.frameDirty[i] && this.frameGpa[i] >= 0) {
+        const offset = this.poolBase + i * PAGE_SIZE;
+        this.writeToSql(this.frameGpa[i], this.wasmHeap.subarray(offset, offset + PAGE_SIZE));
+        this.frameDirty[i] = 0;
       }
     }
-
-    this.dirtyCount = 0;
   }
 
-  // ── Frame allocation & eviction ───────────────────────────────────────
+  // ── Clock eviction ────────────────────────────────────────────────────────
 
   /**
-   * Allocate a page frame. Returns frame index (0-based).
-   * If no free frames, evicts LRU pages first.
+   * Allocate one frame.  If free frames remain, returns the next free slot
+   * (advancing clockHand to keep sequential locality).  If the pool is full,
+   * runs the Clock sweep to evict one frame.
+   *
+   * Returns frame index ≥ 0, or -1 on failure.
    */
   private allocateFrame(): number {
-    if (this.freeFrames.length > 0) {
-      return this.freeFrames.pop()!;
-    }
-
-    // Need to evict — find LRU pages
-    this.evictLRU();
-
-    if (this.freeFrames.length > 0) {
-      return this.freeFrames.pop()!;
-    }
-
-    // Should not happen if eviction works correctly
-    console.error(`${LOG_PREFIX} SqlPageStore: frame allocation failed after eviction`);
-    return -1;
-  }
-
-  /**
-   * Evict the least-recently-used pages from the hot pool.
-   * Dirty pages are flushed to SQLite before eviction.
-   *
-   * SYNCHRONOUS.
-   */
-  private evictLRU(): void {
-    // Collect all entries, sort by access order (ascending = oldest first)
-    const entries = [...this.hotPages.values()]
-      .sort((a, b) => a.accessOrder - b.accessOrder);
-
-    let evicted = 0;
-    for (const entry of entries) {
-      if (evicted >= EVICT_BATCH) break;
-
-      // Flush dirty page to SQLite before eviction
-      if (entry.dirty && this.wasmHeap) {
-        const offset = this.frameOffset(entry.frameIndex);
-        const data = this.wasmHeap.slice(offset, offset + PAGE_SIZE);
-        this.writePageToSql(entry.gpa, data);
-      }
-
-      // Remove from hot maps
-      this.hotPages.delete(entry.gpa);
-      this.frameToGpa.delete(entry.frameIndex);
-
-      // Return frame to free list
-      this.freeFrames.push(entry.frameIndex);
-      evicted++;
-    }
-
-    if (evicted > 0) {
-      this.dirtyCount = 0; // Reset after flush
-
-      // Invalidate the entire TLB so no stale entries reference evicted frames.
-      // Cost: ~microseconds (clears ~4096-entry array + list); paid once per
-      // EVICT_BATCH page-ins — negligible vs the SQLite I/O we just did.
-      if (this.cpu) {
-        try { this.cpu.full_clear_tlb(); } catch { /* non-fatal if not yet running */ }
+    if (this.usedFrames < this.cfg.maxFrames) {
+      // Linear scan from clockHand to find a free slot
+      for (let i = 0; i < this.cfg.maxFrames; i++) {
+        const idx = (this.clockHand + i) % this.cfg.maxFrames;
+        if (this.frameGpa[idx] < 0) {
+          this.clockHand = (idx + 1) % this.cfg.maxFrames;
+          return idx;
+        }
       }
     }
+    return this.clockEvict();
   }
 
   /**
-   * Trigger flush if dirty count exceeds threshold.
-   */
-  private flushIfNeeded(): void {
-    if (this.dirtyCount >= DIRTY_FLUSH_THRESHOLD) {
-      this.flushDirty();
-    }
-  }
-
-  // ── SQLite operations (SYNCHRONOUS) ───────────────────────────────────
-
-  /**
-   * Read a page from SQLite. Returns null if the page has never been written.
+   * Clock sweep: advance the hand up to cfg.maxEvictScan steps, giving each
+   * referenced frame a second chance (clear ref bit), and evicting the first
+   * unreferenced frame found.
    *
-   * SYNCHRONOUS — sql.exec() returns SqlStorageCursor.
+   * If cfg.maxEvictScan is exhausted without finding an unreferenced frame,
+   * a second pass is triggered (all bits were cleared in the first pass, so
+   * the very next frame will be evictable).  Worst case: 2 × maxFrames steps.
    */
-  private readPageFromSql(gpa: number): Uint8Array | null {
+  private clockEvict(): number {
+    // Two passes max: first clears all ref bits, second finds first victim
+    const limit = this.cfg.maxFrames * 2;
+    let evicted = -1;
+
+    for (let scanned = 0; scanned < limit; scanned++) {
+      const i = this.clockHand;
+      this.clockHand = (this.clockHand + 1) % this.cfg.maxFrames;
+
+      if (this.frameGpa[i] < 0) {
+        evicted = i; // free slot — shouldn't happen but safe to take
+        break;
+      }
+
+      if (this.frameRef[i]) {
+        this.frameRef[i] = 0; // second chance — clear and keep going
+        continue;
+      }
+
+      evicted = i; // unreferenced — evict
+      break;
+    }
+
+    if (evicted < 0) {
+      console.error(`${LOG_PREFIX} SqlPageStore: Clock eviction failed after ${limit} scans`);
+      return -1;
+    }
+
+    // Flush dirty frame to SQLite before reuse
+    if (this.frameDirty[evicted] && this.wasmHeap) {
+      const offset = this.poolBase + evicted * PAGE_SIZE;
+      this.writeToSql(this.frameGpa[evicted], this.wasmHeap.subarray(offset, offset + PAGE_SIZE));
+      this.frameDirty[evicted] = 0;
+    }
+
+    // Unregister the old GPA
+    this.frameMap.delete(this.frameGpa[evicted]);
+    this.frameGpa[evicted]   = -1;
+    this.frameRef[evicted]   = 0;
+    this.usedFrames--;
+    this._evictions++;
+
+    // Invalidate all TLB entries so no stale entry references this frame's
+    // old GPA mapping.  full_clear_tlb() is O(TLB_SIZE) ≈ microseconds.
+    if (this.cpu) {
+      try { this.cpu.full_clear_tlb(); } catch { /* non-fatal before first run */ }
+    }
+
+    return evicted;
+  }
+
+  // ── SQLite helpers ────────────────────────────────────────────────────────
+
+  private readFromSql(gpa: number): Uint8Array | null {
     this.init();
-
-    const rows = [...this.sql.exec(
-      `SELECT data FROM ram_pages WHERE gpa = ?`, gpa,
-    )];
-
+    this._sqlReads++;
+    const rows = [...this.sql.exec(`SELECT data FROM ram_pages WHERE gpa = ?`, gpa)];
     if (rows.length === 0) return null;
 
     const blob = rows[0].data;
     let data: Uint8Array;
-
-    if (blob instanceof ArrayBuffer) {
-      data = new Uint8Array(blob);
-    } else if (blob instanceof Uint8Array) {
+    if (blob instanceof Uint8Array) {
       data = blob;
+    } else if (blob instanceof ArrayBuffer) {
+      data = new Uint8Array(blob);
     } else {
-      // SqlStorageCursor may return blob as ArrayBufferLike
-      data = new Uint8Array(
-        (blob as { buffer: ArrayBuffer }).buffer ?? blob as ArrayBuffer,
-      );
+      data = new Uint8Array((blob as any).buffer ?? (blob as any));
     }
 
-    // Ensure exactly PAGE_SIZE bytes
     if (data.length !== PAGE_SIZE) {
       const padded = new Uint8Array(PAGE_SIZE);
       padded.set(data.subarray(0, Math.min(data.length, PAGE_SIZE)));
       return padded;
     }
-
     return data;
   }
 
-  /**
-   * Write a page to SQLite.
-   *
-   * SYNCHRONOUS — sql.exec() returns SqlStorageCursor.
-   */
-  private writePageToSql(gpa: number, data: Uint8Array): void {
+  private writeToSql(gpa: number, data: Uint8Array): void {
     this.init();
-
-    // Ensure we write exactly PAGE_SIZE bytes
+    this._sqlWrites++;
     const blob = data.length === PAGE_SIZE
       ? data
       : data.subarray(0, Math.min(data.length, PAGE_SIZE));
-
-    this.sql.exec(
-      `INSERT OR REPLACE INTO ram_pages (gpa, data, dirty) VALUES (?, ?, 1)`,
-      gpa,
-      blob,
-    );
+    this.sql.exec(`INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES (?, ?)`, gpa, blob);
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────
+  // ── Stats ─────────────────────────────────────────────────────────────────
 
-  /**
-   * Compute the WASM heap byte offset for a given frame index.
-   */
-  private frameOffset(frameIndex: number): number {
-    return this.poolBase + frameIndex * PAGE_SIZE;
-  }
-
-  // ── Stats ─────────────────────────────────────────────────────────────
-
-  get stats(): {
-    hotPages: number;
-    dirtyPages: number;
-    freeFrames: number;
-    totalFrames: number;
-    accessCounter: number;
-  } {
-    let dirty = 0;
-    for (const entry of this.hotPages.values()) {
-      if (entry.dirty) dirty++;
-    }
+  get stats() {
     return {
-      hotPages: this.hotPages.size,
-      dirtyPages: dirty,
-      freeFrames: this.freeFrames.length,
-      totalFrames: this.maxFrames,
-      accessCounter: this.accessCounter,
+      hotPages:    this.usedFrames,
+      totalFrames: this.cfg.maxFrames,
+      freeFrames:  this.cfg.maxFrames - this.usedFrames,
+      swapIns:     this._swapIns,
+      evictions:   this._evictions,
+      sqlReads:    this._sqlReads,
+      sqlWrites:   this._sqlWrites,
     };
   }
 }

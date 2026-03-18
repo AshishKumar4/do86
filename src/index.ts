@@ -22,32 +22,40 @@ interface ImageDef {
 
 // ── DO memory budget ─────────────────────────────────────────────────────────
 // Cloudflare Durable Objects have a 128 MB total isolate memory limit.
-// Breakdown for a running VM:
-//   Guest RAM:    48 MB  (memory_size)
-//   VGA SVGA buf:  4 MB  (svga_allocate_memory)
-//   v86 WASM heap:~30 MB (wasm linear memory: JIT code cache, TLB tables, etc.)
-//   JS heap:      ~20 MB (emulator objects, WS sessions, delta encoder)
-//   ─────────────────────
-//   Total:       ~102 MB  ← safe headroom below 128 MB limit
+// Demand-paging layout (all tunable in linux-vm.ts VM_CONFIG):
+//   Resident guest RAM:  32 MB  (WASM mem8[0..32MB], always hot)
+//   Hot page frame pool: 32 MB  (WASM mem8[32MB..64MB], 8192 × 4 KB frames)
+//   VGA SVGA buffer:      8 MB  (svga_allocate_memory, outside mem8)
+//   WASM heap overhead:  ~20 MB (JIT code cache, TLB tables, CPU structs)
+//   JS heap:             ~10 MB (emulator objects, WS sessions, delta encoder)
+//   ──────────────────────────
+//   Total:              ~102 MB ← safe headroom below 128 MB limit
 //
-// The previous 96 MB RAM + 8 MB VGA = 104 MB guest allocation pushed total
-// to ~154 MB, causing OOM eviction when the guest OS opened applications.
-// 48 MB is sufficient for all GUI OSes here: KolibriOS uses ~4 MB, TinyCore
-// uses ~32 MB at peak, DSL/HelenOS fit comfortably in 48 MB.
-// linux4 (text-only) stays at 32 MB / 2 MB VGA — it needs even less.
+// Guest sees 256 MB via CMOS/e820 (VM_CONFIG.LOGICAL_MB).
+// GPAs [32 MB, 256 MB) are demand-paged from DO SQLite via swap_page_in.
+// linux4 (text-only) uses a reduced budget: 32 MB RAM, 2 MB VGA.
+//
+// memory/vgaMemory values in IMAGES are the WASM physical allocations (MB)
+// sent to v86 — not what the guest OS sees.  To change the shared default,
+// edit VM_CONFIG in linux-vm.ts; this table stays in sync via the constants below.
+
+/** Shared default memory/VGA allocation for demand-paged images (MB). */
+const DEFAULT_MEMORY_MB  = 32; // == VM_CONFIG.RESIDENT_MB + VM_CONFIG.HOT_FRAMES×4KB/1MB
+const DEFAULT_VGA_MB     =  8; // == VM_CONFIG.VGA_MB
+
 const IMAGES: Record<string, ImageDef> = {
-  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: 48, vgaMemory: 4, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
+  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: 48, vgaMemory: 4, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true },
-  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: 48, vgaMemory: 4, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
+  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
-  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: 48, vgaMemory: 4, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
                 url: "http://tinycorelinux.net/11.x/x86/release/TinyCore-11.1.iso" },
-  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: 48, vgaMemory: 4, label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
+  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
                 url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
-  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: 48, vgaMemory: 4, label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
+  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
                 url: "https://www.helenos.org/releases/HelenOS-0.14.1-ia32.iso" },
-  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32, vgaMemory: 2, label: "Linux 4 (Text)", description: "Minimal Linux kernel. Text-only — great for exploring the shell.",
+  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,                vgaMemory: 2,              label: "Linux 4 (Text)", description: "Minimal Linux kernel. Text-only — great for exploring the shell.",
                 url: "https://copy.sh/v86/images/linux4.iso" },
 };
 

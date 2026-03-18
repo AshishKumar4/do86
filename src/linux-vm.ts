@@ -14,8 +14,46 @@ import {
 import { DOScreenAdapter } from "./screen-adapter";
 import { DeltaEncoder, encodeSerialData, encodeStatus, encodeTextScreen } from "./delta-encoder";
 import { SqliteStorage, SqliteImageCache, SQLiteBlockDevice, unpackAssets } from "./sqlite-storage";
-import { SqlPageStore } from "./sql-page-store";
+import { SqlPageStore, type PageStoreConfig } from "./sql-page-store";
 import type { Env } from "./index";
+
+// ── VM configuration ──────────────────────────────────────────────────────────
+//
+// All tunable memory / paging parameters live here.  Change these values to
+// reshape the DO memory budget without touching boot logic.
+//
+// DO isolate memory budget (128 MB hard limit):
+//   WASM resident RAM : RESIDENT_MB  = 32 MB
+//   WASM hot pool     : HOT_POOL_MB  = 32 MB   (HOT_FRAMES × 4 KB)
+//   VGA SVGA buffer   : VGA_MB       =  8 MB
+//   WASM heap overhead:              ~ 20 MB   (JIT cache, TLB tables, etc.)
+//   JS heap           :              ~ 10 MB   (emulator objects, WS sessions)
+//   ──────────────────────────────────────
+//   Total                            ~102 MB   ← safe below 128 MB limit
+//
+// Guest sees LOGICAL_MB via CMOS/e820.  GPAs in [RESIDENT_MB, LOGICAL_MB)
+// are demand-paged from DO SQLite via the swap_page_in WASM import hook.
+// RESIDENT_MB must equal PAGED_THRESHOLD in stratum/src/rust/cpu/memory.rs.
+const VM_CONFIG = {
+  /** Physical WASM allocation: resident guest RAM (bytes). */
+  RESIDENT_MB:   32,
+  /** Hot page frame pool size (frames).  Each frame = 4 KB.
+   *  Pool occupies mem8[RESIDENT_MB .. RESIDENT_MB + HOT_FRAMES×4KB]. */
+  HOT_FRAMES:    8192,   // 8192 × 4 KB = 32 MB hot window
+  /** VGA SVGA framebuffer size (MB). */
+  VGA_MB:         8,
+  /** Logical RAM reported to guest BIOS/CMOS (MB).
+   *  Pages above RESIDENT_MB are demand-paged from SQLite. */
+  LOGICAL_MB:   256,
+  /** SMP CPU count: 1 = BSP only, 2 = BSP + 1 AP.
+   *  Each AP adds cooperative ticks; increase only after measuring headroom. */
+  CPU_COUNT:      2,
+  /** PageStore tuning forwarded to SqlPageStore constructor. */
+  PAGE_STORE: {
+    maxFrames:    8192,  // must match HOT_FRAMES
+    maxEvictScan: 256,
+  } satisfies Partial<PageStoreConfig>,
+} as const;
 
 // ── Image registry (mirrored from index.ts for DO self-recovery) ─────────────
 // When the DO is evicted and a client reconnects, cachedAssets is gone.
@@ -32,19 +70,23 @@ interface ImageDef {
   noSnapshot?: boolean;
 }
 
+// memory/vgaMemory in IMAGES are the WASM-physical allocations (MB) passed to v86.
+// With demand-paging active these equal RESIDENT_MB / VGA_MB from VM_CONFIG.
+// linux4 is text-only and uses a smaller budget; all other images share the default.
+const { RESIDENT_MB, VGA_MB } = VM_CONFIG;
 const IMAGES: Record<string, ImageDef> = {
-  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: 48, vgaMemory: 4, label: "KolibriOS",
+  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "KolibriOS",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: 48, vgaMemory: 4, label: "AqeousOS",      noSnapshot: true },
-  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: 48, vgaMemory: 4, label: "TinyCore 15",
+  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "AqeousOS",      noSnapshot: true },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "TinyCore 15",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
-  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: 48, vgaMemory: 4, label: "TinyCore 11",
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "TinyCore 11",
                 url: "http://tinycorelinux.net/11.x/x86/release/TinyCore-11.1.iso" },
-  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: 48, vgaMemory: 4, label: "DSL Linux",
+  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "DSL Linux",
                 url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
-  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: 48, vgaMemory: 4, label: "HelenOS",
+  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: RESIDENT_MB, vgaMemory: VGA_MB, label: "HelenOS",
                 url: "https://www.helenos.org/releases/HelenOS-0.14.1-ia32.iso" },
-  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32, vgaMemory: 2, label: "Linux 4 (Text)",
+  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,          vgaMemory: 2,      label: "Linux 4 (Text)",
                 url: "https://copy.sh/v86/images/linux4.iso" },
 };
 
@@ -382,23 +424,21 @@ export class LinuxVM extends DurableObject<Env> {
         disable_jit: false,
         bios: { buffer: bios },
         vga_bios: { buffer: vgaBios },
-        memory_size: memorySizeMB * 1024 * 1024,
-        vga_memory_size: vgaMemoryMB * 1024 * 1024,
-        // logical_memory_size: what the guest BIOS reports (128 MB).
-        // WASM only allocates memory_size (48 MB); the upper 80 MB is demand-paged
-        // from DO SQLite via the swap_page_in WASM import hook installed below.
-        // The hot pool occupies mem8[32MB..48MB] — 4096 × 4KB = 16MB hot window.
-        logical_memory_size: 128 * 1024 * 1024,
+        memory_size:         memorySizeMB * 1024 * 1024,
+        vga_memory_size:     vgaMemoryMB  * 1024 * 1024,
+        // logical_memory_size: what the guest BIOS/CMOS reports (VM_CONFIG.LOGICAL_MB).
+        // WASM only allocates memory_size (VM_CONFIG.RESIDENT_MB); the upper range
+        // is demand-paged from DO SQLite via the swap_page_in WASM import hook wired
+        // in the emulator-loaded listener below.
+        logical_memory_size: VM_CONFIG.LOGICAL_MB * 1024 * 1024,
         autostart: false,
         disable_speaker: true,
         fastboot: true,
         acpi: true,
         boot_order: drive === "cdrom" ? BOOT_ORDER_CDROM_FIRST : BOOT_ORDER_HDA_FIRST,
-        // cpu_count: stratum WASM supports SMP via smp_init(). Start with 2 CPUs
-        // (BSP + 1 AP) — conservative for the DO's 128MB budget. Each AP adds
-        // cooperative round-robin ticks per main loop iteration; increase to 4
-        // only after verifying memory headroom in production.
-        cpu_count: 2,
+        // cpu_count: stratum WASM supports SMP via smp_init().
+        // VM_CONFIG.CPU_COUNT = 2 (BSP + 1 AP) is conservative for the DO budget.
+        cpu_count: VM_CONFIG.CPU_COUNT,
       };
 
       if (drive === "fda") v86Config.fda = { buffer: disk };
@@ -451,44 +491,45 @@ export class LinuxVM extends DurableObject<Env> {
           clearTimeout(timeout);
 
           // ── SQLite demand-paging hook ─────────────────────────────────────────
-          // Install SqlPageStore on the v86 CPU object so that swap_page_in()
-          // calls (from do_page_walk in WASM) are served synchronously from
-          // DO SQLite.  Hot pool: mem8[HOT_POOL_BASE..48MB] = 4096 × 4KB frames.
+          // Wire SqlPageStore to cpu._swap_page_in_hook so that swap_page_in()
+          // WASM imports (from do_page_walk) are served synchronously from DO SQLite.
           //
-          // HOT_POOL_BASE must match PAGED_THRESHOLD in stratum/src/rust/cpu/memory.rs.
-          const HOT_POOL_BASE = 32 * 1024 * 1024; // 32 MB
-          const HOT_POOL_FRAMES = 4096;             // 4096 × 4KB = 16MB
+          // HOT_POOL_BASE = RESIDENT_MB bytes — must match PAGED_THRESHOLD in
+          // stratum/src/rust/cpu/memory.rs (both are 32 MB).
+          const HOT_POOL_BASE = VM_CONFIG.RESIDENT_MB * 1024 * 1024;
+          const poolSizeMB    = VM_CONFIG.HOT_FRAMES * 4096 / 1024 / 1024;
 
           try {
             const cpu = (this.emulator as any).v86?.cpu;
             if (cpu && cpu.wasm_memory?.buffer) {
               const pageStore = new SqlPageStore(
                 this.ctx.storage.sql as any,
-                HOT_POOL_FRAMES,
+                VM_CONFIG.PAGE_STORE,
               );
               pageStore.init();
 
-              // Point at the top 16MB of WASM linear memory (the hot pool window).
               const wasmHeap = new Uint8Array(cpu.wasm_memory.buffer);
               pageStore.setWasmHeap(wasmHeap, HOT_POOL_BASE);
-
-              // Give the store a reference to the CPU for TLB flush after eviction.
               pageStore.setCpu(cpu);
 
-              // Install the swap hook — called by cpu.swap_page_in() (WASM import).
-              cpu._swap_page_in_hook = (gpa: number): number => pageStore.swapIn(gpa);
+              // Install hook — called by cpu.swap_page_in(gpa, forWriting) (WASM import).
+              cpu._swap_page_in_hook = (gpa: number, forWriting: number): number =>
+                pageStore.swapPageIn(gpa, forWriting);
 
               console.log(
-                `${LOG_PREFIX} SqlPageStore ready: hot pool at WASM offset ` +
-                `0x${HOT_POOL_BASE.toString(16)}–0x${(HOT_POOL_BASE + HOT_POOL_FRAMES * 4096).toString(16)} ` +
-                `(${HOT_POOL_FRAMES} frames × 4KB = ${HOT_POOL_FRAMES * 4096 / 1024 / 1024}MB)`,
+                `${LOG_PREFIX} SqlPageStore ready: ` +
+                `resident=${VM_CONFIG.RESIDENT_MB}MB ` +
+                `hot_pool=${HOT_POOL_BASE.toString(16)}h–` +
+                `${(HOT_POOL_BASE + VM_CONFIG.HOT_FRAMES * 4096).toString(16)}h ` +
+                `(${VM_CONFIG.HOT_FRAMES} frames × 4KB = ${poolSizeMB}MB) ` +
+                `logical=${VM_CONFIG.LOGICAL_MB}MB`,
               );
             } else {
               console.warn(`${LOG_PREFIX} SqlPageStore: cpu or wasm_memory not available — demand-paging disabled`);
             }
           } catch (e) {
             console.error(`${LOG_PREFIX} SqlPageStore init failed (non-fatal):`, e);
-            // Non-fatal: guest runs with 48MB resident RAM (no paging). Same as before.
+            // Non-fatal: guest runs with resident RAM only (no demand-paging).
           }
 
           const vga = this.getVga();

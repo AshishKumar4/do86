@@ -114,7 +114,7 @@ var MIXER_SRC_PCSPEAKER = 1;
 var MIXER_SRC_DAC = 2;
 
 // src/log.js
-if (false) {
+if (typeof DEBUG === "undefined") {
   globalThis.DEBUG = true;
 }
 var LOG_TO_FILE = false;
@@ -131,7 +131,7 @@ function do_the_log(message) {
   }
 }
 var dbg_log = (function() {
-  if (true) {
+  if (!DEBUG) {
     return function() {
     };
   }
@@ -142,7 +142,7 @@ var dbg_log = (function() {
   var log_last_message = "";
   var log_message_repetitions = 0;
   function dbg_log_(stuff, level) {
-    if (true) return;
+    if (!DEBUG) return;
     level = level || 1;
     if (level & LOG_LEVEL) {
       var level_name = dbg_names[level] || "", message = "[" + pads(level_name, 4) + "] " + stuff;
@@ -169,11 +169,11 @@ var dbg_log = (function() {
   return dbg_log_;
 })();
 function dbg_trace(level) {
-  if (true) return;
+  if (!DEBUG) return;
   dbg_log(Error().stack, level);
 }
 function dbg_assert(cond, msg, level) {
-  if (true) return;
+  if (!DEBUG) return;
   if (!cond) {
     dbg_assert_failed(msg);
   }
@@ -321,7 +321,7 @@ var round_up_to_next_power_of_2 = function(x) {
   dbg_assert(x >= 0);
   return x <= 1 ? 1 : 1 << 1 + int_log2(x - 1);
 };
-if (false) {
+if (typeof DEBUG !== "undefined" && DEBUG) {
   dbg_assert(int_log2(1) === 0);
   dbg_assert(int_log2(2) === 1);
   dbg_assert(int_log2(7) === 2);
@@ -1382,7 +1382,7 @@ IO.prototype.register_read = function(port_addr, device, r8, r16, r32) {
   dbg_assert(!r16 || typeof r16 === "function");
   dbg_assert(!r32 || typeof r32 === "function");
   dbg_assert(r8 || r16 || r32);
-  if (false) {
+  if (DEBUG) {
     var fail = function(n) {
       dbg_assert(false, "Overlapped read" + n + " " + h(port_addr, 4) + " (" + device.name + ")");
       return -1 >>> 32 - n | 0;
@@ -1403,7 +1403,7 @@ IO.prototype.register_write = function(port_addr, device, w8, w16, w32) {
   dbg_assert(!w16 || typeof w16 === "function");
   dbg_assert(!w32 || typeof w32 === "function");
   dbg_assert(w8 || w16 || w32);
-  if (false) {
+  if (DEBUG) {
     var fail = function(n) {
       dbg_assert(false, "Overlapped write" + n + " " + h(port_addr) + " (" + device.name + ")");
     };
@@ -3537,7 +3537,7 @@ UART.prototype.write_data = function(out_byte) {
   } else {
     this.bus.send("serial" + this.com + "-output-byte", out_byte);
   }
-  if (false) {
+  if (DEBUG) {
     var char = String.fromCharCode(out_byte);
     this.current_line += char;
     if (char === "\n") {
@@ -5160,7 +5160,7 @@ function VirtIO(cpu, options) {
   this.queue_select = 0;
   this.queue_selected = this.queues[0];
   this.isr_status = 0;
-  if (false) {
+  if (DEBUG) {
     const offsets = /* @__PURE__ */ new Set();
     for (const offset of this.queues.map((q) => q.notify_offset)) {
       const effective_offset = options.notification.single_handler ? 0 : offset;
@@ -5271,7 +5271,7 @@ VirtIO.prototype.create_common_capability = function(options) {
             this.notify_config_changes();
           }
           if (!this.features_ok) {
-            if (false) {
+            if (DEBUG && data & VIRTIO_STATUS_FEATURES_OK) {
               dbg_log("Removing FEATURES_OK", LOG_VIRTIO);
             }
             data &= ~VIRTIO_STATUS_FEATURES_OK;
@@ -5540,7 +5540,7 @@ VirtIO.prototype.init_capabilities = function(capabilities) {
     for (const field of cap.struct) {
       let read = field.read;
       let write = field.write;
-      if (false) {
+      if (DEBUG) {
         read = () => {
           const val = field.read();
           dbg_log(
@@ -5900,7 +5900,7 @@ function VirtQueueBufferChain(virtqueue, head_idx) {
     const desc = virtqueue.get_descriptor(table_address, desc_idx);
     dbg_log("descriptor: idx=" + desc_idx + " addr=" + h(desc.addr_high, 8) + ":" + h(desc.addr_low, 8) + " len=" + h(desc.len, 8) + " flags=" + h(desc.flags, 4) + " next=" + h(desc.next, 4), LOG_VIRTIO);
     if (has_indirect_feature && desc.flags & VIRTQ_DESC_F_INDIRECT) {
-      if (false) {
+      if (DEBUG && desc.flags & VIRTQ_DESC_F_NEXT) {
         dbg_log("Driver bug: has set VIRTQ_DESC_F_NEXT flag in an indirect table descriptor", LOG_VIRTIO);
       }
       table_address = desc.addr_low;
@@ -6921,7 +6921,7 @@ function read_elf(buffer) {
   const view2 = new DataView(buffer);
   const [header, offset] = read_struct(view2, Header);
   console.assert(offset === 52);
-  if (false) {
+  if (DEBUG) {
     for (const key of Object.keys(header)) {
       dbg_log(key + ": 0x" + (header[key].toString(16) >>> 0));
     }
@@ -6945,7 +6945,7 @@ function read_elf(buffer) {
     SectionHeader,
     header.shnum
   );
-  if (false) {
+  if (DEBUG && LOG_LEVEL) {
     console.log("%d program headers:", program_headers.length);
     for (const program of program_headers) {
       console.log(
@@ -7573,7 +7573,7 @@ FloppyController.prototype.read_reg_fifo = function() {
   if (this.response_cursor < this.response_length) {
     const fifo_byte = this.response_data[this.response_cursor++];
     if (this.response_cursor === this.response_length) {
-      const lower_irq_reason = false ? "end of " + this.cmd_table[this.cmd_code].name + " response" : "";
+      const lower_irq_reason = DEBUG ? "end of " + this.cmd_table[this.cmd_code].name + " response" : "";
       this.msr &= ~MSR_RQM;
       this.enter_command_phase();
       this.lower_irq(lower_irq_reason);
@@ -7668,7 +7668,7 @@ FloppyController.prototype.write_reg_fifo = function(fifo_byte) {
     this.cmd_phase = CMD_PHASE_EXECUTION;
     const cmd_desc = this.cmd_table[this.cmd_code];
     const args = this.cmd_buffer.slice(0, this.cmd_cursor);
-    if (false) {
+    if (DEBUG) {
       const args_hex = [];
       for (const arg of args) {
         args_hex.push(h(arg, 2));
@@ -7866,7 +7866,7 @@ FloppyController.prototype.start_read_write = function(args, do_write) {
     }
   }
   this.eot = eot;
-  if (false) {
+  if (DEBUG) {
     dbg_log(
       "Floppy " + this.cmd_table[this.cmd_code].name + " from: " + h(data_offset) + ", length: " + h(data_length) + ", C/H/S: " + track + "/" + head + "/" + sect + ", ro: " + curr_drive.read_only + ", #S: " + curr_drive.max_sect + ", #H: " + curr_drive.max_head,
       LOG_FLOPPY
@@ -8144,7 +8144,7 @@ FloppyDrive.prototype.insert_disk = function(buffer, read_only) {
   if (this.drive_type === CMOS_FDD_TYPE_NO_DRIVE) {
     this.drive_type = disk_format.drive_type;
   }
-  if (false) {
+  if (DEBUG) {
     dbg_log(
       "disk inserted into " + this.name + ": type: " + disk_format.drive_type + ", C/H/S: " + disk_format.tracks + "/" + disk_format.heads + "/" + disk_format.sectors + ", size: " + new_buffer.byteLength,
       LOG_FLOPPY
@@ -8415,12 +8415,13 @@ var ATAPI_SK_ILLEGAL_REQUEST = 5;
 var ATAPI_SK_UNIT_ATTENTION = 6;
 var ATAPI_ASC_INV_FIELD_IN_CMD_PACKET = 36;
 var ATAPI_ASC_MEDIUM_NOT_PRESENT = 58;
+var LOG_DETAIL_NONE = 0;
 var LOG_DETAIL_REG_IO = 1;
 var LOG_DETAIL_IRQ = 2;
 var LOG_DETAIL_RW = 4;
 var LOG_DETAIL_RW_DMA = 8;
 var LOG_DETAIL_CHS = 16;
-var LOG_DETAILS = false ? LOG_DETAIL_NONE : 0;
+var LOG_DETAILS = DEBUG ? LOG_DETAIL_NONE : 0;
 function IDEController(cpu, bus, ide_config) {
   this.cpu = cpu;
   this.bus = bus;
@@ -8814,6 +8815,7 @@ function IDEChannel(controller, channel_nr, channel_config, command_base, contro
     void 0,
     this.dma_set_addr
   );
+  DEBUG && Object.seal(this);
 }
 IDEChannel.prototype.read_status = function() {
   return this.current_interface.drive_connected ? this.current_interface.status_reg : 0;
@@ -9090,8 +9092,8 @@ IDEInterface.prototype.ata_command = function(cmd) {
     dbg_log(`${this.name}: ATA command ${ATA_CMD_NAME[cmd]} (${h(cmd)}) ignored: no slave drive connected`, LOG_DISK);
     return;
   }
-  const regs_pre = false ? this.capture_regs() : void 0;
-  let do_dbg_log = false;
+  const regs_pre = DEBUG ? this.capture_regs() : void 0;
+  let do_dbg_log = DEBUG;
   this.current_command = cmd;
   this.error_reg = 0;
   switch (cmd) {
@@ -9279,7 +9281,7 @@ IDEInterface.prototype.ata_command = function(cmd) {
       this.ata_abort_command();
       break;
   }
-  if (false) {
+  if (DEBUG && do_dbg_log) {
     const regs_msg = `[${regs_pre}] -> [${this.capture_regs()}]`;
     const result = this.status_reg & ATA_SR_ERR ? this.error_reg & ATA_ER_ABRT ? "ABORT" : "ERROR" : "OK";
     dbg_log(`${this.name}: ATA command ${ATA_CMD_NAME[cmd]} (${h(cmd)}): ${result} ${regs_msg}`, LOG_DISK);
@@ -9289,8 +9291,8 @@ IDEInterface.prototype.atapi_handle = function() {
   const cmd = this.data[0];
   const cmd_name = ATAPI_CMD[cmd] ? ATAPI_CMD[cmd].name : "<undefined>";
   const cmd_flags = ATAPI_CMD[cmd] ? ATAPI_CMD[cmd].flags : ATAPI_CF_NONE;
-  const regs_pre = false ? this.capture_regs() : void 0;
-  let do_dbg_log = false;
+  const regs_pre = DEBUG ? this.capture_regs() : void 0;
+  let do_dbg_log = DEBUG;
   let dbg_log_extra;
   this.data_pointer = 0;
   this.current_atapi_command = cmd;
@@ -9301,7 +9303,7 @@ IDEInterface.prototype.atapi_handle = function() {
   if (!this.buffer && cmd_flags & ATAPI_CF_NEEDS_DISK) {
     this.atapi_check_condition_response(ATAPI_SK_NOT_READY, ATAPI_ASC_MEDIUM_NOT_PRESENT);
     this.push_irq();
-    if (false) {
+    if (DEBUG) {
       dbg_log(`${this.name}: ATAPI command ${cmd_name} (${h(cmd)}) without medium: ERROR [${regs_pre}]`, LOG_DISK);
     }
     return;
@@ -9547,7 +9549,7 @@ IDEInterface.prototype.atapi_handle = function() {
     this.sector_count_reg |= 1;
     this.status_reg &= ~ATA_SR_DRQ;
   }
-  if (false) {
+  if (DEBUG && do_dbg_log) {
     const regs_msg = `[${regs_pre}] -> [${this.capture_regs()}]`;
     const result = this.status_reg & ATA_SR_ERR ? this.error_reg & ATA_ER_ABRT ? "ABORT" : "ERROR" : "OK";
     dbg_log_extra = dbg_log_extra ? ` ${dbg_log_extra}:` : "";
@@ -13995,7 +13997,7 @@ VirtioNet.prototype.Ack = function(queue_id, bufchain) {
 };
 
 // src/browser/screen.js
-var DEBUG_SCREEN_LAYERS = false;
+var DEBUG_SCREEN_LAYERS = DEBUG && false;
 function ScreenAdapter(options, screen_fill_buffer) {
   const screen_container = options.container;
   this.screen_fill_buffer = screen_fill_buffer;
@@ -18801,6 +18803,8 @@ function make_linux_boot_rom(real_mode_segment, heap_end) {
 }
 
 // src/cpu.js
+var DUMP_GENERATED_WASM = false;
+var DUMP_UNCOMPILED_ASSEMBLY = false;
 function CPU(bus, wm, stop_idling) {
   this.stop_idling = stop_idling;
   this.wm = wm;
@@ -18886,7 +18890,7 @@ function CPU(bus, wm, stop_idling) {
   this.io = void 0;
   this.bus = bus;
   this.set_tsc(0, 0);
-  if (false) {
+  if (DEBUG) {
     this.seen_code = {};
     this.seen_code_uncompiled = {};
   }
@@ -18930,9 +18934,9 @@ CPU.prototype.mmap_write128 = function(addr, value0, value1, value2, value3) {
   write_func32(addr + 8, value2);
   write_func32(addr + 12, value3);
 };
-CPU.prototype.swap_page_in = function(gpa) {
+CPU.prototype.swap_page_in = function(gpa, for_writing) {
   if (this._swap_page_in_hook) {
-    return this._swap_page_in_hook(gpa) | 0;
+    return this._swap_page_in_hook(gpa, for_writing) | 0;
   }
   return -1;
 };
@@ -19002,7 +19006,7 @@ CPU.prototype.wasm_patch = function() {
   this.device_raise_irq = get_import("device_raise_irq");
   this.device_lower_irq = get_import("device_lower_irq");
   this.apic_timer = get_import("apic_timer");
-  if (false) {
+  if (DEBUG) {
     this.jit_force_generate_unsafe = get_optional_import("jit_force_generate_unsafe");
   }
   this.jit_clear_cache = get_import("jit_clear_cache_js");
@@ -19387,7 +19391,6 @@ CPU.prototype.pack_memory = function() {
   return { bitmap, packed_memory };
 };
 CPU.prototype.unpack_memory = function(bitmap, packed_memory) {
-  this.zero_memory(0, this.memory_size[0]);
   const page_count = this.memory_size[0] >> 12;
   let packed_page = 0;
   for (let page = 0; page < page_count; page++) {
@@ -19580,7 +19583,7 @@ CPU.prototype.init = function(settings, device_bus) {
       this.fw_value = i32(0);
     }
   });
-  if (false) {
+  if (DEBUG) {
     io.register_write(128, this, function(out_byte) {
     });
     io.register_read(128, this, function() {
@@ -19971,7 +19974,7 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
   len >>>= 0;
   dbg_assert(wasm_table_index >= 0 && wasm_table_index < WASM_TABLE_SIZE);
   const code = new Uint8Array(this.wasm_memory.buffer, ptr, len);
-  if (false) {
+  if (DEBUG) {
     if (DUMP_GENERATED_WASM && !this.seen_code[start]) {
       this.dump_wasm(code);
       const DUMP_ASSEMBLY = false;
@@ -20014,7 +20017,7 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
       this.test_hook_did_finalize_wasm(code);
     }
   });
-  if (false) {
+  if (DEBUG) {
     result.catch((e) => {
       console.log(e);
       debugger;
@@ -20023,7 +20026,7 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
   }
 };
 CPU.prototype.log_uncompiled_code = function(start, end) {
-  if (true) {
+  if (!DEBUG || !DUMP_UNCOMPILED_ASSEMBLY) {
     return;
   }
   if ((this.seen_code_uncompiled[start] || 0) < 100) {
@@ -20044,7 +20047,7 @@ CPU.prototype.log_uncompiled_code = function(start, end) {
   }
 };
 CPU.prototype.dump_function_code = function(block_ptr, count) {
-  if (true) {
+  if (!DEBUG || !DUMP_GENERATED_WASM) {
     return;
   }
   const SIZEOF_BASIC_BLOCK_IN_DWORDS = 7;
@@ -20084,7 +20087,7 @@ CPU.prototype.run_hardware_timers = function(acpi_enabled, now) {
   return Math.min(pit_time, rtc_time, acpi_time, apic_time);
 };
 CPU.prototype.debug_init = function() {
-  if (true) return;
+  if (!DEBUG) return;
   if (this.io) {
     var seabios_debug = "";
     this.io.register_write(1026, this, handle);
@@ -20100,7 +20103,7 @@ CPU.prototype.debug_init = function() {
   }
 };
 CPU.prototype.dump_stack = function(start, end) {
-  if (true) return;
+  if (!DEBUG) return;
   var esp = this.reg32[REG_ESP];
   dbg_log("========= STACK ==========");
   if (end >= start || end === void 0) {
@@ -20115,7 +20118,7 @@ CPU.prototype.dump_stack = function(start, end) {
   }
 };
 CPU.prototype.debug_get_state = function(where) {
-  if (true) return;
+  if (!DEBUG) return;
   var mode = this.protected_mode[0] ? "prot" : "real";
   var vm = this.flags[0] & FLAG_VM ? 1 : 0;
   var flags = this.get_eflags();
@@ -20149,11 +20152,11 @@ CPU.prototype.debug_get_state = function(where) {
   return "mode=" + mode + "/" + op_size + " paging=" + +((this.cr[0] & CR0_PG) !== 0) + " pae=" + +((this.cr[4] & CR4_PAE) !== 0) + " iopl=" + iopl + " cpl=" + cpl + " if=" + if_ + " cs:eip=" + cs_eip + " cs_off=" + h(this.get_seg_cs() >>> 0, 8) + " flgs=" + h(this.get_eflags() >>> 0, 6) + " (" + flag_string + ") ss:esp=" + ss_esp + " ssize=" + +this.stack_size_32[0] + (where ? " in " + where : "");
 };
 CPU.prototype.dump_state = function(where) {
-  if (true) return;
+  if (!DEBUG) return;
   dbg_log(this.debug_get_state(where), LOG_CPU);
 };
 CPU.prototype.get_regs_short = function() {
-  if (true) return;
+  if (!DEBUG) return;
   var r32 = {
     "eax": REG_EAX,
     "ecx": REG_ECX,
@@ -20173,13 +20176,13 @@ CPU.prototype.get_regs_short = function() {
   return [line1, line2];
 };
 CPU.prototype.dump_regs_short = function() {
-  if (true) return;
+  if (!DEBUG) return;
   var lines = this.get_regs_short();
   dbg_log(lines[0], LOG_CPU);
   dbg_log(lines[1], LOG_CPU);
 };
 CPU.prototype.dump_gdt_ldt = function() {
-  if (true) return;
+  if (!DEBUG) return;
   dbg_log("gdt: (len = " + h(this.gdtr_size[0]) + ")");
   dump_table(this.translate_address_system_read(this.gdtr_offset[0]), this.gdtr_size[0]);
   dbg_log("\nldt: (len = " + h(this.segment_limits[REG_LDTR]) + ")");
@@ -20218,7 +20221,7 @@ CPU.prototype.dump_gdt_ldt = function() {
   }
 };
 CPU.prototype.dump_idt = function() {
-  if (true) return;
+  if (!DEBUG) return;
   for (var i = 0; i < this.idtr_size[0]; i += 8) {
     var addr = this.translate_address_system_read(this.idtr_offset[0] + i), base = this.read16(addr) | this.read16(addr + 6) << 16, selector = this.read16(addr + 2), type = this.read8(addr + 5), line, dpl = type >> 5 & 3;
     if ((type & 31) === 5) {
@@ -20255,9 +20258,9 @@ CPU.prototype.dump_page_structures = function() {
   }
 };
 CPU.prototype.dump_page_directory = function(pd_addr, pae, start) {
-  if (true) return;
+  if (!DEBUG) return;
   function load_page_entry(dword_entry, pae2, is_directory) {
-    if (true) return;
+    if (!DEBUG) return;
     if (!(dword_entry & 1)) {
       return false;
     }
@@ -20316,7 +20319,7 @@ CPU.prototype.dump_page_directory = function(pd_addr, pae, start) {
   }
 };
 CPU.prototype.get_memory_dump = function(start, count) {
-  if (true) return;
+  if (!DEBUG) return;
   if (start === void 0) {
     start = 0;
     count = this.memory_size[0];
@@ -20327,7 +20330,7 @@ CPU.prototype.get_memory_dump = function(start, count) {
   return this.mem8.slice(start, start + count).buffer;
 };
 CPU.prototype.memory_hex_dump = function(addr, length) {
-  if (true) return;
+  if (!DEBUG) return;
   length = length || 4 * 16;
   var line, byt;
   for (var i = 0; i < length >> 4; i++) {
@@ -20345,7 +20348,7 @@ CPU.prototype.memory_hex_dump = function(addr, length) {
   }
 };
 CPU.prototype.used_memory_dump = function() {
-  if (true) return;
+  if (!DEBUG) return;
   var width = 128, height = 16, block_size = this.memory_size[0] / width / height | 0, row;
   for (var i = 0; i < height; i++) {
     row = h(i * width * block_size, 8) + " | ";
@@ -20359,7 +20362,7 @@ CPU.prototype.used_memory_dump = function() {
 CPU.prototype.debug_interrupt = function(interrupt_nr) {
 };
 CPU.prototype.debug_dump_code = function(is_32, buffer, start) {
-  if (true) return;
+  if (!DEBUG) return;
   if (!this.capstone_decoder) {
     let cs = window.cs;
     if (typeof __require === "function") {
@@ -20388,7 +20391,7 @@ CPU.prototype.debug_dump_code = function(is_32, buffer, start) {
   }
 };
 CPU.prototype.dump_wasm = function(buffer) {
-  if (true) return;
+  if (!DEBUG) return;
   if (this.wabt === void 0) {
     if (typeof __require === "function") {
       this.wabt = __require("./libwabt.cjs");
@@ -20471,7 +20474,7 @@ function save_object(obj, saved_buffers) {
       "buffer_id": saved_buffers.push(buffer) - 1
     };
   }
-  if (false) {
+  if (DEBUG && !obj.get_state) {
     console.log("Object without get_state: ", obj);
   }
   var state = obj.get_state();
@@ -21287,7 +21290,7 @@ function SpeakerWorkletDAC(bus, audio_context, mixer) {
       return item;
     };
     DACProcessor.prototype.dbg_log = function(message) {
-      if (false) {
+      if (DEBUG) {
         this.port.postMessage(
           {
             type: "debug-log",
@@ -21302,7 +21305,7 @@ function SpeakerWorkletDAC(bus, audio_context, mixer) {
   var worklet_code_start = worklet_string.indexOf("{") + 1;
   var worklet_code_end = worklet_string.lastIndexOf("}");
   var worklet_code = worklet_string.substring(worklet_code_start, worklet_code_end);
-  if (false) {
+  if (DEBUG) {
     worklet_code = "var DEBUG = true;\n" + worklet_code;
   }
   var worklet_blob = new Blob([worklet_code], { type: "application/javascript" });
@@ -21364,7 +21367,7 @@ function SpeakerWorkletDAC(bus, audio_context, mixer) {
       }
     );
   }, this);
-  if (false) {
+  if (DEBUG) {
     this.debugger = new SpeakerDACDebugger(this.audio_context, this.node_output);
   }
 }
@@ -21372,7 +21375,7 @@ SpeakerWorkletDAC.prototype.queue = function(data) {
   if (!this.node_processor) {
     return;
   }
-  if (false) {
+  if (DEBUG) {
     this.debugger.push_queued_data(data);
   }
   this.node_processor.port.postMessage(
@@ -21417,12 +21420,12 @@ function SpeakerBufferSourceDAC(bus, audio_context, mixer) {
     this.rate_ratio = Math.ceil(AUDIOBUFFER_MINIMUM_SAMPLING_RATE / rate);
     this.node_lowpass.frequency.setValueAtTime(rate / 2, this.audio_context.currentTime);
   }, this);
-  if (false) {
+  if (DEBUG) {
     this.debugger = new SpeakerDACDebugger(this.audio_context, this.node_output);
   }
 }
 SpeakerBufferSourceDAC.prototype.queue = function(data) {
-  if (false) {
+  if (DEBUG) {
     this.debugger.push_queued_data(data);
   }
   var sample_count = data[0].length;
@@ -24216,9 +24219,10 @@ function V86(options) {
     },
     // Demand-paging hook: called from do_page_walk when GPA >= PAGED_THRESHOLD.
     // Delegates to cpu._swap_page_in_hook (set by do86/linux-vm.ts after emulator-loaded).
+    // for_writing: non-zero when the TLB entry is for a write — page store marks it dirty.
     // Returns the WASM byte offset of the hot frame, or -1 if paging is not enabled.
-    "swap_page_in": function(gpa) {
-      return cpu.swap_page_in(gpa);
+    "swap_page_in": function(gpa, for_writing) {
+      return cpu.swap_page_in(gpa, for_writing);
     },
     "log_from_wasm": function(offset, len) {
       const str = read_sized_string_from_mem(wasm_memory, offset, len);
@@ -24242,7 +24246,7 @@ function V86(options) {
   if (!wasm_fn) {
     wasm_fn = (env) => {
       return new Promise((resolve) => {
-        let v86_bin = false ? "v86-debug.wasm" : "v86.wasm";
+        let v86_bin = DEBUG ? "v86-debug.wasm" : "v86.wasm";
         let v86_bin_fallback = "v86-fallback.wasm";
         if (options.wasm_path) {
           v86_bin = options.wasm_path;
