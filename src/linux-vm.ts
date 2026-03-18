@@ -608,6 +608,13 @@ export class LinuxVM extends DurableObject<Env> {
         // cpu_count: stratum WASM supports SMP via smp_init().
         // VM_CONFIG.CPU_COUNT = 2 (BSP + 1 AP) is conservative for the DO budget.
         cpu_count: VM_CONFIG.CPU_COUNT,
+        // Networking: NE2K hardware is always created by v86 (settings.net_device
+        // defaults to { type: "ne2k" }).  We intentionally do NOT set
+        // network_relay_url — there is no relay, so transmitted packets vanish.
+        // KolibriOS will spin on DHCP retries until it times out (~30-60s).
+        // This is a guest-side delay we can't fix without modifying the disk image
+        // or adding a network relay.  DO NOT set net_device: { type: "none" } —
+        // that breaks PCI init and snapshot compatibility.
       };
 
       if (drive === "fda") v86Config.fda = { buffer: disk };
@@ -783,9 +790,15 @@ export class LinuxVM extends DurableObject<Env> {
         if (!this.noSnapshot) {
           this.inputGated = true;
           const delayMs = imageKey === "kolibri" ? SNAPSHOT_DELAY_FAST_MS : SNAPSHOT_DELAY_SLOW_MS;
-          console.log(`${LOG_PREFIX} Input gated — snapshot will capture clean boot state in ${delayMs / 1000}s`);
+          console.log(`${LOG_PREFIX} Input gated — will ungate in 3s (snapshot in ${delayMs / 1000}s)`);
           this.broadcast(encodeStatus(`running: ${label}`));
           this.scheduleSnapshot(label, delayMs);
+          // Ungate input after 3s regardless of snapshot timing.
+          // The snapshot still fires at delayMs to capture fully-booted state,
+          // but we don't block user input for the entire wait.  The snapshot
+          // captures whatever state the OS is in — user input during the
+          // window between ungate and snapshot is acceptable.
+          setTimeout(() => this.ungateInput("3s timeout"), 3000);
         } else {
           this.inputGated = false;
           console.log(`${LOG_PREFIX} Snapshot saving disabled for ${imageKey} (noSnapshot)`);
