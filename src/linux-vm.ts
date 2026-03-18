@@ -608,11 +608,13 @@ export class LinuxVM extends DurableObject<Env> {
         // cpu_count: stratum WASM supports SMP via smp_init().
         // VM_CONFIG.CPU_COUNT = 2 (BSP + 1 AP) is conservative for the DO budget.
         cpu_count: VM_CONFIG.CPU_COUNT,
-        // Networking: type "none" skips NE2K/virtio PCI device registration
-        // entirely — guest OS sees no NIC, so no DHCP retries or network spin.
-        // Saves ~30-60s of wasted CPU on KolibriOS boot.
-        // Stratum fork supports "none" in cpu.js create_devices().
-        net_device: { type: "none" },
+        // Networking: NE2K is always created (default).  We don't set
+        // network_relay_url — no relay exists, so TX packets vanish and
+        // KolibriOS spins on DHCP retries until timeout (~30-60s).
+        // net_device "none" was tried but breaks KolibriOS boot — the OS
+        // depends on the NE2K PCI slot being present during hardware init
+        // and hangs in text mode without it.  Stratum supports "none" in
+        // cpu.js for other images that don't need NIC hardware.
       };
 
       if (drive === "fda") v86Config.fda = { buffer: disk };
