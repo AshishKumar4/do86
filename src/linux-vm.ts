@@ -325,6 +325,21 @@ export class LinuxVM extends DurableObject<Env> {
 
   // ── Stats collection ──────────────────────────────────────────────────
 
+  
+  private getJitBlockCount(): number {
+    try {
+      const cpu = (this.emulator as any)?.cpu;
+      if (!cpu?.wm?.wasm_table) return -1;
+      const table = cpu.wm.wasm_table;
+      const offset = cpu.wm.exports?.WASM_TABLE_OFFSET ?? 0;
+      let count = 0;
+      for (let i = 0; i < 900; i++) {
+        if (table.get(i + offset) !== null) count++;
+      }
+      return count;
+    } catch { return -1; }
+  }
+
   private collectStats(): Record<string, unknown> {
     const now = performance.now();
     const uptimeMs = this._perf.bootTimeMs > 0
@@ -360,6 +375,8 @@ export class LinuxVM extends DurableObject<Env> {
       effectiveFps:  uptimeMs > 0 ? +(p.framesSent / (uptimeMs / 1000)).toFixed(1) : 0,
       // Page store
       pageStore:   ps,
+      // JIT
+      jitBlocks:   this.getJitBlockCount(),
     };
   }
 
