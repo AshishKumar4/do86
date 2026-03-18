@@ -1,6 +1,7 @@
 export { LinuxVM } from "./linux-vm";
 export { CoordinatorDO } from "./coordinator-do";
 export { CpuCoreDO } from "./core-do";
+export { QemuCpuCoreDO } from "./qemu-core-do";
 
 export interface Env {
   LINUX_VM: DurableObjectNamespace;
@@ -144,8 +145,6 @@ export default {
         const { running } = await statusResp.json<{ running: boolean }>();
 
         if (!running) {
-          // BIOS/WASM binaries are fetched by CpuCoreDO from R2 — no need
-          // to send them from the Worker. Only metadata + disk go here.
           const meta: Record<string, any> = {
             imageKey,
             drive: imageDef.drive,
@@ -153,10 +152,16 @@ export default {
             vgaMemory: imageDef.vgaMemory,
             label: imageDef.label,
             noSnapshot: true, // No snapshots for SMP (yet)
-            numCores: 2, // Phase 3: distributed SMP (BSP + 1 AP)
+            numCores: 2, // distributed SMP (BSP + 1 AP)
           };
 
-          const assets: Record<string, ArrayBuffer> = {};
+          // v86 cores need BIOS ROMs — fetch alongside disk
+          const [bios, vgaBios] = await Promise.all([
+            getAsset(env, "/assets/seabios.bin", request.url),
+            getAsset(env, "/assets/vgabios.bin", request.url),
+          ]);
+
+          const assets: Record<string, ArrayBuffer> = { bios, vgaBios };
 
           // Get disk image — try local ASSETS first, fall back to remote URL
           try {

@@ -5,25 +5,13 @@
  * - Accepts browser WebSocket connections (screen, keyboard, mouse)
  * - Manages per-core CpuCoreDO instances via RPC
  * - Holds the canonical page directory for memory coherence
- * - Routes inter-processor interrupts between cores via QEMU APIC bridge
+ * - Routes inter-processor interrupts between cores via APIC emulation
  * - Hosts the IOAPIC for external interrupt routing
  * - Forwards BSP screen frames to browser clients
  *
- * QEMU migration notes:
- *   - IPI routing uses the same IPIRouter / decodeICR infrastructure.
- *     The difference is that CpuCoreDO now uses QEMUWrapper's bridge
- *     exports (wasm_apic_inject_irq, wasm_apic_read_icr) instead of
- *     direct WASM memory reads at v86 APIC struct offsets.
- *   - The ICR-write-callback approach (Module.onICRWrite via EM_ASM
- *     in patched apic_mem_write) means IPIs are push-based from cores
- *     rather than poll-based. The coordinator's routeIPI() RPC entry
- *     point is unchanged.
- *   - AP boot uses wasm_cpu_set_sipi_vector + wasm_cpu_resume instead
- *     of manual register patching. The coordinator still orchestrates
- *     the INIT→SIPI sequence via IPIRouter callbacks.
- *   - Display frames use the same 12-byte header format:
- *     [width:u32, height:u32, bufferWidth:u32, rgba...]
- *     QEMU's BGRA→RGBA conversion happens in QEMUWrapper.getScreenFrame().
+ * Backend-agnostic: the coordinator communicates with cores via a typed RPC
+ * interface (CoreStubRPC). Currently backed by v86-based CpuCoreDO; a future
+ * QEMU backend (QemuCpuCoreDO) implements the same interface.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -55,6 +43,8 @@ interface CoreStubRPC {
     isBSP: boolean;
     memorySizeBytes: number;
     vgaMemorySizeBytes: number;
+    bios?: ArrayBuffer;
+    vgaBios?: ArrayBuffer;
     disk?: ArrayBuffer;
     diskDrive?: "fda" | "cdrom";
   }, coordinatorId: string): Promise<{ status: string }>;
@@ -64,6 +54,8 @@ interface CoreStubRPC {
   startupIPI(vector: number, memoryConfig: {
     memorySizeBytes: number;
     vgaMemorySizeBytes: number;
+    bios: ArrayBuffer;
+    vgaBios: ArrayBuffer;
   }, trampolinePages: Map<number, ArrayBuffer>): Promise<void>;
   injectInterrupt(ipi: IPIMessage): Promise<void>;
   invalidatePage(physAddr: number): Promise<void>;
@@ -83,8 +75,8 @@ interface CoreStubRPC {
     state: string;
     isBSP: boolean;
     pageStats: Record<string, number> | null;
-    ramStats: Record<string, number> | null;
-    cpuHalted: boolean;
+    ramStats?: Record<string, number> | null;
+    cpuHalted?: boolean;
   }>;
 }
 
@@ -131,6 +123,10 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   // ── Memory config (needed for AP core creation after boot) ──────────
   private memorySizeBytes: number = 0;
   private vgaMemorySizeBytes: number = 0;
+
+  // ── BIOS blobs (cached for AP creation — v86 cores need them) ──────
+  private biosBlob: ArrayBuffer | null = null;
+  private vgaBiosBlob: ArrayBuffer | null = null;
 
   constructor(ctx: DurableObjectState, env: CoordinatorEnv) {
     super(ctx, env);
@@ -211,7 +207,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     if (!this.cachedAssets) throw new Error("No assets loaded");
     this.booting = true;
     this.bootError = null;
-    this.broadcast(encodeStatus("booting: distributed SMP (QEMU)"));
+    this.broadcast(encodeStatus("booting: distributed SMP (v86)"));
 
     try {
       // Parse metadata
@@ -231,6 +227,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         diskUrl = meta.diskUrl || null;
         diskFile = meta.diskFile || null;
       }
+
+      // Extract BIOS blobs (v86 cores need them for emulator creation)
+      const bios = this.cachedAssets.get("bios");
+      const vgaBios = this.cachedAssets.get("vgaBios");
+      if (!bios || !vgaBios) throw new Error("BIOS blobs missing from asset pack");
+      this.biosBlob = bios;
+      this.vgaBiosBlob = vgaBios;
 
       // Resolve disk image — may need to be fetched from URL
       let disk = this.cachedAssets.get("disk") || null;
@@ -253,7 +256,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       // Initialize memory coherence
       this.pageDir = new PageDirectory(memoryBytes);
 
-      // Initialize IPI routing with QEMU APIC bridge callbacks
+      // Initialize IPI routing
       this.ipiRouter = new IPIRouter(async (targetApicId, ipi) => {
         await this.deliverIPIToCore(targetApicId, ipi);
       });
@@ -261,8 +264,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       // ── INIT callback: create AP core DO ────────────────────────────
       this.ipiRouter.onCoreCreate = async (apicId) => {
         await this.createCore(apicId, false);
-        // Initialize the AP core — it creates its SqlPageStore and waits for SIPI.
-        // BIOS/WASM binaries are fetched by the core DO itself from R2.
+        // Initialize the AP core — waits for SIPI before creating its emulator.
         const stub = this.coreStubs.get(apicId);
         if (stub) {
           const coordId = this.ctx.id.toString();
@@ -278,16 +280,15 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         }
       };
 
-      // ── SIPI callback: copy trampoline pages, start AP ──────────────
-      // With QEMU, the AP's QEMUWrapper.handleSIPI() calls
-      // wasm_cpu_set_sipi_vector + wasm_cpu_resume, which sets CS:IP to
-      // real mode at vector:0000 and unpauses the vCPU. The trampoline
-      // pages are written to WASM memory before SIPI is delivered.
+      // ── SIPI callback: copy trampoline pages from BSP, start AP ─────
+      // The AP's v86 instance boots from BIOS, gets stopped, then has its
+      // memory patched with trampoline pages and registers set to 16-bit
+      // real mode at CS:IP = vector:0000. Then execution resumes.
       this.ipiRouter.onCoreSIPI = async (apicId, vector) => {
         const stub = this.coreStubs.get(apicId);
         if (!stub) return;
 
-        // Fetch trampoline pages from BSP's QEMU WASM memory
+        // Fetch trampoline pages from BSP's WASM linear memory
         const bsp = this.coreStubs.get(0);
         const trampolinePages = new Map<number, ArrayBuffer>();
 
@@ -316,12 +317,12 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
           );
         }
 
-        // Deliver SIPI to the AP core — QEMUWrapper.handleSIPI() sets
-        // the SIPI vector via wasm_cpu_set_sipi_vector and resumes.
-        // BIOS/WASM binaries are fetched by the core DO itself from R2.
+        // Deliver SIPI to the AP core with BIOS blobs + trampoline pages
         await coreRPC(stub).startupIPI(vector, {
           memorySizeBytes: this.memorySizeBytes,
           vgaMemorySizeBytes: this.vgaMemorySizeBytes,
+          bios: this.biosBlob!,
+          vgaBios: this.vgaBiosBlob!,
         }, trampolinePages);
       };
 
@@ -334,11 +335,10 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       this.pageDir.assignAllToCore(0);
 
       // Create and boot BSP (Core 0)
-      console.log(`${LOG_PREFIX} Creating BSP (Core 0) with QEMU`);
+      console.log(`${LOG_PREFIX} Creating BSP (Core 0) with v86`);
       await this.createCore(0, true);
 
-      // Initialize BSP with boot config (disk image).
-      // BIOS/WASM binaries are fetched by the core DO itself from R2.
+      // Initialize BSP with boot config (BIOS + disk)
       const bspStub = this.coreStubs.get(0);
       if (!bspStub) throw new Error("Failed to create BSP");
 
@@ -349,27 +349,28 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
           isBSP: true,
           memorySizeBytes: memoryBytes,
           vgaMemorySizeBytes: vgaMemoryBytes,
+          bios: bios,
+          vgaBios: vgaBios,
           disk: disk,
           diskDrive: diskDrive,
         },
         coordId,
       );
 
-      // Start BSP execution — QEMU's emscripten_set_main_loop is already
-      // registered; this just sets the core state to RUNNING.
+      // Start BSP execution
       await coreRPC(bspStub).start();
       this.ipiRouter.registerCore(0);
 
-      // Free cached assets
+      // Free cached assets (BIOS blobs kept in biosBlob/vgaBiosBlob for AP creation)
       this.cachedAssets = null;
 
       this.booted = true;
       this.booting = false;
-      this.broadcast(encodeStatus(`running: distributed SMP QEMU (${this.numCores} cores)`));
+      this.broadcast(encodeStatus(`running: distributed SMP v86 (${this.numCores} cores)`));
       this.startRenderLoop();
 
       console.log(
-        `${LOG_PREFIX} Distributed SMP VM booted (QEMU): ${this.vmId} ` +
+        `${LOG_PREFIX} Distributed SMP VM booted (v86): ${this.vmId} ` +
         `(${this.numCores} cores, ${memorySizeMB}MB RAM)`,
       );
     } catch (err) {
@@ -398,16 +399,16 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     state: string;
     isBSP: boolean;
     pageStats: Record<string, number> | null;
-    ramStats: Record<string, number> | null;
-    cpuHalted: boolean;
+    ramStats?: Record<string, number> | null;
+    cpuHalted?: boolean;
   } | { apicId: number; state: string; error: string }>> {
     const statuses: Array<{
       apicId: number;
       state: string;
       isBSP: boolean;
       pageStats: Record<string, number> | null;
-      ramStats: Record<string, number> | null;
-      cpuHalted: boolean;
+      ramStats?: Record<string, number> | null;
+      cpuHalted?: boolean;
     } | { apicId: number; state: string; error: string }> = [];
     for (const [apicId, stub] of this.coreStubs) {
       try {
@@ -420,17 +421,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     return statuses;
   }
 
-  // ── IPI delivery (QEMU APIC bridge) ───────────────────────────────────
-  // The IPI routing protocol is identical to the v86 version.
-  // The difference is in how the target core handles it:
-  //   v86:  Direct write to APIC IRR bits in WASM linear memory
-  //   QEMU: CpuCoreDO.injectInterrupt() → wasm_apic_inject_irq()
+  // ── IPI delivery ────────────────────────────────────────────────────
+  // Cores call routeIPI() via RPC when the guest writes to LAPIC ICR.
+  // The coordinator routes the IPI to the target core(s).
 
   /**
    * Called by cores via RPC when the guest writes to LAPIC ICR.
-   * This is the push-based path — QEMU's patched apic_mem_write calls
-   * Module.onICRWrite via EM_ASM, which fires onIPISend in QEMUWrapper,
-   * which calls this RPC method on the coordinator.
+   * Routes the IPI to the target core based on destination and mode.
    */
   async routeIPI(ipi: IPIMessage): Promise<void> {
     if (!this.ipiRouter) return;
@@ -438,10 +435,10 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   /**
-   * Deliver an IPI to a target core via the QEMU APIC bridge.
+   * Deliver an IPI to a target core.
    *
-   * For FIXED/LOWEST_PRIORITY: calls injectInterrupt → wasm_apic_inject_irq
-   * For INIT: calls initReset → wasm_cpu_halt
+   * For FIXED/LOWEST_PRIORITY: calls injectInterrupt (writes to APIC IRR)
+   * For INIT: calls initReset (halts the core, waits for SIPI)
    * For SIPI: handled by IPIRouter.onCoreSIPI → startupIPI
    */
   private async deliverIPIToCore(targetApicId: number, ipi: IPIMessage): Promise<void> {
@@ -458,7 +455,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         return;
       }
 
-      // Standard IPI: inject into LAPIC via QEMU bridge
+      // Standard IPI: inject into target core's LAPIC
       await coreRPC(stub).injectInterrupt(ipi);
     } catch (e) {
       console.error(`${LOG_PREFIX} IPI delivery to core ${targetApicId} failed:`, e);
@@ -564,9 +561,8 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   /**
-   * Render a graphical frame from the BSP's QEMU display.
-   * QEMUWrapper.getScreenFrame() returns RGBA data in the same format
-   * as the previous v86 implementation: [width:u32, height:u32, bufferWidth:u32, rgba...]
+   * Render a graphical frame from the BSP's display.
+   * Frame format: [width:u32, height:u32, bufferWidth:u32, rgba...]
    */
   private async renderGraphicalFrame(bsp: DurableObjectStub): Promise<void> {
     const frameData = await coreRPC(bsp).getScreenFrame();
@@ -613,8 +609,6 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
   /**
    * Render text mode content from BSP.
-   * QEMU's text output goes through serial (stdio), so this may return
-   * null. In that case, text content is delivered via serial data messages.
    */
   private async renderTextFrame(bsp: DurableObjectStub): Promise<void> {
     const textData = await coreRPC(bsp).getTextScreen();
@@ -669,7 +663,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
           if (msg.codes) await coreRPC(bsp).sendScancodes(msg.codes as number[]);
           break;
         case "serial":
-          // TODO: serial input forwarding via QEMU bridge
+          // TODO: serial input forwarding to BSP
           break;
       }
     } catch { /* Never throw from WS handler */ }
