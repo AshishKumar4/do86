@@ -187,6 +187,7 @@ export class LinuxVM extends DurableObject<Env> {
   };
   private _pageStore: SqlPageStore | null = null;
   private _statsInterval: ReturnType<typeof setInterval> | null = null;
+  private _yieldDead = false;
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
@@ -374,6 +375,8 @@ export class LinuxVM extends DurableObject<Env> {
       pixelsOk:       p.pixelsOk,
       deltaNull:      p.deltaNull,
       svgaDirtyPages: p.svgaDirtyPages,
+      // Yield health
+      yieldDead:     this._yieldDead,
       // Adaptive FPS
       adaptiveSkips: this._adaptiveSkips,
       cleanTicks:    this._cleanTicks,
@@ -739,21 +742,31 @@ export class LinuxVM extends DurableObject<Env> {
           if (v86Internal) {
             let yieldCount = 0;
             v86Internal.yield = (t: number, tick: number) => {
+              if (this._yieldDead) return;
               yieldCount++;
               this._perf.yields++;
               if (yieldCount % BATCH_SIZE !== 0) {
                 // Synchronous fast path: no event loop round-trip, no setTimeout cost.
                 this._perf.syncYields++;
-                v86Internal.yield_callback(tick);
+                try {
+                  v86Internal.yield_callback(tick);
+                } catch (e) {
+                  console.error(`${LOG_PREFIX} FATAL: sync yield_callback threw:`, e);
+                  this._yieldDead = true;
+                }
                 return;
               }
-              // Async yield: break to event loop. NO rendering here —
-              // rendering is on its own fixed-cadence setInterval (see startRenderLoop).
-              // This keeps yield throughput high and rendering decoupled.
+              // Async yield: break to event loop.
               if (t > 10) {
-                setTimeout(() => v86Internal.yield_callback(tick), Math.min(t, 40));
+                setTimeout(() => {
+                  try { v86Internal.yield_callback(tick); }
+                  catch (e) { console.error(`${LOG_PREFIX} FATAL: async yield_callback threw:`, e); this._yieldDead = true; }
+                }, Math.min(t, 40));
               } else {
-                setTimeout(() => v86Internal.yield_callback(tick), 1);
+                setTimeout(() => {
+                  try { v86Internal.yield_callback(tick); }
+                  catch (e) { console.error(`${LOG_PREFIX} FATAL: async yield_callback threw:`, e); this._yieldDead = true; }
+                }, 1);
               }
             };
           }
