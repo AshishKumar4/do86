@@ -34,6 +34,8 @@ export class LinuxVM extends DurableObject<unknown> {
 
   // ── Rendering state ─────────────────────────────────────────────────────
   private renderInterval: ReturnType<typeof setInterval> | null = null;
+  private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+  private lastSendTime = 0;
   private lastTextContent = "";
   private deltaEncoder = new DeltaEncoder();
   private currentFPS = FPS_DEFAULT;
@@ -603,11 +605,22 @@ export class LinuxVM extends DurableObject<unknown> {
   }
 
   private startRenderLoop(): void {
-    // No-op: rendering is driven by the yield override (every 32nd yield and
-    // on idle). Any previously-running interval is cleaned up if present.
+    // No-op for frame rendering: driven by yield override (every BATCH_SIZE-th
+    // yield and on idle). Clean up any legacy interval if present.
     if (this.renderInterval) {
       clearInterval(this.renderInterval);
       this.renderInterval = null;
+    }
+
+    // Server-side keepalive: when the screen is static (no frame deltas),
+    // nothing is sent server→client. Cloudflare or the browser may close
+    // idle WebSockets. Send a lightweight status ping every 15s of silence.
+    if (!this.keepaliveInterval) {
+      this.keepaliveInterval = setInterval(() => {
+        if (this.sessions.size > 0 && Date.now() - this.lastSendTime > 14_000) {
+          this.broadcast(encodeStatus("alive"));
+        }
+      }, 15_000);
     }
   }
 
@@ -653,17 +666,17 @@ export class LinuxVM extends DurableObject<unknown> {
       return null;
     }
 
-    // Fix detached buffer — see comment above
+    // Ensure image_data exists and points at current WASM memory.
+    // In headless mode (no browser canvas), v86 may never create image_data.
+    // When WASM memory grows, the old ArrayBuffer is detached and v86 doesn't
+    // recreate it (workerd may report stale byteLength). Handle both cases.
     const wasmBuf = cpu.wasm_memory.buffer;
-    if (vga.image_data?.data) {
-      const backingBuffer = vga.image_data.data.buffer;
-      if (backingBuffer !== wasmBuf) {
-        const virtualHeight = vga.virtual_height || height;
-        const pixelCount = bufferWidth * virtualHeight;
-        const freshData = new Uint8ClampedArray(wasmBuf, offset, 4 * pixelCount);
-        vga.image_data = new ImageData(freshData, bufferWidth, virtualHeight);
-        vga.update_layers();
-      }
+    const virtualHeight = vga.virtual_height || height;
+    const pixelCount = bufferWidth * virtualHeight;
+    if (!vga.image_data?.data || vga.image_data.data.buffer !== wasmBuf) {
+      const freshData = new Uint8ClampedArray(wasmBuf, offset, 4 * pixelCount);
+      vga.image_data = new ImageData(freshData, bufferWidth, virtualHeight);
+      vga.update_layers();
     }
 
     // Skip rendering when the screen hasn't changed.
@@ -953,9 +966,9 @@ export class LinuxVM extends DurableObject<unknown> {
     try { ws.close(code, reason); }
     catch { /* already closed */ }
 
-    if (this.sessions.size === 0 && this.renderInterval) {
-      clearInterval(this.renderInterval);
-      this.renderInterval = null;
+    if (this.sessions.size === 0) {
+      if (this.renderInterval) { clearInterval(this.renderInterval); this.renderInterval = null; }
+      if (this.keepaliveInterval) { clearInterval(this.keepaliveInterval); this.keepaliveInterval = null; }
     }
   }
 
@@ -994,5 +1007,6 @@ export class LinuxVM extends DurableObject<unknown> {
       catch { dead.push(ws); /* client disconnected */ }
     }
     for (const ws of dead) this.sessions.delete(ws);
+    if (this.sessions.size > 0) this.lastSendTime = Date.now();
   }
 }

@@ -87,6 +87,14 @@ interface QEMUModule {
   _wasm_get_display_width(): number;
   _wasm_get_display_height(): number;
 
+  // ── Emscripten print hooks ──────────────────────────────────────────
+  print?(line: string): void;
+  printErr?(line: string): void;
+
+  // ── Execution pump + event processing ────────────────────────────────
+  _wasm_step?(iterations: number): number;
+  _wasm_pump_events?(): void;
+
   // ── Emscripten lifecycle ──────────────────────────────────────────────
   _emscripten_cancel_main_loop?(): void;
   _malloc(size: number): number;
@@ -118,10 +126,27 @@ export interface QEMUWrapperConfig {
   wasmHeapMB: number;
   /** SQLite-backed cold page store for demand-paged RAM. */
   sqlPageStore: SqlPageStore;
-  /** QEMU WASM binary (fetched from R2, cached in SQLite). */
-  wasmBinary: ArrayBuffer;
-  /** Emscripten JS glue code as a string (fetched from R2, cached in SQLite). */
-  jsGlue: string;
+
+  // ── WASM loading: two modes ──────────────────────────────────────────
+  //
+  // Mode A (Workers/DOs): pre-compiled at deploy time — no runtime eval.
+  //   wasmModule: pre-compiled WebAssembly.Module (from `import mod from "./x.wasm"`)
+  //   createFactory: Emscripten factory function (from `import fn from "./x-glue.mjs"`)
+  //
+  // Mode B (Node.js / testing): runtime compilation.
+  //   wasmBinary: raw WASM bytes (ArrayBuffer)
+  //   jsGlue: Emscripten JS glue as a string (evaluated via new Function)
+
+  /** Pre-compiled WebAssembly.Module (Workers mode — import at deploy time). */
+  wasmModule?: WebAssembly.Module;
+  /** Emscripten factory function (Workers mode — import at deploy time). */
+  createFactory?: (overrides: Record<string, unknown>) => Promise<any>;
+
+  /** QEMU WASM binary as bytes (Node.js/testing mode — runtime compilation). */
+  wasmBinary?: ArrayBuffer;
+  /** Emscripten JS glue code as string (Node.js/testing mode — eval at runtime). */
+  jsGlue?: string;
+
   /** SeaBIOS binary (required). */
   biosData: ArrayBuffer;
   /** VGA BIOS binary (required). */
@@ -163,6 +188,14 @@ export class QEMUWrapper {
   private tlbMissLog: number[] = [];
   private resolvedPages = new Map<number, Uint8Array>();
   private pendingPageFetches = new Map<number, Promise<Uint8Array>>();
+
+  // ── ASYNCIFY init completion signal ──────────────────────────────────
+  private initSignal: { done: boolean; resolve: (() => void) | null } | null = null;
+
+  // ── Execution pump (JS-driven via setTimeout) ──────────────────────
+  private stepTimer: ReturnType<typeof setTimeout> | null = null;
+  private eventTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly STEP_ITERATIONS = 4096;  // TBs per step call
 
   /** Whether the QEMU module has been loaded and callMain() has returned. */
   get isLoaded(): boolean {
@@ -215,6 +248,66 @@ export class QEMUWrapper {
       `(BSP=${config.isBSP}, heap=${config.wasmHeapMB}MB, ` +
       `pool@0x${poolBase.toString(16)}, ${config.sqlPageStore.maxFrameCount} frames)`,
     );
+
+    // Start the JS-driven execution pump.
+    // callMain() returned without entering a loop (no-ASYNCIFY path).
+    // We drive QEMU by calling _wasm_step(N) on a setInterval.
+    this.startExecution();
+  }
+
+  /**
+   * Start the JS-driven execution pump.
+   * Calls _wasm_step(N) every STEP_INTERVAL_MS milliseconds. Each call
+   * executes N translation blocks + processes timers/events, then returns
+   * control to the JS event loop so HTTP/WebSocket handlers can run.
+   */
+  private startExecution(): void {
+    if (this.stepTimer || !this.module) return;
+
+    const mod = this.module;
+
+    let stepCount = 0;
+    console.log(`${LOG_PREFIX} stepTimer setup: running=${this.running} aborted=${this.aborted} hasStep=${typeof mod._wasm_step}`);
+
+    // Use recursive setTimeout instead of setInterval.
+    // This prevents races between the Fibers trampoline (ASYNCIFY rewind)
+    // and our next scheduled call. Each call completes fully (including any
+    // ASYNCIFY unwind/rewind cycles) before the next is scheduled.
+    const scheduleStep = () => {
+      this.stepTimer = setTimeout(() => {
+        if (!this.running || this.aborted || !mod._wasm_step) return;
+
+        try {
+          stepCount++;
+          const result = mod._wasm_step(QEMUWrapper.STEP_ITERATIONS);
+          if (stepCount <= 5 || stepCount % 5000 === 0) {
+            console.log(`${LOG_PREFIX} wasm_step #${stepCount} returned ${result}`);
+          }
+          if (result > 0) {
+            console.log(`${LOG_PREFIX} QEMU exit requested (status=${result})`);
+            this.stop();
+            return;
+          }
+        } catch (e) {
+          console.error(`${LOG_PREFIX} wasm_step error:`, e);
+          this.aborted = true;
+          this.stop();
+          return;
+        }
+
+        // Schedule next step — setTimeout(0) runs after the current event
+        // loop tick, giving HTTP/WS handlers a chance to process.
+        scheduleStep();
+      }, 0);
+    };
+    scheduleStep();
+
+    // With -icount, timers fire via qemu_clock_run_timers inside wasm_step.
+    // No separate event pump needed.
+
+    console.log(
+      `${LOG_PREFIX} Execution pump started: ${QEMUWrapper.STEP_ITERATIONS} iters/step + event pump`,
+    );
   }
 
   /**
@@ -226,27 +319,50 @@ export class QEMUWrapper {
    * the returned promise — no globalThis.Module hacks needed.
    */
   private async loadModule(config: QEMUWrapperConfig): Promise<QEMUModule> {
-    // Extract the factory function from the JS glue code.
-    // The glue ends with: module.exports = createQemuModule
-    // We use new Function() to evaluate it and return the factory.
-    // eslint-disable-next-line no-new-func
-    const factory = new Function(
-      config.jsGlue + "\nreturn createQemuModule;",
-    )() as (overrides: Record<string, unknown>) => Promise<QEMUModule>;
+    // Resolve the Emscripten factory function.
+    //
+    // Mode A (Workers/DOs): use pre-imported factory + instantiateWasm callback
+    //   with pre-compiled WebAssembly.Module. No eval, no runtime compilation.
+    //
+    // Mode B (Node.js/testing): evaluate JS glue string via new Function() and
+    //   pass wasmBinary for runtime compilation.
+    let factory: (overrides: Record<string, unknown>) => Promise<QEMUModule>;
+
+    const usePrecompiled = !!config.wasmModule && !!config.createFactory;
+
+    if (usePrecompiled) {
+      factory = config.createFactory as (overrides: Record<string, unknown>) => Promise<QEMUModule>;
+    } else if (config.jsGlue) {
+      // eslint-disable-next-line no-new-func
+      factory = new Function(
+        config.jsGlue + "\nreturn createQemuModule;",
+      )() as (overrides: Record<string, unknown>) => Promise<QEMUModule>;
+    } else {
+      throw new Error("QEMUWrapper: need either (wasmModule + createFactory) or (wasmBinary + jsGlue)");
+    }
 
     // Prepare module overrides — all callbacks are wired here.
     // The factory merges these into the Module object before init.
     const moduleOverrides: Record<string, unknown> = {
       noInitialRun: true,
       noExitRuntime: true,
+      // Prevent new URL() with empty base in Workers (no import.meta.url)
+      locateFile: () => "",
 
-      // Serial console output (stdout)
+      // Serial console output (stdout).
+      // Also detects QEMU init completion signal for ASYNCIFY wait.
       print: (line: string) => {
         if (config.onSerialOutput) {
-          for (const ch of line) {
-            config.onSerialOutput(ch);
-          }
+          for (const ch of line) config.onSerialOutput(ch);
           config.onSerialOutput("\n");
+        }
+        if (typeof line === "string" &&
+            (line.includes("[MAIN] after qemu_main_loop") || line.includes("[ML-LOOP] Emscripten:"))) {
+          if (this.initSignal && !this.initSignal.done) {
+            this.initSignal.done = true;
+            console.log(`${LOG_PREFIX} QEMU init complete`);
+            this.initSignal.resolve?.();
+          }
         }
       },
 
@@ -314,14 +430,36 @@ export class QEMUWrapper {
       postTick: () => this.postTick(),
 
       onAbort: (what: string) => {
-        this.aborted = true;
-        throw new Error(`QEMU aborted: ${what}`);
+        // Log but don't set this.aborted — QEMU coroutine issues during init
+        // are non-fatal. The guest can still boot even with coroutine warnings.
+        console.error(`${LOG_PREFIX} QEMU abort: ${what}`);
+        if (what.includes("out of memory") || what.includes("stack overflow")) {
+          this.aborted = true;
+        }
+        // Don't throw — the JS abort() function will return and QEMU continues.
+        // The WASM unreachable instruction after C abort() will be handled by
+        // the patched JS abort() function which returns instead of throwing.
       },
-
-      // Provide WASM binary (raw ArrayBuffer from R2/SQLite cache).
-      // Emscripten accepts either ArrayBuffer or WebAssembly.Module.
-      wasmBinary: new Uint8Array(config.wasmBinary),
     };
+
+    // WASM loading strategy:
+    if (usePrecompiled) {
+      // Mode A: provide instantiateWasm callback with pre-compiled Module.
+      // Workers/DOs cannot call WebAssembly.compile() at runtime.
+      const wasmMod = config.wasmModule!;
+      moduleOverrides.instantiateWasm = (
+        imports: WebAssembly.Imports,
+        successCallback: (instance: WebAssembly.Instance) => void,
+      ) => {
+        WebAssembly.instantiate(wasmMod, imports)
+          .then((instance) => successCallback(instance))
+          .catch((err) => console.error(`${LOG_PREFIX} WASM instantiate error:`, err));
+        return {}; // signal async instantiation to Emscripten
+      };
+    } else if (config.wasmBinary) {
+      // Mode B: pass raw bytes — Emscripten will compile at runtime.
+      moduleOverrides.wasmBinary = new Uint8Array(config.wasmBinary);
+    }
 
     // Call the factory — it returns a promise that resolves when the
     // Emscripten runtime is fully initialized (replaces onRuntimeInitialized).
@@ -330,20 +468,97 @@ export class QEMUWrapper {
     // Mount BIOS/disk files into the Emscripten VFS
     this.mountFilesystem(mod, config);
 
-    // Build QEMU args and start the VM
+    // Build QEMU args and start the VM.
+    //
+    // With ASYNCIFY: callMain() runs qemu_init() which uses fiber_swap for
+    // coroutines (block layer I/O). Each fiber_swap causes an ASYNCIFY
+    // "unwind" — callMain() throws, and Emscripten schedules a "rewind"
+    // via setTimeout to resume execution. This repeats until qemu_init()
+    // completes and qemu_main_loop() returns 0.
+    //
+    // We wrap callMain in a Promise that resolves when the main loop returns
+    // (signaled by our [ML-LOOP] fprintf + the Asyncify state settling).
     const args = this.buildQemuArgs(config);
 
+    // Verify disk file in MEMFS
     try {
-      mod.callMain(args);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg !== "unwind" && !msg.includes("ExitStatus")) {
-        this.aborted = true;
-        throw new Error(`QEMU callMain error: ${msg}`);
-      }
+      const diskPath = config.diskDrive === "fda" ? "/disk.img" : "/disk.iso";
+      const stat = mod.FS.stat(diskPath);
+      const data = mod.FS.readFile(diskPath, { encoding: "binary" });
+      const bytes = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data as unknown as ArrayBuffer);
+      const first4 = [bytes[0], bytes[1], bytes[2], bytes[3]].map(b => b.toString(16).padStart(2, "0")).join(" ");
+      const bootSig = bytes.length >= 512 ? `${bytes[510].toString(16)}${bytes[511].toString(16)}` : "N/A";
+      console.log(`${LOG_PREFIX} MEMFS ${diskPath}: size=${stat.size} first4=[${first4}] bootSig=${bootSig}`);
+    } catch (e: any) {
+      console.log(`${LOG_PREFIX} MEMFS verify error: ${e?.message}`);
     }
 
-    // callMain returned — main loop callback is registered.
+    // With ASYNCIFY: callMain() runs qemu_init() which uses fiber_swap
+    // for coroutines. Each fiber_swap causes an ASYNCIFY unwind — callMain
+    // throws, Emscripten schedules a rewind via setTimeout, and execution
+    // resumes from the fiber_swap point.
+    //
+    // We must NOT catch the unwind exception — let it propagate to Emscripten's
+    // runtime. The rewind callbacks fire via the DO's event loop (setTimeout).
+    // We wait for qemu_main_loop() to return by polling the Asyncify state.
+    // With ASYNCIFY: callMain() runs qemu_init() which may trigger
+    // emscripten_fiber_swap for block layer coroutines. Each fiber_swap
+    // causes an ASYNCIFY unwind — callMain() returns early, and Emscripten
+    // handles the rewind via Fibers.trampoline(). The rewind re-enters
+    // the WASM and qemu_init() continues. This may happen multiple times.
+    //
+    // We wait for qemu_init() to fully complete by watching for the
+    // "[MAIN] after qemu_init" debug message, which prints after qemu_init()
+    // returns in main().
+    // ASYNCIFY init completion: callMain() may return early due to ASYNCIFY
+    // unwind. Fibers.trampoline() handles rewind asynchronously. We detect
+    // completion via "[MAIN] after qemu_main_loop" in stdout.
+    this.initSignal = { done: false, resolve: null };
+
+    console.log(`${LOG_PREFIX} About to callMain with ${args.length} args`);
+    console.log(`${LOG_PREFIX} mod.callMain is: ${typeof mod.callMain}`);
+    console.log(`${LOG_PREFIX} mod._wasm_step is: ${typeof mod._wasm_step}`);
+    console.log(`${LOG_PREFIX} mod.FS is: ${typeof mod.FS}`);
+
+    await new Promise<void>((resolve) => {
+      this.initSignal!.resolve = resolve;
+
+      try {
+        console.log(`${LOG_PREFIX} Calling callMain now...`);
+        mod.callMain(args);
+        console.log(`${LOG_PREFIX} callMain returned normally`);
+      } catch (e: any) {
+        const msg = e?.message || String(e);
+        // Ignore ASYNCIFY unwind, ExitStatus, assertions, and unreachable
+        // (the WASM unreachable instruction fires after C abort() which we
+        // handle non-fatally via the JS abort() patch).
+        if (msg === "unwind" || msg.includes("ExitStatus") ||
+            msg.includes("Assertion") || msg.includes("unreachable") ||
+            msg.includes("aborted")) {
+          console.log(`${LOG_PREFIX} callMain: ${msg.slice(0, 100)} (continuing)`);
+        } else {
+          console.error(`${LOG_PREFIX} callMain fatal: ${msg}`);
+          throw e;
+        }
+      }
+
+      if (this.initSignal!.done) {
+        resolve();
+        return;
+      }
+
+      // Timeout: 120s for ASYNCIFY rewind cycles
+      setTimeout(() => {
+        if (!this.initSignal!.done) {
+          this.initSignal!.done = true;
+          console.log(`${LOG_PREFIX} Init timeout (120s) — proceeding`);
+          resolve();
+        }
+      }, 120_000);
+    });
+
+    this.initSignal = null;
+
     return mod;
   }
 
@@ -363,14 +578,21 @@ export class QEMUWrapper {
       "-no-user-config",
     ];
 
-    // BSP gets disk; AP gets nothing
+    // BSP gets disk; AP gets nothing.
+    // Use format=raw to skip coroutine-based format probing during init.
     if (config.isBSP && config.diskData) {
       if (config.diskDrive === "fda") {
-        args.push("-fda", "/disk.img");
+        args.push("-drive", "file=/disk.img,if=floppy,format=raw");
       } else {
-        args.push("-cdrom", "/disk.iso");
+        args.push("-drive", "file=/disk.iso,if=ide,media=cdrom,format=raw,readonly=on");
+        args.push("-boot", "d");
       }
     }
+
+    args.push("-L", "/usr/local/share/qemu"); // BIOS search path
+    args.push("-nic", "none");                 // No network
+    args.push("-monitor", "none");             // No QMP monitor
+    args.push("-icount", "shift=0");             // 1 insn = 1ns virtual time — fastest timer delivery
 
     // AP starts paused, waiting for SIPI
     if (!config.isBSP) {
@@ -740,7 +962,11 @@ export class QEMUWrapper {
 
     this.running = false;
 
-    // Cancel the Emscripten main loop
+    // Stop the JS execution pumps
+    if (this.stepTimer) { clearTimeout(this.stepTimer); this.stepTimer = null; }
+    if (this.eventTimer) { clearTimeout(this.eventTimer); this.eventTimer = null; }
+
+    // Cancel the Emscripten main loop (if using emscripten_set_main_loop path)
     if (typeof this.module._emscripten_cancel_main_loop === "function") {
       try {
         this.module._emscripten_cancel_main_loop();

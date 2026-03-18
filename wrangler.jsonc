@@ -3,6 +3,9 @@
   "name": "do86",
   "compatibility_date": "2025-04-01",
   "compatibility_flags": ["nodejs_compat"],
+  "limits": {
+    "cpu_ms": 300000
+  },
   "main": "./src/index.ts",
   "routes": [
     { "pattern": "do86.ashishkumarsingh.com", "custom_domain": true }
@@ -25,6 +28,10 @@
       {
         "name": "CPU_CORE",
         "class_name": "CpuCoreDO"
+      },
+      {
+        "name": "QEMU_STANDALONE",
+        "class_name": "QemuStandaloneDO"
       }
     ]
   },
@@ -43,16 +50,8 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["LinuxVM"]
-    },
-    {
-      "tag": "v2",
-      "new_classes": ["CoordinatorDO", "CpuCoreDO"]
-    },
-    {
-      "tag": "v3",
-      "deleted_classes": ["CpuCoreDO"],
-      "new_sqlite_classes": ["CpuCoreDO"]
+      "new_sqlite_classes": ["LinuxVM", "CpuCoreDO", "QemuStandaloneDO"],
+      "new_classes": ["CoordinatorDO"]
     }
   ]
 }

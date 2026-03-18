@@ -56,8 +56,8 @@
         <button class="seg-btn" data-backend="v86-smp" onclick="selectBackend('v86-smp',this)">
           <span class="seg-dot seg-dot--smp"></span>SMP
         </button>
-        <button class="seg-btn" disabled>
-          <span class="seg-dot seg-dot--qemu"></span>QEMU<span class="seg-tag">Soon</span>
+        <button class="seg-btn" data-backend="qemu" onclick="selectBackend('qemu',this)">
+          <span class="seg-dot seg-dot--qemu"></span>QEMU<span class="seg-tag">Beta</span>
         </button>
       </div>
     </div>
@@ -81,7 +81,7 @@
       btn.disabled = true;
       btn.innerHTML = '<span class="btn-spinner"></span>Starting\u2026';
       var id = crypto.randomUUID();
-      var prefix = currentBackend === 'v86-smp' ? '/smp/' : '/s/';
+      var prefix = currentBackend === 'v86-smp' ? '/smp/' : currentBackend === 'qemu' ? '/qd/' : '/s/';
       location.href = prefix + id + '?image=' + image;
     }
 

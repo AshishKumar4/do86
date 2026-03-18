@@ -2,11 +2,13 @@ export { LinuxVM } from "./linux-vm";
 export { CoordinatorDO } from "./coordinator-do";
 export { CpuCoreDO } from "./core-do";
 export { QemuCpuCoreDO } from "./qemu-core-do";
+export { QemuStandaloneDO } from "./qemu-standalone-do";
 
 export interface Env {
   LINUX_VM: DurableObjectNamespace;
   COORDINATOR: DurableObjectNamespace;
   CPU_CORE: DurableObjectNamespace;
+  QEMU_STANDALONE: DurableObjectNamespace;
   ASSETS: { fetch: (request: Request | string) => Promise<Response> };
   ASSETS_BUCKET: R2Bucket;
 }
@@ -107,6 +109,10 @@ function withCoopCoep(response: Response): Response {
 const SESSION_RE = /^\/s\/([a-zA-Z0-9_-]+)$/;
 const SMP_SESSION_RE = /^\/smp\/([a-zA-Z0-9_-]+)$/;
 const QEMU_RE = /^\/qemu(?:\/([a-zA-Z0-9_-]*))?$/;
+const QEMU_DO_RE = /^\/qd\/([a-zA-Z0-9_-]+)$/;
+const QEMU_DO_INIT_RE = /^\/qd-init\/([a-zA-Z0-9_-]+)$/;
+const QEMU_DO_KICK_RE = /^\/qd-kick\/([a-zA-Z0-9_-]+)$/;
+const QEMU_DO_STATUS_RE = /^\/qd-status\/([a-zA-Z0-9_-]+)$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -126,6 +132,118 @@ export default {
         new Request(new URL("/qemu.html", request.url).toString()),
       );
       return withCoopCoep(resp);
+    }
+
+    // ── /qd-init/:id → init QEMU standalone DO with firmware + disk ──────
+    const qdInitMatch = url.pathname.match(QEMU_DO_INIT_RE);
+    if (qdInitMatch) {
+      const sessionId = qdInitMatch[1];
+      const imageKey = url.searchParams.get("image") || "aqeous";
+      const imageDef = IMAGES[imageKey] || IMAGES.aqeous;
+
+      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+      const stub = env.QEMU_STANDALONE.get(id);
+
+      const meta: Record<string, unknown> = {
+        imageKey,
+        drive: imageDef.drive,
+        memory: Math.min(imageDef.memory || 32, 64),
+        label: imageDef.label,
+      };
+
+      const assets: Record<string, ArrayBuffer> = {};
+      assets.metadata = new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer;
+
+      // Fetch BIOS firmware (required by QEMU — small data files, ~300KB total)
+      const firmware = [
+        { path: "/assets/bios-256k.bin", key: "qemu_bios_256k_bin" },
+        { path: "/assets/vgabios-stdvga.bin", key: "qemu_vgabios_stdvga_bin" },
+      ];
+      const missingFirmware: string[] = [];
+      await Promise.all(firmware.map(async ({ path, key }) => {
+        const resp = await env.ASSETS.fetch(new URL(path, request.url).toString());
+        if (resp.ok) {
+          assets[key] = await resp.arrayBuffer();
+        } else {
+          missingFirmware.push(path);
+        }
+      }));
+      if (missingFirmware.length > 0) {
+        return new Response(`Missing QEMU firmware: ${missingFirmware.join(", ")}`, { status: 500 });
+      }
+
+      // Fetch disk image
+      try {
+        const localResp = await env.ASSETS.fetch(
+          new URL(`/assets/${imageDef.file}`, request.url).toString(),
+        );
+        if (localResp.ok) assets.disk = await localResp.arrayBuffer();
+      } catch { /* not available locally */ }
+
+      if (!assets.disk && imageDef.url) {
+        const remoteResp = await fetch(imageDef.url);
+        if (remoteResp.ok) assets.disk = await remoteResp.arrayBuffer();
+      }
+
+      if (!assets.disk) {
+        return new Response(`Disk image not found for ${imageKey}`, { status: 500 });
+      }
+
+      // Pack and send to DO
+      const packed = packAssets(assets);
+      const initResp = await stub.fetch(
+        new Request(new URL("/init", request.url).toString(), { method: "POST", body: packed }),
+      );
+      if (!initResp.ok) return new Response("Failed to init QEMU VM", { status: 500 });
+
+      return Response.json({ status: "ok", sessionId, imageKey });
+    }
+
+    // ── /qd-kick/:id → trigger QEMU boot ─────────────────────────────────
+    const qdKickMatch = url.pathname.match(QEMU_DO_KICK_RE);
+    if (qdKickMatch) {
+      const sessionId = qdKickMatch[1];
+      const imageKey = url.searchParams.get("image") || "aqeous";
+      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+      const resp = await env.QEMU_STANDALONE.get(id).fetch(
+        new Request(new URL("/kick", request.url).toString(), { method: "POST" }),
+      );
+      return new Response(await resp.text(), { status: resp.status });
+    }
+
+    // ── /qd-status/:id → QEMU DO status ──────────────────────────────────
+    const qdStatusMatch = url.pathname.match(QEMU_DO_STATUS_RE);
+    if (qdStatusMatch) {
+      const sessionId = qdStatusMatch[1];
+      const imageKey = url.searchParams.get("image") || "aqeous";
+      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+      return env.QEMU_STANDALONE.get(id).fetch(
+        new Request(new URL("/status", request.url).toString()),
+      );
+    }
+
+    // ── /qd-test-import/:id → test WASM loading on QEMU DO ──────────────
+    const qdTestMatch = url.pathname.match(/^\/qd-test-import\/([a-zA-Z0-9_-]+)$/);
+    if (qdTestMatch) {
+      const sessionId = qdTestMatch[1];
+      const imageKey = url.searchParams.get("image") || "aqeous";
+      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+      // Forward with query params preserved
+      const doUrl = new URL("/test-import", request.url);
+      doUrl.search = url.search;
+      return env.QEMU_STANDALONE.get(id).fetch(new Request(doUrl.toString()));
+    }
+
+    // ── /qd/:id → WebSocket to QEMU standalone DO ────────────────────────
+    const qdMatch = url.pathname.match(QEMU_DO_RE);
+    if (qdMatch) {
+      if (request.headers.get("Upgrade") === "websocket") {
+        const sessionId = qdMatch[1];
+        const imageKey = url.searchParams.get("image") || "aqeous";
+        const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+        return env.QEMU_STANDALONE.get(id).fetch(request);
+      }
+      return env.ASSETS.fetch(new Request(new URL("/session.html", request.url).toString()));
     }
 
     // /smp/:sessionId → distributed SMP session via CoordinatorDO

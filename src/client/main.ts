@@ -12,10 +12,11 @@ import {
 
 // ── Session ──────────────────────────────────────────────────────────────────
 
-const pathMatch = location.pathname.match(/^\/(s|smp)\/([a-zA-Z0-9_-]+)/);
-const pathPrefix = pathMatch?.[1] ?? "s";   // "s" or "smp"
+const pathMatch = location.pathname.match(/^\/(s|smp|qd)\/([a-zA-Z0-9_-]+)/);
+const pathPrefix = pathMatch?.[1] ?? "s";   // "s", "smp", or "qd"
 const sessionId = pathMatch?.[2] ?? null;
 const isSMP = pathPrefix === "smp";
+const isQEMU = pathPrefix === "qd";
 const params = new URLSearchParams(location.search);
 const imageParam = params.get("image") || "";
 const freshParam = params.get("fresh") === "1";
@@ -445,12 +446,12 @@ function connect() {
   if (firstConnect) {
     const wsParams = new URLSearchParams();
     if (imageParam) wsParams.set("image", imageParam);
-    if (freshParam) wsParams.set("fresh", "1");
+    if (freshParam && !isQEMU) wsParams.set("fresh", "1");
     const qs = wsParams.toString();
     if (qs) wsUrl += `?${qs}`;
-    firstConnect = false;
-  } else if (isSMP && imageParam) {
-    // SMP route always needs ?image — the server resolves the CoordinatorDO
+    if (!isQEMU) firstConnect = false;  // QEMU always needs image param
+  } else if ((isSMP || isQEMU) && imageParam) {
+    // SMP/QEMU routes always need ?image — the server resolves the DO
     // stub by image key on every request, including WS reconnects
     wsUrl += `?image=${encodeURIComponent(imageParam)}`;
   }
@@ -471,14 +472,23 @@ function connect() {
     }
     updateFocusUI();
 
-    // Trigger boot from the server side. Boot runs inside webSocketMessage so
-    // v86's internal setTimeout(d,0) fires within an active DO event handler.
-    ws!.send(JSON.stringify({ type: "boot" }));
-
-    // Heartbeat every 10s to keep the non-hibernating DO alive
+    // Heartbeat to keep the non-hibernating DO alive
     heartbeatInterval = setInterval(() => {
       if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "heartbeat" }));
-    }, 10_000);
+    }, isQEMU ? 5_000 : 10_000);
+
+    if (isQEMU) {
+      // QEMU standalone: 3-phase init → kick → WS. The init/kick are HTTP
+      // requests that set up the DO; the WS streams output after boot.
+      initQemuSession().catch((err) => {
+        setStatus(`error: ${err?.message || err}`);
+      });
+    } else {
+      // v86 / SMP: trigger boot from the server side. Boot runs inside
+      // webSocketMessage so v86's internal setTimeout(d,0) fires within an
+      // active DO event handler.
+      ws!.send(JSON.stringify({ type: "boot" }));
+    }
   });
 
   ws.addEventListener("message", (event) => {
@@ -505,6 +515,29 @@ function connect() {
   });
 
   ws.addEventListener("error", () => { /* handled by close */ });
+}
+
+// ── QEMU standalone init (3-phase: init → kick → WS) ────────────────────────
+
+let qemuInitDone = false;
+
+async function initQemuSession(): Promise<void> {
+  if (!sessionId || !imageParam || qemuInitDone) return;
+  setStatus("Preparing QEMU runtime\u2026");
+  loadingText.textContent = "Preparing QEMU runtime\u2026";
+  loadingSub.textContent = "Fetching firmware and disk image";
+  showOverlay(loadingOverlay);
+
+  const initUrl = `/qd-init/${sessionId}?image=${encodeURIComponent(imageParam)}`;
+  const initResp = await fetch(initUrl);
+  if (!initResp.ok) throw new Error(`QEMU init failed: ${initResp.status}`);
+
+  loadingSub.textContent = "Starting QEMU\u2026";
+  const kickUrl = `/qd-kick/${sessionId}?image=${encodeURIComponent(imageParam)}`;
+  const kickResp = await fetch(kickUrl, { method: "POST" });
+  if (!kickResp.ok) throw new Error(`QEMU kick failed: ${kickResp.status}`);
+
+  qemuInitDone = true;
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
