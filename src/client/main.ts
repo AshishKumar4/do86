@@ -63,6 +63,24 @@ let wsConnected = false;
 // Cached Uint32Array view over the local pixel buffer
 let pixelU32: Uint32Array | null = null;
 
+// ── Frame paint ──────────────────────────────────────────────────────────────
+// Paint immediately on frame receive — no rAF queue delay.
+// Each WS message is one rendered frame from the server; painting synchronously
+// eliminates the up-to-16ms rAF wait that was the dominant source of cursor
+// ghosting on top of the ~8ms server batch latency.
+// The browser still composites to the display at vsync — the immediate
+// putImageData just ensures the canvas backbuffer is up-to-date as early
+// as possible before that composite step.
+
+function paintFrame(dirty: { x: number; y: number; w: number; h: number } | "full") {
+  if (!localImageData) return;
+  if (dirty === "full") {
+    ctx.putImageData(localImageData, 0, 0);
+  } else {
+    ctx.putImageData(localImageData, 0, 0, dirty.x, dirty.y, dirty.w, dirty.h);
+  }
+}
+
 // Stats / FPS
 let frameCount = 0;
 let deltaFrameCount = 0;
@@ -268,7 +286,7 @@ function handleBinaryMessage(data: ArrayBuffer) {
       const u32 = ensureLocalBuffer(w, h);
       const result = decodeFullFrame(data, u32);
       if (result) {
-        ctx.putImageData(localImageData!, 0, 0);
+        paintFrame("full");
         fullFrameCount++;
         frameCount++;
         onFrameReceived(data.byteLength);
@@ -283,11 +301,10 @@ function handleBinaryMessage(data: ArrayBuffer) {
       updateCanvasSize(w, h);
       const u32 = ensureLocalBuffer(w, h);
       const result = decodeDeltaFrame(data, u32);
-      if (result?.dirty) {
-        const d = result.dirty;
-        ctx.putImageData(localImageData!, 0, 0, d.x, d.y, d.w, d.h);
-      }
       if (result) {
+        if (result.dirty) {
+          paintFrame(result.dirty);
+        }
         deltaFrameCount++;
         frameCount++;
         onFrameReceived(data.byteLength);
@@ -302,7 +319,6 @@ function handleBinaryMessage(data: ArrayBuffer) {
     case MSG_TEXT_SCREEN: {
       const ts = decodeTextScreen(data, textDecoder);
       updateCanvasSize(ts.width, ts.height);
-
       ctx.fillStyle = "#000";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.font = "16px monospace";
@@ -311,6 +327,8 @@ function handleBinaryMessage(data: ArrayBuffer) {
       for (let row = 0; row < ts.lines.length && row < ts.rows; row++) {
         ctx.fillText(ts.lines[row] || "", 0, row * 16);
       }
+      // Text renders directly to canvas; clear pixel buffer so next graphical
+      // frame forces a full repaint.
       localImageData = null;
       pixelU32 = null;
       frameCount++;

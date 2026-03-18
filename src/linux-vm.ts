@@ -401,27 +401,56 @@ export class LinuxVM extends DurableObject<unknown> {
                 vga.virtual_width, vga.virtual_height,
               );
             }
+            // Force a full redraw into our newly-assigned screen adapter.
+            // When restoring from snapshot, v86 calls complete_redraw() during
+            // state load — before we hook vga.screen — so our adapter misses the
+            // initial put_char() calls. Calling complete_redraw() again after
+            // assigning our adapter re-pumps the current VGA state into it.
+            try { vga.complete_redraw?.(); } catch (_) {}
           }
           this.emulator!.run();
 
-          // In deployed Workers the yield→main_loop→yield chain monopolizes the
-          // macrotask queue: setTimeout(fn, 0) re-enqueues faster than setInterval
-          // callbacks can fire. The render loop and WS handlers starve.
+          // ── High-performance yield override ──────────────────────────────────
           //
-          // Fix: every 16th yield, call renderFrame() directly (synchronous, inside
-          // this macrotask) before scheduling the next yield. This guarantees frames
-          // are produced without depending on setInterval winning the scheduler race.
-          // The closure over `this` makes it feasible without any plumbing changes.
-          // The other 15 yields are plain setTimeout(fn, 0) for full throughput.
+          // Strategy: eliminate ~87% of setTimeout overhead by calling
+          // yield_callback() synchronously for (BATCH_SIZE-1) of every BATCH_SIZE
+          // yields. Only the last yield in each batch breaks to the event loop:
+          //   1. Lets WS sends flush (network I/O) and incoming messages land
+          //   2. Prevents a single DO request from monopolising the event loop
+          //   3. Gives us a clean batch boundary to render from (guest has
+          //      finished its draw operations — no mid-draw ghost captures)
+          //
+          // BATCH_SIZE=8: ~8ms between renders (~125fps capture rate), ~87% sync.
+          //
+          // Idle detection: v86 passes `t` (ms hint) from main_loop. When
+          // t > 10 the guest CPU is halted (HLT) — we sleep min(t, 40)ms instead
+          // of spinning, saving CPU on idle desktops.
+          //
+          // Rendering: renderFrame() fires at every batch boundary and on idle.
+          // No setInterval — all rendering is driven by the yield cadence.
+          const BATCH_SIZE = 8;
           const v86Internal = (this.emulator as any).v86;
           if (v86Internal) {
             let yieldCount = 0;
             v86Internal.yield = (t: number, tick: number) => {
               yieldCount++;
-              if (yieldCount % 16 === 0) {
-                try { this.renderFrame(); } catch (_) {}
+              if (yieldCount % BATCH_SIZE !== 0) {
+                // Synchronous fast path: no event loop round-trip, no setTimeout cost.
+                // Stack depth stays bounded (v86's own yield fires every ~1ms).
+                v86Internal.yield_callback(tick);
+                return;
               }
-              setTimeout(() => v86Internal.yield_callback(tick), 0);
+              // Batch boundary: render, then schedule next batch via setTimeout.
+              try { this.renderFrame(); } catch (_) {}
+              if (t > 10) {
+                // Guest is idle (HLT). Sleep proportionally — cap at 40ms so we
+                // stay responsive to heartbeats and input events.
+                setTimeout(() => v86Internal.yield_callback(tick), Math.min(t, 40));
+              } else {
+                // Guest is active. Use setTimeout(fn, 1) — just enough to flush
+                // WS sends and process incoming messages without burning delay.
+                setTimeout(() => v86Internal.yield_callback(tick), 1);
+              }
             };
           }
 
@@ -568,17 +597,18 @@ export class LinuxVM extends DurableObject<unknown> {
   }
 
   private restartRenderLoop(): void {
-    if (this.renderInterval) clearInterval(this.renderInterval);
-    this.renderInterval = null;
-    this.startRenderLoop();
+    // Rendering is driven by the yield override — no setInterval needed.
+    // FPS adaptation still tracks frame sizes (adjustFrameRate) but no longer
+    // controls an interval timer.
   }
 
   private startRenderLoop(): void {
-    if (this.renderInterval) return;
-    this.renderInterval = setInterval(() => {
-      try { this.renderFrame(); }
-      catch (e) { console.error(`${LOG_PREFIX} Render frame error:`, e); }
-    }, Math.round(1000 / this.currentFPS));
+    // No-op: rendering is driven by the yield override (every 32nd yield and
+    // on idle). Any previously-running interval is cleaned up if present.
+    if (this.renderInterval) {
+      clearInterval(this.renderInterval);
+      this.renderInterval = null;
+    }
   }
 
   // ── VGA pixel reader ──────────────────────────────────────────────────
@@ -860,10 +890,12 @@ export class LinuxVM extends DurableObject<unknown> {
 
       if (msg.type === "heartbeat") return;
 
-      // Drop all user input while the boot snapshot is pending.
-      // This prevents keyboard/mouse activity from contaminating the
-      // pristine boot state that gets persisted for future sessions.
-      if (this.inputGated) return;
+      // Drop keyboard input while the boot snapshot is pending.
+      // This prevents key presses from contaminating the pristine boot
+      // state that gets persisted for future sessions.
+      // Mouse events are allowed through — they don't affect snapshot state
+      // and blocking them makes the OS feel broken during the gate window.
+      if (this.inputGated && msg.type !== "mousemove" && msg.type !== "mousedown" && msg.type !== "mouseup") return;
 
       // ── Input messages — require running emulator ──────────────────────
       if (!this.emulator) return;
