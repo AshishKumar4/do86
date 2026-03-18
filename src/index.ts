@@ -292,7 +292,7 @@ export default {
           description: def.description,
           drive: def.drive,
           memory: def.memory,
-          backends: key === "aqeous" ? ["v86", "v86-smp"] : ["v86"],
+          backends: ["v86", "v86-smp"],
         })),
       );
     }

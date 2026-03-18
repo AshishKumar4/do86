@@ -18,16 +18,24 @@
     .card h3{font-size:15px;font-weight:600;color:#e6edf3;margin-bottom:4px}
     .card p{font-size:13px;color:#8b949e;line-height:1.4}
     .card-meta{font-size:11px;color:#484f58;margin-top:6px}
-    .card-actions{flex-shrink:0;display:flex;gap:6px}
-    .btn-backend{display:inline-flex;align-items:center;gap:5px;background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:20px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;transition:border-color .15s,background .15s,opacity .15s;white-space:nowrap}
-    .btn-backend:hover:not(:disabled){border-color:#8b949e;background:#30363d}
-    .btn-backend:disabled{opacity:.45;cursor:default}
-    .btn-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-    .btn-dot--v86{background:#3fb950}
-    .btn-dot--smp{background:#58a6ff}
-    .btn-dot--qemu{background:#484f58}
-    .btn-tag{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#484f58;margin-left:2px}
-    .btn-spinner{display:inline-block;width:10px;height:10px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle}
+    .backend-toggle{display:flex;justify-content:center;margin-bottom:32px}
+    .seg{display:inline-flex;background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+    .seg-btn{display:inline-flex;align-items:center;gap:6px;background:none;color:#8b949e;border:none;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s,color .15s;position:relative;white-space:nowrap}
+    .seg-btn+.seg-btn{border-left:1px solid #30363d}
+    .seg-btn:hover:not(:disabled):not(.seg-btn--active){background:#21262d;color:#e6edf3}
+    .seg-btn--active{background:#f97316;color:#fff;cursor:default}
+    .seg-btn:disabled{opacity:.4;cursor:default}
+    .seg-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+    .seg-dot--v86{background:#3fb950}
+    .seg-dot--smp{background:#58a6ff}
+    .seg-dot--qemu{background:#484f58}
+    .seg-tag{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#484f58;margin-left:1px}
+    .seg-btn--active .seg-dot--v86,.seg-btn--active .seg-dot--smp{background:#fff}
+    .seg-btn--active .seg-tag{color:rgba(255,255,255,.5)}
+    .card button{flex-shrink:0;background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 20px;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s,opacity .15s;min-width:90px}
+    .card button:hover:not(:disabled){background:#ea580c}
+    .card button:disabled{opacity:.7;cursor:default}
+    .btn-spinner{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px}
     @keyframes spin{to{transform:rotate(360deg)}}
     .footer{text-align:center;color:#484f58;font-size:12px;margin-top:48px}
     /* Skeleton loading state for cards */
@@ -40,37 +48,41 @@
       <h1>do86</h1>
       <p>x86 operating systems running on Cloudflare Durable Objects</p>
     </div>
+    <div class="backend-toggle" id="backend-toggle">
+      <div class="seg">
+        <button class="seg-btn seg-btn--active" data-backend="v86" onclick="selectBackend('v86',this)">
+          <span class="seg-dot seg-dot--v86"></span>v86
+        </button>
+        <button class="seg-btn" data-backend="v86-smp" onclick="selectBackend('v86-smp',this)">
+          <span class="seg-dot seg-dot--smp"></span>SMP
+        </button>
+        <button class="seg-btn" disabled>
+          <span class="seg-dot seg-dot--qemu"></span>QEMU<span class="seg-tag">Soon</span>
+        </button>
+      </div>
+    </div>
     <div class="grid" id="grid">
       <div class="grid-loading">Loading images&hellip;</div>
     </div>
     <div class="footer">VMs are shared per image &mdash; instant boot via state snapshots.</div>
   </div>
   <script>
-    function launch(backend, image, btn) {
-      btn.disabled = true;
-      btn.innerHTML = '<span class="btn-spinner"></span>';
-      var id = crypto.randomUUID();
-      var prefix = backend === 'v86-smp' ? '/smp/' : '/s/';
-      location.href = prefix + id + '?image=' + image;
+    var currentBackend = 'v86';
+
+    function selectBackend(backend, btn) {
+      if (backend === currentBackend) return;
+      currentBackend = backend;
+      var btns = btn.parentNode.querySelectorAll('.seg-btn');
+      for (var i = 0; i < btns.length; i++) btns[i].classList.remove('seg-btn--active');
+      btn.classList.add('seg-btn--active');
     }
 
-    function backendButtons(img) {
-      var bs = img.backends || ['v86'];
-      var html = '';
-      // v86 button
-      if (bs.indexOf('v86') !== -1) {
-        html += '<button class="btn-backend" onclick="launch(\'v86\',\'' + img.key + '\',this)">' +
-          '<span class="btn-dot btn-dot--v86"></span>v86</button>';
-      }
-      // SMP button
-      if (bs.indexOf('v86-smp') !== -1) {
-        html += '<button class="btn-backend" onclick="launch(\'v86-smp\',\'' + img.key + '\',this)">' +
-          '<span class="btn-dot btn-dot--smp"></span>SMP</button>';
-      }
-      // QEMU button (always shown, always disabled)
-      html += '<button class="btn-backend" disabled>' +
-        '<span class="btn-dot btn-dot--qemu"></span>QEMU<span class="btn-tag">Soon</span></button>';
-      return html;
+    function launch(image, btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="btn-spinner"></span>Starting\u2026';
+      var id = crypto.randomUUID();
+      var prefix = currentBackend === 'v86-smp' ? '/smp/' : '/s/';
+      location.href = prefix + id + '?image=' + image;
     }
 
     (async function() {
@@ -86,7 +98,7 @@
               '<p>' + img.description + '</p>' +
               '<div class="card-meta">' + media + ' \u00b7 ' + img.memory + ' MB RAM</div>' +
             '</div>' +
-            '<div class="card-actions">' + backendButtons(img) + '</div>' +
+            '<button onclick="launch(\'' + img.key + '\', this)">Launch</button>' +
           '</div>';
         }).join('');
       } catch (e) {
