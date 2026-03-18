@@ -5,6 +5,7 @@ export const MSG_DELTA_FRAME = 1;
 export const MSG_SERIAL_DATA = 2;
 export const MSG_STATUS = 3;
 export const MSG_TEXT_SCREEN = 4;
+export const MSG_STATS = 5;
 
 // ── Rendering constants ─────────────────────────────────────────────────────
 

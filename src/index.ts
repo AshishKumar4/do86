@@ -111,6 +111,7 @@ function packAssets(assets: Record<string, ArrayBuffer>): ArrayBuffer {
 // ── Router ────────────────────────────────────────────────────────────────────
 
 const SESSION_RE = /^\/s\/([a-zA-Z0-9_-]+)$/;
+const STATS_RE   = /^\/stats\/([a-zA-Z0-9_-]+)$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -218,6 +219,19 @@ export default {
           memory: def.memory === DEFAULT_MEMORY_MB ? 256 : def.memory,
         })),
       );
+    }
+
+    // /stats/:sessionId — proxy to DO's /stats handler, returns JSON counters
+    const statsMatch = url.pathname.match(STATS_RE);
+    if (statsMatch && request.method === "GET") {
+      const sessionId = statsMatch[1];
+      const id = env.LINUX_VM.idFromName(`vm-${sessionId}`);
+      const stub = env.LINUX_VM.get(id);
+      const resp = await stub.fetch(new Request(new URL("/stats", request.url).toString()));
+      return new Response(resp.body, {
+        status: resp.status,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
     }
 
     if (url.pathname === "/api/health") {

@@ -142,10 +142,12 @@ export class SqlPageStore {
   // ── Counters ──────────────────────────────────────────────────────────────
 
   private _swapIns       = 0;
-  private _wasmHits      = 0;  // warm misses resolved by pool_lookup in WASM (counted on JS cold path only)
+  private _wasmHits      = 0;
   private _evictions     = 0;
   private _sqlReads      = 0;
   private _sqlWrites     = 0;
+  private _sqlReadMs     = 0;
+  private _sqlWriteMs    = 0;
 
   constructor(
     private readonly sql: SqlHandle,
@@ -402,7 +404,9 @@ export class SqlPageStore {
   private readFromSql(gpa: number): Uint8Array | null {
     this.init();
     this._sqlReads++;
+    const t0 = performance.now();
     const rows = [...this.sql.exec(`SELECT data FROM ram_pages WHERE gpa = ?`, gpa)];
+    this._sqlReadMs += performance.now() - t0;
     if (rows.length === 0) return null;
 
     const blob = rows[0].data;
@@ -426,10 +430,12 @@ export class SqlPageStore {
   private writeToSql(gpa: number, data: Uint8Array): void {
     this.init();
     this._sqlWrites++;
+    const t0 = performance.now();
     const blob = data.length === PAGE_SIZE
       ? data
       : data.subarray(0, Math.min(data.length, PAGE_SIZE));
     this.sql.exec(`INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES (?, ?)`, gpa, blob);
+    this._sqlWriteMs += performance.now() - t0;
   }
 
   // ── Internal helpers ──────────────────────────────────────────────────────
@@ -449,7 +455,12 @@ export class SqlPageStore {
       evictions:   this._evictions,
       sqlReads:    this._sqlReads,
       sqlWrites:   this._sqlWrites,
+      sqlReadMs:   Math.round(this._sqlReadMs),
+      sqlWriteMs:  Math.round(this._sqlWriteMs),
       hasWasmPool: this.pool !== null,
     };
   }
+
+  /** Alias for external callers that want a plain object snapshot. */
+  getStats() { return this.stats; }
 }

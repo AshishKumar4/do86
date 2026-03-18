@@ -12,7 +12,7 @@ import {
   EMULATOR_LOAD_TIMEOUT_MS, SNAPSHOT_DELAY_FAST_MS, SNAPSHOT_DELAY_SLOW_MS,
 } from "./types";
 import { DOScreenAdapter } from "./screen-adapter";
-import { DeltaEncoder, encodeSerialData, encodeStatus, encodeTextScreen } from "./delta-encoder";
+import { DeltaEncoder, encodeSerialData, encodeStats, encodeStatus, encodeTextScreen } from "./delta-encoder";
 import { SqliteStorage, SqliteImageCache, SQLiteBlockDevice, unpackAssets } from "./sqlite-storage";
 import { SqlPageStore, type PageStoreConfig } from "./sql-page-store";
 import type { Env } from "./index";
@@ -163,6 +163,18 @@ export class LinuxVM extends DurableObject<Env> {
   // skipped (noSnapshot / already exists), or (c) the snapshot attempt fails.
   private inputGated = false;
 
+  // ── Performance counters (reset on each cold boot) ───────────────────
+  private _perf = {
+    yields:      0,   // total yield callbacks (sync + async)
+    syncYields:  0,   // synchronous fast-path yields (BATCH-1 of every BATCH)
+    renders:     0,   // renderFrame() calls
+    renderMs:    0,   // cumulative ms spent in renderFrame()
+    framesSent:  0,   // binary frames delivered to ≥1 client
+    bootTimeMs:  0,   // performance.now() at boot complete
+  };
+  private _pageStore: SqlPageStore | null = null;
+  private _statsInterval: ReturnType<typeof setInterval> | null = null;
+
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
     // Non-hibernating DO: no session restore needed.
@@ -178,9 +190,14 @@ export class LinuxVM extends DurableObject<Env> {
       return Response.json({ running: this.booted || this.booting });
     }
 
+    if (url.pathname === "/stats" && request.method === "GET") {
+      return Response.json(this.collectStats());
+    }
+
     if (url.pathname === "/reboot" && request.method === "POST") {
       console.log(`${LOG_PREFIX} Reboot requested — stopping emulator`);
       if (this.renderInterval) { clearInterval(this.renderInterval); this.renderInterval = null; }
+      if (this._statsInterval) { clearInterval(this._statsInterval); this._statsInterval = null; }
       if (this.snapshotTimer) { clearTimeout(this.snapshotTimer); this.snapshotTimer = null; }
       if (this.emulator) {
         try { (this.emulator as any).stop?.(); } catch { /* ok */ }
@@ -291,6 +308,36 @@ export class LinuxVM extends DurableObject<Env> {
     }
 
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // ── Stats collection ──────────────────────────────────────────────────
+
+  private collectStats(): Record<string, unknown> {
+    const now = performance.now();
+    const uptimeMs = this._perf.bootTimeMs > 0
+      ? Math.round(now - this._perf.bootTimeMs)
+      : 0;
+    const p = this._perf;
+    const ps = this._pageStore?.getStats() ?? null;
+    return {
+      // DO-level
+      booted:      this.booted,
+      imageKey:    this.imageKey,
+      uptimeMs,
+      sessions:    this.sessions.size,
+      // Yield / CPU
+      yields:      p.yields,
+      syncYields:  p.syncYields,
+      asyncYields: p.yields - p.syncYields,
+      // Render
+      renders:     p.renders,
+      renderMs:    Math.round(p.renderMs),
+      framesSent:  p.framesSent,
+      rendersPerSec: uptimeMs > 0 ? +(p.renders / (uptimeMs / 1000)).toFixed(1) : 0,
+      framesPerSec:  uptimeMs > 0 ? +(p.framesSent / (uptimeMs / 1000)).toFixed(2) : 0,
+      // Page store
+      pageStore:   ps,
+    };
   }
 
   // ── Boot pipeline ─────────────────────────────────────────────────────
@@ -442,6 +489,9 @@ export class LinuxVM extends DurableObject<Env> {
         return syntheticTime;
       };
 
+      // Reset perf counters for this boot
+      this._perf = { yields: 0, syncYields: 0, renders: 0, renderMs: 0, framesSent: 0, bootTimeMs: 0 };
+
       // ── SqlPageStore: created BEFORE new V86() so the swap hook is live ───────
       // SeaBIOS runs during cpu.init() which is called synchronously inside the
       // V86 constructor chain (wasm_fn → new v86() → continue_init → v86.init).
@@ -455,6 +505,7 @@ export class LinuxVM extends DurableObject<Env> {
         VM_CONFIG.PAGE_STORE,
       );
       pageStore.init();
+      this._pageStore = pageStore;
 
       const v86Config: Record<string, any> = {
         wasm_fn: async (importObj: any) => {
@@ -632,21 +683,18 @@ export class LinuxVM extends DurableObject<Env> {
             let yieldCount = 0;
             v86Internal.yield = (t: number, tick: number) => {
               yieldCount++;
+              this._perf.yields++;
               if (yieldCount % BATCH_SIZE !== 0) {
                 // Synchronous fast path: no event loop round-trip, no setTimeout cost.
-                // Stack depth stays bounded (v86's own yield fires every ~1ms).
+                this._perf.syncYields++;
                 v86Internal.yield_callback(tick);
                 return;
               }
               // Batch boundary: render, then schedule next batch via setTimeout.
               try { this.renderFrame(); } catch (_) {}
               if (t > 10) {
-                // Guest is idle (HLT). Sleep proportionally — cap at 40ms so we
-                // stay responsive to heartbeats and input events.
                 setTimeout(() => v86Internal.yield_callback(tick), Math.min(t, 40));
               } else {
-                // Guest is active. Use setTimeout(fn, 1) — just enough to flush
-                // WS sends and process incoming messages without burning delay.
                 setTimeout(() => v86Internal.yield_callback(tick), 1);
               }
             };
@@ -665,9 +713,11 @@ export class LinuxVM extends DurableObject<Env> {
       }
 
       this.booted = true;
+      this._perf.bootTimeMs = performance.now();
       this.restoredFromSnapshot = !!savedState;
       this.cachedAssets = null;
       this.startRenderLoop();
+      this.startStatsInterval();
 
       if (savedState) {
         // Restored from snapshot — no need to gate input or save again
@@ -809,6 +859,19 @@ export class LinuxVM extends DurableObject<Env> {
     }
   }
 
+  private startStatsInterval(): void {
+    if (this._statsInterval) clearInterval(this._statsInterval);
+    this._statsInterval = setInterval(() => {
+      if (!this.booted || this.sessions.size === 0) return;
+      try {
+        const stats = this.collectStats();
+        this.broadcast(encodeStats(stats));
+        // Also log to console every 10s for wrangler tail visibility
+        console.log(`${LOG_PREFIX} STATS ${JSON.stringify(stats)}`);
+      } catch { /* non-fatal */ }
+    }, 10_000);
+  }
+
   // ── VGA pixel reader ──────────────────────────────────────────────────
   //
   // Reads pixel data directly from wasm linear memory.
@@ -900,7 +963,12 @@ export class LinuxVM extends DurableObject<Env> {
    private _dbgFirstEncNull = false;
    private renderFrame(): void {
      this._renderCount++;
-     if (!this.emulator || !this.screenAdapter || this.sessions.size === 0) return;
+     this._perf.renders++;
+     const _rfT0 = performance.now();
+     if (!this.emulator || !this.screenAdapter || this.sessions.size === 0) {
+       this._perf.renderMs += performance.now() - _rfT0;
+       return;
+     }
 
      const vga = this.getVga();
 
@@ -960,15 +1028,17 @@ export class LinuxVM extends DurableObject<Env> {
       if (!result) return;
 
       this.adjustFrameRate(result.data.byteLength);
+      this._perf.renderMs += performance.now() - _rfT0;
       this.sendFrameToClients(result, frame);
     } else {
       const textRows = this.screenAdapter.getTextScreen();
-      if (textRows.length === 0) return;
+      if (textRows.length === 0) { this._perf.renderMs += performance.now() - _rfT0; return; }
 
       const textContent = textRows.join("\n");
-      if (textContent === this.lastTextContent) return;
+      if (textContent === this.lastTextContent) { this._perf.renderMs += performance.now() - _rfT0; return; }
       this.lastTextContent = textContent;
 
+      this._perf.renderMs += performance.now() - _rfT0;
       this.broadcast(encodeTextScreen(
         this.screenAdapter.textWidth_, this.screenAdapter.textHeight_, textRows,
       ));
@@ -1007,6 +1077,7 @@ export class LinuxVM extends DurableObject<Env> {
         state.lastSendTime = now;
         state.droppedFrames = 0;
         state.needsKeyframe = false;
+        this._perf.framesSent++;
       } catch {
         // WebSocket send failed — client disconnected
         dead.push(ws);
