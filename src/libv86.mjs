@@ -19620,7 +19620,10 @@ CPU.prototype.init = function(settings, device_bus) {
     ide_config[1][0] = { is_cdrom: true, buffer: settings.cdrom };
     this.devices.ide = new IDEController(this, device_bus, ide_config);
     this.devices.cdrom = this.devices.ide.secondary.master;
-    this.devices.ahci = new AHCIController(this, device_bus);
+    this.devices.ahci = new AHCIController(this, device_bus, {
+      ahci_disk_size: settings.ahci_disk_size || 0,
+      hda: settings.ahci_hda || null
+    });
     this.devices.pit = new PIT(this, device_bus);
     if (settings.net_device.type === "ne2k") {
       this.devices.net = new Ne2k(this, device_bus, settings.preserve_mac_from_state_image, settings.mac_address_translation);

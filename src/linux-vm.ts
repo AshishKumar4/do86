@@ -646,7 +646,8 @@ export class LinuxVM extends DurableObject<Env> {
       }
 
       const origOnError = globalThis.onerror;
-      console.log(`${LOG_PREFIX} Calling new V86(config)`);
+      // Log v86 config summary for debugging (omit large buffers)
+      console.log(`${LOG_PREFIX} v86Config: memory=${memorySizeMB}MB logical=${logicalMemoryMB}MB vga=${vgaMemoryMB}MB drive=${drive} acpi=${v86Config.acpi} ahci_disk_size=${v86Config.ahci_disk_size || 0} multiboot=${!!v86Config.multiboot} cdrom=${!!v86Config.cdrom} fda=${!!v86Config.fda}`);
       this.emulator = new V86(v86Config);
       console.log(`${LOG_PREFIX} new V86() returned — waiting for emulator-loaded`);
 
@@ -1490,6 +1491,8 @@ export class LinuxVM extends DurableObject<Env> {
       vgaMemory: imageDef.vgaMemory,
       label: imageDef.label,
       noSnapshot: imageDef.noSnapshot ?? false,
+      ...(imageDef.ahciDiskSize ? { ahciDiskSize: imageDef.ahciDiskSize } : {}),
+      ...(imageDef.logicalMemory ? { logicalMemory: imageDef.logicalMemory } : {}),
       // disk was resolved above, no need for diskUrl — pass it inline
     };
     assets.set("disk", disk);
