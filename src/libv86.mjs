@@ -20018,16 +20018,13 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
       this.test_hook_did_finalize_wasm(code);
     }
   }).catch((err) => {
-    // Always reset the compiling flag on failure so future JIT compilations
-    // are not permanently blocked.  Without this, if WebAssembly.instantiate
-    // rejects (e.g. in workerd: "Wasm code generation disallowed by embedder"),
-    // codegen_finalize_finished is never called → ctx.compiling stays true
-    // forever → all future JIT is dead.
-    this.codegen_finalize_finished(wasm_table_index, start, state_flags);
-    if (DEBUG) {
-      console.log(err);
-      debugger;
-    }
+    // WebAssembly.instantiate failed (e.g. workerd: "Wasm code generation
+    // disallowed by embedder").  Do NOT call codegen_finalize_finished —
+    // no function was installed in wasm_table, so finalizing would leave a
+    // null slot that causes "function signature mismatch" on call_indirect.
+    // ctx.compiling stays Some(...), blocking future JIT — acceptable since
+    // the interpreter works fine and this only happens in environments that
+    // block runtime WASM compilation anyway.
   });
 };
 CPU.prototype.log_uncompiled_code = function(start, end) {
