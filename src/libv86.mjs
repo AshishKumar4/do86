@@ -19431,9 +19431,10 @@ CPU.prototype.create_memory = function(size, minimum_size) {
   dbg_assert((size & MMAP_BLOCK_SIZE - 1) === 0);
   console.assert(this.memory_size[0] === 0, "Expected uninitialised memory");
   this.memory_size[0] = size;
-  const memory_offset = this.allocate_memory(size);
-  this.mem8 = view(Uint8Array, this.wasm_memory, memory_offset, size);
-  this.mem32s = view(Uint32Array, this.wasm_memory, memory_offset, size >> 2);
+  const alloc_size = Math.max(size, this._logical_memory_size || size);
+  const memory_offset = this.allocate_memory(alloc_size);
+  this.mem8 = view(Uint8Array, this.wasm_memory, memory_offset, alloc_size);
+  this.mem32s = view(Uint32Array, this.wasm_memory, memory_offset, alloc_size >> 2);
 };
 CPU.prototype.init = function(settings, device_bus) {
   this.create_memory(
