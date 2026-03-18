@@ -5,6 +5,7 @@ export const MSG_DELTA_FRAME = 1;
 export const MSG_SERIAL_DATA = 2;
 export const MSG_STATUS = 3;
 export const MSG_TEXT_SCREEN = 4;
+export const MSG_STATS = 5;
 
 // ── Rendering constants ─────────────────────────────────────────────────────
 
@@ -29,7 +30,7 @@ export const CACHE_DEVICE = "cache";
 export const BOOT_ORDER_CDROM_FIRST = 0x213;
 export const BOOT_ORDER_HDA_FIRST = 0x312;
 export const EMULATOR_LOAD_TIMEOUT_MS = 30_000;
-export const SNAPSHOT_DELAY_FAST_MS = 30_000;  // KolibriOS — boots fast
+export const SNAPSHOT_DELAY_FAST_MS = 30_000;  // KolibriOS — must be long enough for OS to fully boot before snapshot
 export const SNAPSHOT_DELAY_SLOW_MS = 60_000;  // Heavier OSes
 
 // ── Log prefix ──────────────────────────────────────────────────────────────
@@ -62,6 +63,7 @@ export interface VgaDevice {
     wasm_memory: WebAssembly.Memory;
     svga_dirty_bitmap_min_offset: Uint32Array;
     svga_dirty_bitmap_max_offset: Uint32Array;
+    svga_mark_dirty(): void;
   };
   screen: any;
   graphical_mode: boolean;

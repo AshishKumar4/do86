@@ -11138,10 +11138,7 @@ var AHCICommandProcessor = class {
       const entry = prdt_entries[0];
       const dest_addr = entry.dba.low;
       const xfer_size = Math.min(512, entry.dbc);
-      const mem8 = this.controller.cpu.mem8;
-      for (let i = 0; i < xfer_size; i++) {
-        mem8[dest_addr + i] = identify_bytes[i];
-      }
+      this.controller.cpu.dma_write(dest_addr, identify_bytes, xfer_size);
       cmd_header.prdbc = xfer_size;
     }
     this.complete_command_success(slot);
@@ -11168,7 +11165,7 @@ var AHCICommandProcessor = class {
     }
     const disk_offset = lba * this.sector_size;
     const transfer_size = count * this.sector_size;
-    const mem8 = this.controller.cpu.mem8;
+    const cpu = this.controller.cpu;
     const prdt_entries = this.get_prdt_entries(cmd_header);
     let transferred = 0;
     let disk_pos = disk_offset;
@@ -11181,10 +11178,11 @@ var AHCICommandProcessor = class {
       const src_end = Math.min(disk_pos + size, disk.data.length);
       const copy_len = src_end - disk_pos;
       if (copy_len > 0) {
-        mem8.set(disk.data.subarray(disk_pos, src_end), memory_addr);
+        cpu.dma_write(memory_addr, disk.data.subarray(disk_pos, src_end), copy_len);
       }
       if (copy_len < size) {
-        mem8.fill(0, memory_addr + copy_len, memory_addr + size);
+        const zeros = new Uint8Array(size - copy_len);
+        cpu.dma_write(memory_addr + copy_len, zeros);
       }
       transferred += size;
       disk_pos += size;
@@ -11211,7 +11209,7 @@ var AHCICommandProcessor = class {
     }
     const disk_offset = lba * this.sector_size;
     const transfer_size = count * this.sector_size;
-    const mem8 = this.controller.cpu.mem8;
+    const cpu = this.controller.cpu;
     const prdt_entries = this.get_prdt_entries(cmd_header);
     let transferred = 0;
     let disk_pos = disk_offset;
@@ -11224,7 +11222,8 @@ var AHCICommandProcessor = class {
       const dest_end = Math.min(disk_pos + size, disk.data.length);
       const copy_len = dest_end - disk_pos;
       if (copy_len > 0) {
-        disk.data.set(mem8.subarray(memory_addr, memory_addr + copy_len), disk_pos);
+        const guest_data = cpu.dma_read(memory_addr, copy_len);
+        disk.data.set(guest_data, disk_pos);
       }
       transferred += size;
       disk_pos += size;
@@ -11277,9 +11276,8 @@ var AHCICommandProcessor = class {
     if (clb === 0) {
       return null;
     }
-    const mem8 = this.controller.cpu.mem8;
     const entry_addr = clb + slot * 32;
-    const cmd_list_buffer = mem8.subarray(entry_addr, entry_addr + 32);
+    const cmd_list_buffer = this.controller.cpu.dma_read(entry_addr, 32);
     return new AHCICommandHeader(slot, cmd_list_buffer, 0);
   }
   /**
@@ -11298,8 +11296,7 @@ var AHCICommandProcessor = class {
     }
     const prdtl = cmd_header.prdtl;
     const tbl_size = 128 + prdtl * 16;
-    const mem8 = this.controller.cpu.mem8;
-    return mem8.subarray(ctba.low, ctba.low + tbl_size);
+    return this.controller.cpu.dma_read(ctba.low, tbl_size);
   }
   /**
    * Execute ATA command
@@ -11387,10 +11384,7 @@ var AHCICommandProcessor = class {
       const entry = prdt_entries[0];
       const dest_addr = entry.dba.low;
       const xfer_size = Math.min(512, entry.dbc);
-      const mem8 = this.controller.cpu.mem8;
-      for (let i = 0; i < xfer_size; i++) {
-        mem8[dest_addr + i] = identify_bytes[i];
-      }
+      this.controller.cpu.dma_write(dest_addr, identify_bytes, xfer_size);
       cmd_header.prdbc = xfer_size;
     }
     this.complete_command_success(slot);
@@ -11551,11 +11545,11 @@ var AHCICommandProcessor = class {
   create_d2h_fis(lba = 0, count = 0) {
     const fb = this.port.fb;
     if (!fb) return;
-    const mem8 = this.controller.cpu.mem8;
     const fis_addr = fb + 64;
-    const fis_buf = mem8.subarray(fis_addr, fis_addr + 20);
+    const fis_buf = new Uint8Array(20);
     const fis = new RegisterFIS_D2H(fis_buf, 0);
     fis.set_success(lba, count);
+    this.controller.cpu.dma_write(fis_addr, fis_buf);
     dbg_log("AHCI Port " + this.port_num + ": Wrote D2H Register FIS to " + h(fis_addr), LOG_DISK);
   }
   /**
@@ -11565,17 +11559,18 @@ var AHCICommandProcessor = class {
   create_sdb_fis(slot) {
     const fb = this.port.fb;
     if (!fb) return;
-    const mem8 = this.controller.cpu.mem8;
     const fis_addr = fb + 88;
-    mem8[fis_addr + 0] = FIS_TYPE_DEV_BITS;
-    mem8[fis_addr + 1] = 64;
-    mem8[fis_addr + 2] = ATA_STATUS_DRDY | ATA_STATUS_DSC;
-    mem8[fis_addr + 3] = 0;
+    const buf = new Uint8Array(8);
+    buf[0] = FIS_TYPE_DEV_BITS;
+    buf[1] = 64;
+    buf[2] = ATA_STATUS_DRDY | ATA_STATUS_DSC;
+    buf[3] = 0;
     const sact_clear = ~(1 << slot) >>> 0;
-    mem8[fis_addr + 4] = sact_clear & 255;
-    mem8[fis_addr + 5] = sact_clear >> 8 & 255;
-    mem8[fis_addr + 6] = sact_clear >> 16 & 255;
-    mem8[fis_addr + 7] = sact_clear >> 24 & 255;
+    buf[4] = sact_clear & 255;
+    buf[5] = sact_clear >> 8 & 255;
+    buf[6] = sact_clear >> 16 & 255;
+    buf[7] = sact_clear >> 24 & 255;
+    this.controller.cpu.dma_write(fis_addr, buf);
     dbg_log("AHCI Port " + this.port_num + ": Wrote Set Device Bits FIS for slot " + slot + " to " + h(fis_addr), LOG_DISK);
   }
   /**
@@ -11609,11 +11604,11 @@ var AHCICommandProcessor = class {
   create_error_fis(error_code) {
     const fb = this.port.fb;
     if (!fb) return;
-    const mem8 = this.controller.cpu.mem8;
     const fis_addr = fb + 64;
-    const fis_buf = mem8.subarray(fis_addr, fis_addr + 20);
+    const fis_buf = new Uint8Array(20);
     const fis = new RegisterFIS_D2H(fis_buf, 0);
     fis.set_error(error_code);
+    this.controller.cpu.dma_write(fis_addr, fis_buf);
     dbg_log("AHCI Port " + this.port_num + ": Wrote error D2H FIS (err=" + h(error_code) + ") to " + h(fis_addr), LOG_DISK);
   }
   /**
@@ -11937,10 +11932,8 @@ var AHCIDMAManager = class {
    */
   async copy_from_memory(memory_addr, buffer, size) {
     dbg_log("AHCI DMA: Copying " + size + " bytes from mem " + h(memory_addr) + " to DMA buffer", LOG_DISK);
-    const mem8 = this.cpu.mem8;
-    for (let i = 0; i < size; i++) {
-      buffer[i] = mem8[memory_addr + i];
-    }
+    const data = this.cpu.dma_read(memory_addr, size);
+    buffer.set(data.subarray(0, size));
   }
   /**
    * Copy data from DMA buffer to memory
@@ -11950,10 +11943,7 @@ var AHCIDMAManager = class {
    */
   async copy_to_memory(buffer, memory_addr, size) {
     dbg_log("AHCI DMA: Copying " + size + " bytes from DMA buffer to mem " + h(memory_addr), LOG_DISK);
-    const mem8 = this.cpu.mem8;
-    for (let i = 0; i < size; i++) {
-      mem8[memory_addr + i] = buffer[i];
-    }
+    this.cpu.dma_write(memory_addr, buffer, size);
   }
   /**
    * Simulate disk read operation
@@ -18809,6 +18799,7 @@ function CPU(bus, wm, stop_idling) {
   const memory = this.wm.exports.memory;
   this.wasm_memory = memory;
   this.memory_size = view(Uint32Array, memory, 812, 1);
+  this.wasm_logical_memory_size = view(Uint32Array, memory, 1132, 1);
   this.mem8 = new Uint8Array(0);
   this.mem32s = new Int32Array(this.mem8.buffer);
   this.segment_is_null = view(Uint8Array, memory, 724, 8);
@@ -18930,6 +18921,74 @@ CPU.prototype.mmap_write128 = function(addr, value0, value1, value2, value3) {
   write_func32(addr + 8, value2);
   write_func32(addr + 12, value3);
 };
+CPU.prototype.swap_page_in = function(gpa, for_writing) {
+  if (this._swap_page_in_hook) {
+    return this._swap_page_in_hook(gpa, for_writing) | 0;
+  }
+  return -1;
+};
+CPU.prototype.resolveGPA = function(gpa) {
+  const page_gpa = gpa & ~4095;
+  const page_off = gpa & 4095;
+  if (page_gpa < this.memory_size[0]) {
+    return gpa;
+  }
+  if (this.pool_lookup) {
+    const frame2 = this.pool_lookup(page_gpa);
+    if (frame2 > 0) {
+      return frame2 + page_off;
+    }
+  }
+  const frame = this.swap_page_in(page_gpa, 0);
+  if (frame > 0) {
+    return frame + page_off;
+  }
+  return -1;
+};
+CPU.prototype.dma_read = function(gpa, size) {
+  const result = new Uint8Array(size);
+  let pos = 0;
+  while (pos < size) {
+    const page_offset = gpa + pos & 4095;
+    const chunk = Math.min(size - pos, 4096 - page_offset);
+    const resolved = this.resolveGPA(gpa + pos);
+    if (resolved >= 0 && resolved + chunk <= this.mem8.length) {
+      result.set(this.mem8.subarray(resolved, resolved + chunk), pos);
+    }
+    pos += chunk;
+  }
+  return result;
+};
+CPU.prototype.dma_write = function(gpa, data, size) {
+  if (size === void 0) size = data.length;
+  let pos = 0;
+  while (pos < size) {
+    const page_offset = gpa + pos & 4095;
+    const chunk = Math.min(size - pos, 4096 - page_offset);
+    const page_gpa = gpa + pos & ~4095;
+    let resolved;
+    if (page_gpa < this.memory_size[0]) {
+      resolved = gpa + pos;
+    } else {
+      if (this.pool_lookup) {
+        const frame = this.pool_lookup(page_gpa);
+        if (frame > 0) {
+          resolved = frame + page_offset;
+        }
+      }
+      if (resolved === void 0) {
+        const frame = this.swap_page_in(page_gpa, 1);
+        if (frame > 0) {
+          resolved = frame + page_offset;
+        }
+      }
+    }
+    if (resolved !== void 0 && resolved >= 0 && resolved + chunk <= this.mem8.length) {
+      this.mem8.set(data.subarray(pos, pos + chunk), resolved);
+    }
+    pos += chunk;
+  }
+};
 CPU.prototype.write_blob = function(blob, offset) {
   dbg_assert(blob && blob.length >= 0);
   if (blob.length) {
@@ -19018,6 +19077,7 @@ CPU.prototype.wasm_patch = function() {
   this.zstd_free_ctx = get_import("zstd_free_ctx");
   this.zstd_read = get_import("zstd_read");
   this.zstd_read_free = get_import("zstd_read_free");
+  this.pool_lookup = get_optional_import("pool_lookup");
   this.smp_init = get_optional_import("smp_init");
   this.smp_cpu_loop = get_optional_import("smp_cpu_loop");
   this.smp_is_enabled = get_optional_import("smp_is_enabled");
@@ -19381,7 +19441,6 @@ CPU.prototype.pack_memory = function() {
   return { bitmap, packed_memory };
 };
 CPU.prototype.unpack_memory = function(bitmap, packed_memory) {
-  this.zero_memory(0, this.memory_size[0]);
   const page_count = this.memory_size[0] >> 12;
   let packed_page = 0;
   for (let page = 0; page < page_count; page++) {
@@ -19440,6 +19499,8 @@ CPU.prototype.init = function(settings, device_bus) {
   }
   settings.cpuid_level && this.set_cpuid_level(settings.cpuid_level);
   this.acpi_enabled[0] = +settings.acpi;
+  this._logical_memory_size = settings.logical_memory_size || this.memory_size[0];
+  this.wasm_logical_memory_size[0] = this._logical_memory_size;
   this.reset_cpu();
   if (this.smp_init) {
     const cpu_count = settings.cpu_count | 0 || 1;
@@ -19539,7 +19600,7 @@ CPU.prototype.init = function(settings, device_bus) {
     } else if (value === FW_CFG_ID) {
       this.fw_value = i32(0);
     } else if (value === FW_CFG_RAM_SIZE) {
-      this.fw_value = i32(this.memory_size[0]);
+      this.fw_value = i32(this._logical_memory_size || this.memory_size[0]);
     } else if (value === FW_CFG_NB_CPUS) {
       this.fw_value = i32(1);
     } else if (value === FW_CFG_MAX_CPUS) {
@@ -19612,7 +19673,10 @@ CPU.prototype.init = function(settings, device_bus) {
     ide_config[1][0] = { is_cdrom: true, buffer: settings.cdrom };
     this.devices.ide = new IDEController(this, device_bus, ide_config);
     this.devices.cdrom = this.devices.ide.secondary.master;
-    this.devices.ahci = new AHCIController(this, device_bus);
+    this.devices.ahci = new AHCIController(this, device_bus, {
+      ahci_disk_size: settings.ahci_disk_size || 0,
+      hda: settings.ahci_hda || null
+    });
     this.devices.pit = new PIT(this, device_bus);
     if (settings.net_device.type === "ne2k") {
       this.devices.net = new Ne2k(this, device_bus, settings.preserve_mac_from_state_image, settings.mac_address_translation);
@@ -19711,15 +19775,27 @@ CPU.prototype.load_multiboot_option_rom = function(buffer, initrd, cmdline) {
         cpu.write_blob(cmdline_utf8, multiboot_data);
         multiboot_data += cmdline_utf8.length;
       }
+      {
+        const reported_mem = cpu._logical_memory_size || cpu.memory_size[0];
+        info |= 1;
+        cpu.write32(multiboot_info_addr + 4, 640);
+        cpu.write32(
+          multiboot_info_addr + 8,
+          Math.max(0, reported_mem - 1024 * 1024) >> 10
+        );
+      }
       if (flags & MULTIBOOT_HEADER_MEMORY_INFO) {
         info |= MULTIBOOT_INFO_MEM_MAP;
         let multiboot_mmap_count = 0;
         cpu.write32(multiboot_info_addr + 44, 0);
         cpu.write32(multiboot_info_addr + 48, multiboot_data);
+        const reported_size = cpu._logical_memory_size || cpu.memory_size[0];
         let start = 0;
         let was_memory = false;
         for (let addr = 0; addr < MMAP_MAX; addr += MMAP_BLOCK_SIZE) {
-          if (was_memory && cpu.memory_map_read8[addr >>> MMAP_BLOCK_BITS] !== void 0) {
+          const has_handler = cpu.memory_map_read8[addr >>> MMAP_BLOCK_BITS] !== void 0;
+          const is_ram = addr < reported_size && (!has_handler || addr >= cpu.memory_size[0]);
+          if (was_memory && !is_ram) {
             cpu.write32(multiboot_data, 20);
             cpu.write32(multiboot_data + 4, start);
             cpu.write32(multiboot_data + 8, 0);
@@ -19729,12 +19805,21 @@ CPU.prototype.load_multiboot_option_rom = function(buffer, initrd, cmdline) {
             multiboot_data += 24;
             multiboot_mmap_count += 24;
             was_memory = false;
-          } else if (!was_memory && cpu.memory_map_read8[addr >>> MMAP_BLOCK_BITS] === void 0) {
+          } else if (!was_memory && is_ram) {
             start = addr;
             was_memory = true;
           }
         }
-        dbg_assert(!was_memory, "top of 4GB shouldn't have memory");
+        if (was_memory) {
+          cpu.write32(multiboot_data, 20);
+          cpu.write32(multiboot_data + 4, start);
+          cpu.write32(multiboot_data + 8, 0);
+          cpu.write32(multiboot_data + 12, reported_size - start);
+          cpu.write32(multiboot_data + 16, 0);
+          cpu.write32(multiboot_data + 20, 1);
+          multiboot_data += 24;
+          multiboot_mmap_count += 24;
+        }
         cpu.write32(multiboot_info_addr + 44, multiboot_mmap_count);
       }
       let entrypoint = 0;
@@ -19890,9 +19975,10 @@ CPU.prototype.fill_cmos = function(rtc, settings) {
   rtc.cmos_write(CMOS_BIOS_BOOTFLAG2, boot_order & 255);
   rtc.cmos_write(CMOS_MEM_BASE_LOW, 640 & 255);
   rtc.cmos_write(CMOS_MEM_BASE_HIGH, 640 >> 8);
+  var reported_mem = this._logical_memory_size || this.memory_size[0];
   var memory_above_1m = 0;
-  if (this.memory_size[0] >= 1024 * 1024) {
-    memory_above_1m = this.memory_size[0] - 1024 * 1024 >> 10;
+  if (reported_mem >= 1024 * 1024) {
+    memory_above_1m = reported_mem - 1024 * 1024 >> 10;
     memory_above_1m = Math.min(memory_above_1m, 65535);
   }
   rtc.cmos_write(CMOS_MEM_OLD_EXT_LOW, memory_above_1m & 255);
@@ -19900,8 +19986,8 @@ CPU.prototype.fill_cmos = function(rtc, settings) {
   rtc.cmos_write(CMOS_MEM_EXTMEM_LOW, memory_above_1m & 255);
   rtc.cmos_write(CMOS_MEM_EXTMEM_HIGH, memory_above_1m >> 8 & 255);
   var memory_above_16m = 0;
-  if (this.memory_size[0] >= 16 * 1024 * 1024) {
-    memory_above_16m = this.memory_size[0] - 16 * 1024 * 1024 >> 16;
+  if (reported_mem >= 16 * 1024 * 1024) {
+    memory_above_16m = reported_mem - 16 * 1024 * 1024 >> 16;
     memory_above_16m = Math.min(memory_above_16m, 65535);
   }
   rtc.cmos_write(CMOS_MEM_EXTMEM2_LOW, memory_above_16m & 255);
@@ -20005,14 +20091,12 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
     if (this.test_hook_did_finalize_wasm) {
       this.test_hook_did_finalize_wasm(code);
     }
-  });
-  if (false) {
-    result.catch((e) => {
-      console.log(e);
+  }).catch((err) => {
+    if (false) {
+      console.log(err);
       debugger;
-      throw e;
-    });
-  }
+    }
+  });
 };
 CPU.prototype.log_uncompiled_code = function(start, end) {
   if (true) {
@@ -20631,6 +20715,138 @@ function restore_state(cpu, state) {
     state_object = restore_buffers(state_object, buffers);
     cpu.set_state(state_object);
   }
+}
+
+// src/main.js
+function v86(bus, wasm) {
+  this.running = false;
+  this.stopping = false;
+  this.idle = true;
+  this.tick_counter = 0;
+  this.worker = null;
+  this.cpu = new CPU(bus, wasm, () => {
+    this.idle && this.next_tick(0);
+  });
+  this.bus = bus;
+  this.register_yield();
+}
+v86.prototype.run = function() {
+  this.stopping = false;
+  if (!this.running) {
+    this.running = true;
+    this.bus.send("emulator-started");
+  }
+  this.next_tick(0);
+};
+v86.prototype.do_tick = function() {
+  if (this.stopping || !this.running) {
+    this.stopping = this.running = false;
+    this.bus.send("emulator-stopped");
+    return;
+  }
+  this.idle = false;
+  const t = this.cpu.main_loop();
+  this.next_tick(t);
+};
+v86.prototype.next_tick = function(t) {
+  const tick = ++this.tick_counter;
+  this.idle = true;
+  this.yield(t, tick);
+};
+v86.prototype.yield_callback = function(tick) {
+  if (tick === this.tick_counter) {
+    this.do_tick();
+  }
+};
+v86.prototype.stop = function() {
+  if (this.running) {
+    this.stopping = true;
+  }
+};
+v86.prototype.destroy = function() {
+  this.unregister_yield();
+};
+v86.prototype.restart = function() {
+  this.cpu.reset_cpu();
+  this.cpu.load_bios();
+};
+v86.prototype.init = function(settings) {
+  this.cpu.init(settings, this.bus);
+  this.bus.send("emulator-ready");
+};
+if (typeof process !== "undefined") {
+  v86.prototype.yield = function(t, tick) {
+    if (t < 1) {
+      global.setImmediate((tick2) => this.yield_callback(tick2), tick);
+    } else {
+      setTimeout((tick2) => this.yield_callback(tick2), t, tick);
+    }
+  };
+  v86.prototype.register_yield = function() {
+  };
+  v86.prototype.unregister_yield = function() {
+  };
+} else if (globalThis["scheduler"] && typeof globalThis["scheduler"]["postTask"] === "function" && location.href.includes("use-scheduling-api")) {
+  v86.prototype.yield = function(t, tick) {
+    t = Math.max(0, t);
+    globalThis["scheduler"]["postTask"](() => this.yield_callback(tick), { delay: t });
+  };
+  v86.prototype.register_yield = function() {
+  };
+  v86.prototype.unregister_yield = function() {
+  };
+} else if (typeof Worker !== "undefined") {
+  let the_worker = function() {
+    let timeout;
+    globalThis.onmessage = function(e) {
+      const t = e.data.t;
+      timeout = timeout && clearTimeout(timeout);
+      if (t < 1) postMessage(e.data.tick);
+      else timeout = setTimeout(() => postMessage(e.data.tick), t);
+    };
+  };
+  v86.prototype.register_yield = function() {
+    const url = URL.createObjectURL(new Blob(["(" + the_worker.toString() + ")()"], { type: "text/javascript" }));
+    this.worker = new Worker(url);
+    this.worker.onmessage = (e) => this.yield_callback(e.data);
+    URL.revokeObjectURL(url);
+  };
+  v86.prototype.yield = function(t, tick) {
+    this.worker.postMessage({ t, tick });
+  };
+  v86.prototype.unregister_yield = function() {
+    this.worker && this.worker.terminate();
+    this.worker = null;
+  };
+} else {
+  v86.prototype.yield = function(t) {
+    setTimeout(() => {
+      this.do_tick();
+    }, t);
+  };
+  v86.prototype.register_yield = function() {
+  };
+  v86.prototype.unregister_yield = function() {
+  };
+}
+v86.prototype.save_state = function() {
+  return save_state(this.cpu);
+};
+v86.prototype.restore_state = function(state) {
+  return restore_state(this.cpu, state);
+};
+if (typeof performance === "object" && performance.now) {
+  v86.microtick = performance.now.bind(performance);
+} else if (typeof __require === "function") {
+  const { performance: performance2 } = __require("perf_hooks");
+  v86.microtick = performance2.now.bind(performance2);
+} else if (typeof process === "object" && process.hrtime) {
+  v86.microtick = function() {
+    var t = process.hrtime();
+    return t[0] * 1e3 + t[1] / 1e6;
+  };
+} else {
+  v86.microtick = Date.now;
 }
 
 // src/browser/print_stats.js
@@ -24206,6 +24422,13 @@ function V86(options) {
     "mmap_write128": function(addr, value0, value1, value2, value3) {
       cpu.mmap_write128(addr, value0, value1, value2, value3);
     },
+    // Demand-paging hook: called from do_page_walk when GPA >= PAGED_THRESHOLD.
+    // Delegates to cpu._swap_page_in_hook (set by do86/linux-vm.ts after emulator-loaded).
+    // for_writing: non-zero when the TLB entry is for a write — page store marks it dirty.
+    // Returns the WASM byte offset of the hot frame, or -1 if paging is not enabled.
+    "swap_page_in": function(gpa, for_writing) {
+      return cpu.swap_page_in(gpa, for_writing);
+    },
     "log_from_wasm": function(offset, len) {
       const str = read_sized_string_from_mem(wasm_memory, offset, len);
       dbg_log(str, LOG_CPU);
@@ -24297,6 +24520,7 @@ V86.prototype.continue_init = async function(emulator, options) {
   settings.load_devices = true;
   settings.memory_size = options.memory_size || 64 * 1024 * 1024;
   settings.vga_memory_size = options.vga_memory_size || 8 * 1024 * 1024;
+  settings.logical_memory_size = options.logical_memory_size || settings.memory_size;
   settings.boot_order = boot_order;
   settings.fastboot = options.fastboot || false;
   settings.fda = void 0;
@@ -25045,140 +25269,7 @@ if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
 } else if (typeof importScripts === "function") {
   self["V86"] = V86;
 }
-
-// src/main.js
-function v86(bus, wasm) {
-  this.running = false;
-  this.stopping = false;
-  this.idle = true;
-  this.tick_counter = 0;
-  this.worker = null;
-  this.cpu = new CPU(bus, wasm, () => {
-    this.idle && this.next_tick(0);
-  });
-  this.bus = bus;
-  this.register_yield();
-}
-v86.prototype.run = function() {
-  this.stopping = false;
-  if (!this.running) {
-    this.running = true;
-    this.bus.send("emulator-started");
-  }
-  this.next_tick(0);
-};
-v86.prototype.do_tick = function() {
-  if (this.stopping || !this.running) {
-    this.stopping = this.running = false;
-    this.bus.send("emulator-stopped");
-    return;
-  }
-  this.idle = false;
-  const t = this.cpu.main_loop();
-  this.next_tick(t);
-};
-v86.prototype.next_tick = function(t) {
-  const tick = ++this.tick_counter;
-  this.idle = true;
-  this.yield(t, tick);
-};
-v86.prototype.yield_callback = function(tick) {
-  if (tick === this.tick_counter) {
-    this.do_tick();
-  }
-};
-v86.prototype.stop = function() {
-  if (this.running) {
-    this.stopping = true;
-  }
-};
-v86.prototype.destroy = function() {
-  this.unregister_yield();
-};
-v86.prototype.restart = function() {
-  this.cpu.reset_cpu();
-  this.cpu.load_bios();
-};
-v86.prototype.init = function(settings) {
-  this.cpu.init(settings, this.bus);
-  this.bus.send("emulator-ready");
-};
-if (typeof process !== "undefined") {
-  v86.prototype.yield = function(t, tick) {
-    if (t < 1) {
-      global.setImmediate((tick2) => this.yield_callback(tick2), tick);
-    } else {
-      setTimeout((tick2) => this.yield_callback(tick2), t, tick);
-    }
-  };
-  v86.prototype.register_yield = function() {
-  };
-  v86.prototype.unregister_yield = function() {
-  };
-} else if (globalThis["scheduler"] && typeof globalThis["scheduler"]["postTask"] === "function" && location.href.includes("use-scheduling-api")) {
-  v86.prototype.yield = function(t, tick) {
-    t = Math.max(0, t);
-    globalThis["scheduler"]["postTask"](() => this.yield_callback(tick), { delay: t });
-  };
-  v86.prototype.register_yield = function() {
-  };
-  v86.prototype.unregister_yield = function() {
-  };
-} else if (typeof Worker !== "undefined") {
-  let the_worker = function() {
-    let timeout;
-    globalThis.onmessage = function(e) {
-      const t = e.data.t;
-      timeout = timeout && clearTimeout(timeout);
-      if (t < 1) postMessage(e.data.tick);
-      else timeout = setTimeout(() => postMessage(e.data.tick), t);
-    };
-  };
-  v86.prototype.register_yield = function() {
-    const url = URL.createObjectURL(new Blob(["(" + the_worker.toString() + ")()"], { type: "text/javascript" }));
-    this.worker = new Worker(url);
-    this.worker.onmessage = (e) => this.yield_callback(e.data);
-    URL.revokeObjectURL(url);
-  };
-  v86.prototype.yield = function(t, tick) {
-    this.worker.postMessage({ t, tick });
-  };
-  v86.prototype.unregister_yield = function() {
-    this.worker && this.worker.terminate();
-    this.worker = null;
-  };
-} else {
-  v86.prototype.yield = function(t) {
-    setTimeout(() => {
-      this.do_tick();
-    }, t);
-  };
-  v86.prototype.register_yield = function() {
-  };
-  v86.prototype.unregister_yield = function() {
-  };
-}
-v86.prototype.save_state = function() {
-  return save_state(this.cpu);
-};
-v86.prototype.restore_state = function(state) {
-  return restore_state(this.cpu, state);
-};
-if (typeof performance === "object" && performance.now) {
-  v86.microtick = performance.now.bind(performance);
-} else if (typeof __require === "function") {
-  const { performance: performance2 } = __require("perf_hooks");
-  v86.microtick = performance2.now.bind(performance2);
-} else if (typeof process === "object" && process.hrtime) {
-  v86.microtick = function() {
-    var t = process.hrtime();
-    return t[0] * 1e3 + t[1] / 1e6;
-  };
-} else {
-  v86.microtick = Date.now;
-}
 export {
-  V86,
-  v86
+  V86
 };
 //# sourceMappingURL=libv86.mjs.map

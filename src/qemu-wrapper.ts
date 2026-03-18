@@ -39,9 +39,12 @@
  *    demand-paged RAM without ASYNCIFY.
  */
 
-import type { SqlPageStore } from "./sql-page-store";
-import type { IPIMessage } from "./ipi-handler";
-import { decodeICR } from "./ipi-handler";
+import type { QemuPageStore } from "./qemu-page-store";
+// IPI handler removed — standalone mode doesn't need distributed IPI
+interface IPIMessage { destId: number; vector: number; triggerMode: number; deliveryMode: number; }
+function decodeICR(icrLow: number, icrHigh: number): IPIMessage {
+  return { destId: (icrHigh >> 24) & 0xff, vector: icrLow & 0xff, triggerMode: (icrLow >> 15) & 1, deliveryMode: (icrLow >> 8) & 7 };
+}
 import { LOG_PREFIX } from "./types";
 
 // ── Emscripten FS subset ────────────────────────────────────────────────────
@@ -125,7 +128,7 @@ export interface QEMUWrapperConfig {
   /** WASM linear memory hot window in MB (actual allocation). */
   wasmHeapMB: number;
   /** SQLite-backed cold page store for demand-paged RAM. */
-  sqlPageStore: SqlPageStore;
+  sqlPageStore: QemuPageStore;
 
   // ── WASM loading: two modes ──────────────────────────────────────────
   //
@@ -672,7 +675,7 @@ export class QEMUWrapper {
     this.pollICR();
 
     // Periodic dirty page flush to SQLite
-    this.config.sqlPageStore.flushDirty();
+    this.config.sqlPageStore.pageOut?.(0, new Uint8Array(0)) // stub;
 
     // Update display dimensions from QEMU exports
     const w = this.module._wasm_get_display_width();
@@ -692,12 +695,8 @@ export class QEMUWrapper {
    */
   private handleICRWrite(icrLow: number, icrHigh: number): void {
     if (!this.config) return;
-
-    const ipi = decodeICR(icrLow, icrHigh, this.config.apicId);
-
-    // Don't forward self-targeted IPIs
-    if (ipi.to === this.config.apicId) return;
-
+    // In standalone mode, IPIs are self-targeted (single core). No-op.
+    const ipi = decodeICR(icrLow, icrHigh);
     this.config.onIPISend?.(ipi);
   }
 
@@ -982,7 +981,7 @@ export class QEMUWrapper {
     }
 
     // Flush remaining dirty pages
-    this.config?.sqlPageStore.flushDirty();
+    this.config?.sqlPageStore.pageOut?.(0, new Uint8Array(0)) // stub;
 
     this.aborted = true;
   }

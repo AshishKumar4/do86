@@ -1,58 +1,20 @@
 {
-  "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "do86",
   "compatibility_date": "2025-04-01",
-  "compatibility_flags": ["nodejs_compat"],
-  "limits": {
-    "cpu_ms": 300000
-  },
+  "compatibility_flags": ["nodejs_compat", "assets_navigation_has_no_effect"],
   "main": "./src/index.ts",
-  "routes": [
-    { "pattern": "do86.ashishkumarsingh.com", "custom_domain": true }
-  ],
-  "assets": {
-    "not_found_handling": "single-page-application",
-    "binding": "ASSETS",
-    "run_worker_first": true
-  },
+  "routes": [{ "pattern": "do86.ashishkumarsingh.com", "custom_domain": true }],
+  "assets": { "not_found_handling": "single-page-application", "binding": "ASSETS", "run_worker_first": true },
   "durable_objects": {
     "bindings": [
-      {
-        "name": "LINUX_VM",
-        "class_name": "LinuxVM"
-      },
-      {
-        "name": "COORDINATOR",
-        "class_name": "CoordinatorDO"
-      },
-      {
-        "name": "CPU_CORE",
-        "class_name": "CpuCoreDO"
-      },
-      {
-        "name": "QEMU_STANDALONE",
-        "class_name": "QemuStandaloneDO"
-      }
+      { "name": "LINUX_VM", "class_name": "LinuxVM" },
+      { "name": "QEMU_STANDALONE", "class_name": "QemuStandaloneDO" }
     ]
   },
-  "r2_buckets": [
-    {
-      "binding": "ASSETS_BUCKET",
-      "bucket_name": "do86-assets"
-    }
-  ],
-  "limits": {
-    "cpu_ms": 300000
-  },
-  "observability": {
-    "enabled": true
-  },
+  "limits": { "cpu_ms": 300000 },
+  "observability": { "enabled": true },
   "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["LinuxVM", "CpuCoreDO", "QemuStandaloneDO"],
-      "new_classes": ["CoordinatorDO"]
-    }
+    { "tag": "v1", "new_sqlite_classes": ["LinuxVM"] },
+    { "tag": "v2", "new_sqlite_classes": ["QemuStandaloneDO"] }
   ]
 }
-

@@ -1,6 +1,6 @@
 import {
   MSG_FULL_FRAME, MSG_DELTA_FRAME, MSG_SERIAL_DATA,
-  MSG_STATUS, MSG_TEXT_SCREEN, TILE_SIZE,
+  MSG_STATUS, MSG_TEXT_SCREEN, MSG_STATS, TILE_SIZE,
 } from "./types";
 
 // ── Message Encoders ────────────────────────────────────────────────────────
@@ -33,6 +33,15 @@ export function encodeStatus(status: string): ArrayBuffer {
   const buf = new ArrayBuffer(1 + encoded.length);
   const view = new Uint8Array(buf);
   view[0] = MSG_STATUS;
+  view.set(encoded, 1);
+  return buf;
+}
+
+export function encodeStats(stats: Record<string, unknown>): ArrayBuffer {
+  const encoded = textEncoder.encode(JSON.stringify(stats));
+  const buf = new ArrayBuffer(1 + encoded.length);
+  const view = new Uint8Array(buf);
+  view[0] = MSG_STATS;
   view.set(encoded, 1);
   return buf;
 }

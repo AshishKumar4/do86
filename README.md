@@ -7,80 +7,105 @@
 </p>
 
 <p align="center">
+  <a href="https://do86.ashishkumarsingh.com"><img src="https://img.shields.io/badge/Live-do86.ashishkumarsingh.com-F38020?logo=cloudflare&logoColor=white" alt="Live Demo"></a>
   <a href="https://workers.cloudflare.com"><img src="https://img.shields.io/badge/Built_with-Cloudflare_Workers-F38020?logo=cloudflare&logoColor=white" alt="Cloudflare Workers"></a>
-  <a href="https://github.com/copy/v86"><img src="https://img.shields.io/badge/Emulator-v86-4B32C3" alt="v86"></a>
+  <a href="https://github.com/AshishKumar4/stratum"><img src="https://img.shields.io/badge/Emulator-Stratum-4B32C3" alt="Stratum"></a>
   <img src="https://img.shields.io/badge/Platform-Durable_Objects-7C3AED" alt="Durable Objects">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License">
 </p>
 
 ---
 
-A full x86 PC emulated at the edge using [v86](https://github.com/copy/v86). The browser connects over WebSocket and receives compressed framebuffer updates — no plugins, no VNC client, just a `<canvas>`.
+Full x86 PCs emulated at the edge using [Stratum](https://github.com/AshishKumar4/stratum) (a v86 fork with AHCI, ACPI, and SMP extensions). The browser connects over WebSocket and receives compressed framebuffer updates — no plugins, no VNC client, just a \`<canvas>\`.
+
+**🚀 Try it live: [do86.ashishkumarsingh.com](https://do86.ashishkumarsingh.com)**
 
 ## How It Works
 
-```
+\`\`\`
 ┌────────────┐              ┌────────────┐              ┌─────────────────────┐
 │            │  WebSocket   │            │     RPC      │                     │
 │  Browser   │◄────────────►│   Worker   │◄────────────►│   Durable Object    │
 │            │              │            │              │                     │
-│  canvas    │ frames+input │  routes    │   assets     │   v86 emulator      │
-│  keyboard  │              │  packs     │              │   screen adapter    │
+│  canvas    │ frames+input │  routes    │   assets     │   Stratum (v86)     │
+│  keyboard  │              │  packs     │              │   demand-paged RAM  │
 │  mouse     │              │  assets    │              │   delta encoder     │
-│            │              │            │              │   SQLite (10 GB)    │
+│            │              │            │              │   SQLite storage    │
 └────────────┘              └────────────┘              └─────────────────────┘
-```
+\`\`\`
 
 1. **Browser** opens a WebSocket to the Worker, requesting an OS image
-2. **Worker** loads BIOS + disk image from Assets, packs them into a binary bundle, and forwards to the Durable Object
-3. **Durable Object** boots v86 with the assets — a full x86 CPU emulated in WebAssembly
-4. **Frames** are captured from the virtual VGA, delta-compressed (tile-based diffing + RLE), and streamed back over the WebSocket
-5. **Input** (keyboard scancodes, relative mouse deltas) flows back from browser to the emulator's bus
+2. **Worker** loads BIOS + disk image from Assets/CDN, packs them, and forwards to the Durable Object
+3. **Durable Object** boots Stratum — a full x86 CPU emulated in WebAssembly with demand-paged guest RAM
+4. **Frames** are captured from virtual VGA, delta-compressed (tile-based diffing), and streamed over WebSocket
+5. **Input** (keyboard scancodes, mouse deltas) flows back to the emulator
+
+## Available OS Images
+
+| Image | OS | Boot | Notes |
+|-------|----|------|-------|
+| \`kolibri\` | [KolibriOS](http://kolibrios.org) | Floppy | Default. Full GUI, boots in seconds |
+| \`aqeous\` | [AqeousOS](https://github.com/AshishKumar4/AqeousOS) | Multiboot | Custom x86 OS with AHCI, window system, EXT2 |
+| \`tinycore\` | TinyCore 15 | CD-ROM | Minimal Linux with X11 + FLWM |
+| \`tinycore11\` | TinyCore 11 | CD-ROM | Classic release |
+| \`dsl\` | Damn Small Linux | CD-ROM | Fluxbox desktop, browser, tools |
+| \`helenos\` | HelenOS | CD-ROM | Research microkernel OS |
+| \`linux4\` | Linux 4.x | CD-ROM | Minimal text-mode kernel |
+
+## Architecture
+
+### Demand-Paged Guest RAM
+
+Guest OSes see up to 3.5 GB of logical RAM, but the DO only commits ~60-80 MB of real memory (within the 128 MB DO limit):
+
+\`\`\`
+Guest Physical Address Space (up to 3.5 GB logical)
+┌──────────────────────┬──────────────────────┬─────────────────────┐
+│   Resident Zone      │   Hot Page Pool      │   Cold Pages        │
+│   0 – 32 MB          │   32 – 64 MB WASM    │   > 64 MB           │
+│   Always in WASM     │   8192 × 4KB frames  │   Stored in SQLite  │
+│   BIOS, kernel, low  │   Clock eviction     │   Paged in on fault │
+└──────────────────────┴──────────────────────┴─────────────────────┘
+\`\`\`
+
+- **WASM-side pool lookup**: TLB miss → \`pool_lookup(gpa)\` — pure WASM, zero FFI
+- **Cold miss**: \`swap_page_in()\` → SQLite read → frame allocation
+- **Batched SQLite I/O** for page fault storms
+- **CDN-cached disk images** via Cache API
+
+### Render Pipeline
+
+- **Adaptive FPS**: 2–30 FPS based on screen activity
+- **Tile-based delta compression**: only changed tiles sent
+- **Multi-client**: multiple browsers share the same VM session
+
+### JIT Compilation
+
+Hot x86 basic blocks compiled to WASM at runtime via \`WebAssembly.instantiate()\`. Confirmed working in production Workers (200+ compiled blocks).
 
 ## Quick Start
 
-```sh
+\`\`\`sh
 bun install
 bun run dev
-# → http://localhost:5173
-```
+\`\`\`
 
-## Images
+### Deploy
 
-| Image | OS | Notes |
-|-------|----|-------|
-| **`kolibri`** | KolibriOS | Default. Full GUI, boots in seconds |
-| `dsl` | Damn Small Linux | Fluxbox + Firefox, 128MB RAM |
-| `helenos` | HelenOS | Research microkernel OS |
-| `linux4` | Linux 4.x | Minimal text-mode kernel |
+\`\`\`sh
+bun run build
+npx wrangler deploy
+\`\`\`
 
-Browse to `/` to see the landing page with all available images. Click **Launch** to create a unique session at `/s/{id}?image=kolibri`. Share the session URL with others to let them view the same VM in real time.
+## Stratum (v86 Fork)
 
-## Technical Notes
+This project uses [Stratum](https://github.com/AshishKumar4/stratum), a fork of v86 with AHCI, ACPI, SMP scaffolding, demand paging hooks, and \`net_device: "none"\` support.
 
-- **JIT** — v86 compiles x86 basic blocks to Wasm functions at runtime (~10-100x faster than interpretation)
-- **SQLite swap** — DO SQLite storage backs a 10GB lazily-allocated virtual swap disk
-- **Delta compression** — only changed 64×64 pixel tiles are sent; RLE-encoded for solid-color regions (title bars, backgrounds)
-- **Adaptive FPS** — 2–15 FPS, auto-adjusts based on frame size and client backpressure
-- **State snapshots** — v86 machine state saved to SQLite after first boot; subsequent sessions restore instantly (~840ms vs ~11s cold boot)
-- **Multi-client** — multiple browsers can connect to the same VM instance simultaneously
-
-## Project Structure
-
-```
-src/
-├── index.ts              Worker — routing, image config, asset packing
-├── linux-vm.ts           Durable Object — v86 lifecycle, WebSocket, render loop
-├── types.ts              Shared constants and interfaces
-├── screen-adapter.ts     VGA screen adapter + ImageData polyfill
-├── delta-encoder.ts      Tile-based frame diffing + RLE compression
-├── sqlite-storage.ts     SQLite image cache, block device, disk cache
-├── client/
-│   ├── main.ts           Browser client — WebSocket, canvas, input capture
-│   ├── decoder.ts        RLE decode, frame parsing
-│   └── session.css       Session page styles
-└── v86.wasm              Pre-compiled v86 emulator module
-```
+Rebuild after stratum changes:
+\`\`\`sh
+cd ../stratum && bun run build
+cp build/libv86.mjs ../do86/src/libv86.mjs
+\`\`\`
 
 ## License
 

@@ -15,9 +15,9 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { QEMUWrapper, type QEMUWrapperConfig } from "./qemu-wrapper";
-import { SqlPageStore } from "./sql-page-store";
+import { QemuPageStoreStub } from "./qemu-page-store";
 import { DeltaEncoder, encodeSerialData, encodeStatus } from "./delta-encoder";
-import { type ClientMessage, type SqlHandle, LOG_PREFIX, MSG_FULL_FRAME, FPS_DEFAULT } from "./types";
+import { type ClientMessage, LOG_PREFIX, MSG_FULL_FRAME } from "./types";
 
 // ── Deploy-time imports (pre-compiled by Wrangler) ──────────────────────────
 // WASM: Wrangler compiles this to a WebAssembly.Module at deploy time.
@@ -44,7 +44,7 @@ const BIOS_FIRMWARE = [
 
 const HOT_PAGES_MAX = 8192;     // 32MB hot window (8192 * 4KB)
 const WASM_HEAP_MB = 48;        // Total WASM linear memory
-const RENDER_FPS = FPS_DEFAULT;  // Frame capture rate for display streaming
+const RENDER_FPS = 15;  // Frame capture rate for display streaming
 const KEEPALIVE_MS = 15_000;     // Server-side keepalive interval
 const SERIAL_CAP = 4096;         // Max serial buffer chars
 
@@ -56,7 +56,7 @@ export class QemuStandaloneDO extends DurableObject<QemuStandaloneEnv> {
 
   // ── QEMU runtime ────────────────────────────────────────────────────────
   private qemu: QEMUWrapper | null = null;
-  private sqlPageStore: SqlPageStore | null = null;
+  private sqlPageStore: QemuPageStoreStub | null = null;
   private booting = false;
   private booted = false;
   private bootError: string | null = null;
@@ -183,8 +183,8 @@ export class QemuStandaloneDO extends DurableObject<QemuStandaloneEnv> {
       log(`image=${meta.imageKey} drive=${meta.drive} memory=${meta.memory}MB`);
 
       // 3. Create SqlPageStore
-      const sqlHandle = this.ctx.storage.sql as unknown as SqlHandle;
-      this.sqlPageStore = new SqlPageStore(sqlHandle, HOT_PAGES_MAX);
+      
+      this.sqlPageStore = new QemuPageStoreStub(HOT_PAGES_MAX);
       this.sqlPageStore.init();
 
       // 4. Build QemuWrapper config — WASM + glue from deploy-time imports

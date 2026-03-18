@@ -5,6 +5,7 @@ import {
   MSG_SERIAL_DATA,
   MSG_STATUS,
   MSG_TEXT_SCREEN,
+  MSG_STATS,
   decodeFullFrame,
   decodeDeltaFrame,
   decodeTextScreen,
@@ -46,6 +47,69 @@ const reconnectOverlay = document.getElementById("reconnect-overlay")!;
 if (sessionId) {
   sessionIdEl.textContent = sessionId.slice(0, 8);
   sessionIdEl.title = sessionId;
+}
+
+// ── Debug stats overlay ──────────────────────────────────────────────────────
+// Created dynamically so it doesn't require session.html changes.
+// Toggle with Ctrl+Shift+D.
+
+const debugOverlay = document.createElement("div");
+debugOverlay.id = "debug-stats";
+Object.assign(debugOverlay.style, {
+  position:   "fixed",
+  bottom:     "8px",
+  right:      "8px",
+  background: "rgba(0,0,0,0.75)",
+  color:      "#0f0",
+  fontFamily: "monospace",
+  fontSize:   "11px",
+  padding:    "8px 10px",
+  borderRadius: "4px",
+  zIndex:     "9999",
+  whiteSpace: "pre",
+  display:    "none",
+  maxWidth:   "320px",
+  lineHeight: "1.4",
+  pointerEvents: "none",
+});
+document.body.appendChild(debugOverlay);
+
+let debugVisible = false;
+document.addEventListener("keydown", (e) => {
+  if (e.ctrlKey && e.shiftKey && e.code === "KeyD") {
+    debugVisible = !debugVisible;
+    debugOverlay.style.display = debugVisible ? "block" : "none";
+  }
+});
+
+function updateDebugOverlay(stats: Record<string, unknown>) {
+  const ps = stats.pageStore as Record<string, unknown> | null;
+  const lines = [
+    `═══ do86 stats ═══`,
+    `uptime     ${stats.uptimeMs} ms`,
+    `image      ${stats.imageKey ?? "?"}`,
+    ``,
+    `── render ──`,
+    `renders    ${stats.renders}  (${stats.rendersPerSec}/s)`,
+    `frames     ${stats.framesSent}  (${stats.framesPerSec}/s)`,
+    `renderMs   ${stats.renderMs} ms`,
+    ``,
+    `── cpu ──`,
+    `yields     ${stats.yields}`,
+    `syncYields ${stats.syncYields}`,
+    `asyncY     ${(stats as any).asyncYields}`,
+    ``,
+    ...(ps ? [
+      `── page store ──`,
+      `swapIns    ${ps.swapIns}`,
+      `evictions  ${ps.evictions}`,
+      `hotPages   ${ps.hotPages}/${ps.totalFrames}`,
+      `sqlReads   ${ps.sqlReads}  (${ps.sqlReadMs}ms)`,
+      `sqlWrites  ${ps.sqlWrites}  (${ps.sqlWriteMs}ms)`,
+      `wasmPool   ${ps.hasWasmPool}`,
+    ] : [`── page store: N/A ──`]),
+  ];
+  debugOverlay.textContent = lines.join("\n");
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -160,17 +224,34 @@ function setStatus(text: string) {
   } else if (
     text.startsWith("booting") ||
     text.startsWith("waiting_for_boot") ||
+    text.startsWith("recovering") ||
     text.startsWith("downloading") ||
     text.startsWith("mode:") ||
     text.startsWith("resize:")
   ) {
     statusEl.className = "booting";
+  } else if (text === "waiting_for_assets") {
+    statusEl.className = "";
   } else {
     statusEl.className = "";
   }
 
   // Drive the loading overlay from status messages
-  if (text.startsWith("downloading")) {
+  if (text === "waiting_for_assets") {
+    // DO is alive but lost its assets (eviction without self-recovery).
+    // Close and reconnect — the HTTP GET on reconnect will re-run /init.
+    loadingText.textContent = "Reconnecting\u2026";
+    loadingSub.textContent = "Session state lost. Reconnecting automatically\u2026";
+    showOverlay(loadingOverlay);
+    hideOverlay(reconnectOverlay);
+    // Close WS so the close handler fires and schedules connect() with backoff.
+    if (ws) { ws.close(); }
+  } else if (text.startsWith("recovering")) {
+    const what = text.replace("recovering:", "").trim() || "session";
+    loadingText.textContent = `Recovering ${what}\u2026`;
+    loadingSub.textContent = "DO was evicted — reloading assets automatically";
+    showOverlay(loadingOverlay);
+  } else if (text.startsWith("downloading")) {
     const what = text.replace("downloading:", "").trim() || "image";
     loadingText.textContent = `Downloading ${what}\u2026`;
     loadingSub.textContent = "This may take 10\u201330 seconds on first boot";
@@ -342,6 +423,19 @@ function handleBinaryMessage(data: ArrayBuffer) {
     case MSG_STATUS:
       setStatus(textDecoder.decode(new Uint8Array(data, 1)));
       break;
+
+    case MSG_STATS: {
+      try {
+        const stats = JSON.parse(textDecoder.decode(new Uint8Array(data, 1)));
+        updateDebugOverlay(stats);
+        // Auto-show overlay on first stats message if URL has ?debug=1
+        if (new URLSearchParams(location.search).get("debug") === "1") {
+          debugVisible = true;
+          debugOverlay.style.display = "block";
+        }
+      } catch { /* malformed stats — ignore */ }
+      break;
+    }
   }
 }
 

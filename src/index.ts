@@ -1,21 +1,15 @@
 export { LinuxVM } from "./linux-vm";
-export { CoordinatorDO } from "./coordinator-do";
-export { CpuCoreDO } from "./core-do";
-export { QemuCpuCoreDO } from "./qemu-core-do";
 export { QemuStandaloneDO } from "./qemu-standalone-do";
 
 export interface Env {
   LINUX_VM: DurableObjectNamespace;
-  COORDINATOR: DurableObjectNamespace;
-  CPU_CORE: DurableObjectNamespace;
   QEMU_STANDALONE: DurableObjectNamespace;
   ASSETS: { fetch: (request: Request | string) => Promise<Response> };
-  ASSETS_BUCKET: R2Bucket;
 }
 
 interface ImageDef {
   file: string;
-  drive: "fda" | "cdrom";
+  drive: "fda" | "cdrom" | "multiboot";
   memory: number;
   vgaMemory: number;
   label: string;
@@ -26,25 +20,55 @@ interface ImageDef {
   url?: string;
   /** If true, never save/restore snapshots for this image (unstable OS) */
   noSnapshot?: boolean;
+  ahciDiskSize?: number;
+  /** Logical memory the guest BIOS reports (MB).  Defaults to VM_CONFIG.LOGICAL_MB (64).
+   *  GPAs beyond memory_size are demand-paged via swap_page_in.  Set higher for
+   *  OSes that need to see more RAM than the WASM allocation provides. */
+  logicalMemory?: number;
 }
 
-// Memory budget: Durable Objects have a 128 MB total isolate limit.
-// Each VM's guest RAM + VGA framebuffer + v86 WASM heap + JS runtime overhead
-// must all fit within that budget. Keep guest memory ≤ 64 MB to leave headroom
-// for WASM (~30 MB) and the JS heap (~20 MB). Exceeding this causes OOM eviction.
+// ── DO memory budget ─────────────────────────────────────────────────────────
+// Cloudflare Durable Objects have a 128 MB total isolate memory limit.
+// Demand-paging layout (all tunable in linux-vm.ts VM_CONFIG):
+//   WASM mem8 total    : 64 MB  (memory_size passed to v86; MUST cover full hot pool)
+//     ↳ Resident RAM   : 32 MB  (mem8[0..32MB], PAGED_THRESHOLD in Rust)
+//     ↳ Hot pool       : 32 MB  (mem8[32MB..64MB], 8192 × 4 KB frames)
+//   VGA SVGA buffer    :  8 MB  (svga_allocate_memory, separate allocation)
+//   WASM heap overhead : ~20 MB (JIT code cache, TLB tables, CPU structs)
+//   JS heap            : ~10 MB (emulator objects, WS sessions, delta encoder)
+//   ──────────────────────────────────
+//   Total              ~102 MB ← safe headroom below 128 MB limit
+//
+// Guest sees 64 MB via CMOS/e820 (VM_CONFIG.LOGICAL_MB = WASM_MB).
+// LOGICAL_MB must equal WASM_MB: SeaBIOS places ACPI tables at ~logical_memory_size-7KB;
+// if that exceeds WASM allocation, writes hit MMIO no-op and KolibriOS loops on RSDT.
+// GPAs [32 MB, 64 MB) are demand-paged from DO SQLite via swap_page_in.
+// linux4 (text-only, no demand-paging) uses a smaller budget: 32 MB RAM, 2 MB VGA.
+//
+// memory/vgaMemory values in IMAGES are the values passed as memory_size to v86.
+// For demand-paged images this is WASM_MB = 64 MB (must include the hot pool).
+// To change the shared default, edit VM_CONFIG in linux-vm.ts.
+
+/** Shared default memory/VGA allocation for demand-paged images (MB).
+ *  memory = WASM_MB = RESIDENT_MB + HOT_POOL_MB = 64 MB (full mem8 allocation).
+ *  Must match VM_CONFIG.WASM_MB in linux-vm.ts — see that file for the full explanation
+ *  of why memory_size must cover the hot pool, not just the resident window. */
+const DEFAULT_MEMORY_MB  = 64; // == VM_CONFIG.WASM_MB (resident 32 MB + hot pool 32 MB)
+const DEFAULT_VGA_MB     =  8; // == VM_CONFIG.VGA_MB
+
 const IMAGES: Record<string, ImageDef> = {
-  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: 96, vgaMemory: 8, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
+  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.iso",              drive: "cdrom", memory: 96, vgaMemory: 8, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true },
-  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: 96, vgaMemory: 8, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
+    aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true, ahciDiskSize: 32, logicalMemory: 3584 },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
-  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: 96, vgaMemory: 8, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
                 url: "http://tinycorelinux.net/11.x/x86/release/TinyCore-11.1.iso" },
-  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: 96, vgaMemory: 8, label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
+  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
                 url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
-  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: 96, vgaMemory: 8, label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
+  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
                 url: "https://www.helenos.org/releases/HelenOS-0.14.1-ia32.iso" },
-  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,  vgaMemory: 2, label: "Linux 4 (Text)", description: "Minimal Linux kernel. Text-only — great for exploring the shell.",
+  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,                vgaMemory: 2,              label: "Linux 4 (Text)", description: "Minimal Linux kernel. Text-only — great for exploring the shell.",
                 url: "https://copy.sh/v86/images/linux4.iso" },
 };
 
@@ -91,28 +115,15 @@ function packAssets(assets: Record<string, ArrayBuffer>): ArrayBuffer {
   return packed;
 }
 
-// ── Helpers: COOP/COEP for SharedArrayBuffer (required by QEMU pthreads) ────
-
-function withCoopCoep(response: Response): Response {
-  const headers = new Headers(response.headers);
-  headers.set("Cross-Origin-Opener-Policy", "same-origin");
-  headers.set("Cross-Origin-Embedder-Policy", "require-corp");
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
-}
-
 // ── Router ────────────────────────────────────────────────────────────────────
 
 const SESSION_RE = /^\/s\/([a-zA-Z0-9_-]+)$/;
-const SMP_SESSION_RE = /^\/smp\/([a-zA-Z0-9_-]+)$/;
-const QEMU_RE = /^\/qemu(?:\/([a-zA-Z0-9_-]*))?$/;
+const STATS_RE   = /^\/stats\/([a-zA-Z0-9_-]+)$/;
 const QEMU_DO_RE = /^\/qd\/([a-zA-Z0-9_-]+)$/;
 const QEMU_DO_INIT_RE = /^\/qd-init\/([a-zA-Z0-9_-]+)$/;
 const QEMU_DO_KICK_RE = /^\/qd-kick\/([a-zA-Z0-9_-]+)$/;
 const QEMU_DO_STATUS_RE = /^\/qd-status\/([a-zA-Z0-9_-]+)$/;
+const QEMU_DO_TEST_RE = /^\/qd-test-import\/([a-zA-Z0-9_-]+)$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -123,204 +134,7 @@ export default {
       return env.ASSETS.fetch(new Request(new URL("/index.html", request.url).toString()));
     }
 
-    // ── /qemu or /qemu/:sessionId → QEMU-WASM page (browser-side emulation) ─
-    // Serves qemu.html with COOP+COEP headers for SharedArrayBuffer.
-    // QEMU WASM + BIOS + disk images are served from /qemu/* and /assets/* below.
-    const qemuMatch = url.pathname.match(QEMU_RE);
-    if (qemuMatch) {
-      const resp = await env.ASSETS.fetch(
-        new Request(new URL("/qemu.html", request.url).toString()),
-      );
-      return withCoopCoep(resp);
-    }
-
-    // ── /qd-init/:id → init QEMU standalone DO with firmware + disk ──────
-    const qdInitMatch = url.pathname.match(QEMU_DO_INIT_RE);
-    if (qdInitMatch) {
-      const sessionId = qdInitMatch[1];
-      const imageKey = url.searchParams.get("image") || "aqeous";
-      const imageDef = IMAGES[imageKey] || IMAGES.aqeous;
-
-      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
-      const stub = env.QEMU_STANDALONE.get(id);
-
-      const meta: Record<string, unknown> = {
-        imageKey,
-        drive: imageDef.drive,
-        memory: Math.min(imageDef.memory || 32, 64),
-        label: imageDef.label,
-      };
-
-      const assets: Record<string, ArrayBuffer> = {};
-      assets.metadata = new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer;
-
-      // Fetch BIOS firmware (required by QEMU — small data files, ~300KB total)
-      const firmware = [
-        { path: "/assets/bios-256k.bin", key: "qemu_bios_256k_bin" },
-        { path: "/assets/vgabios-stdvga.bin", key: "qemu_vgabios_stdvga_bin" },
-      ];
-      const missingFirmware: string[] = [];
-      await Promise.all(firmware.map(async ({ path, key }) => {
-        const resp = await env.ASSETS.fetch(new URL(path, request.url).toString());
-        if (resp.ok) {
-          assets[key] = await resp.arrayBuffer();
-        } else {
-          missingFirmware.push(path);
-        }
-      }));
-      if (missingFirmware.length > 0) {
-        return new Response(`Missing QEMU firmware: ${missingFirmware.join(", ")}`, { status: 500 });
-      }
-
-      // Fetch disk image
-      try {
-        const localResp = await env.ASSETS.fetch(
-          new URL(`/assets/${imageDef.file}`, request.url).toString(),
-        );
-        if (localResp.ok) assets.disk = await localResp.arrayBuffer();
-      } catch { /* not available locally */ }
-
-      if (!assets.disk && imageDef.url) {
-        const remoteResp = await fetch(imageDef.url);
-        if (remoteResp.ok) assets.disk = await remoteResp.arrayBuffer();
-      }
-
-      if (!assets.disk) {
-        return new Response(`Disk image not found for ${imageKey}`, { status: 500 });
-      }
-
-      // Pack and send to DO
-      const packed = packAssets(assets);
-      const initResp = await stub.fetch(
-        new Request(new URL("/init", request.url).toString(), { method: "POST", body: packed }),
-      );
-      if (!initResp.ok) return new Response("Failed to init QEMU VM", { status: 500 });
-
-      return Response.json({ status: "ok", sessionId, imageKey });
-    }
-
-    // ── /qd-kick/:id → trigger QEMU boot ─────────────────────────────────
-    const qdKickMatch = url.pathname.match(QEMU_DO_KICK_RE);
-    if (qdKickMatch) {
-      const sessionId = qdKickMatch[1];
-      const imageKey = url.searchParams.get("image") || "aqeous";
-      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
-      const resp = await env.QEMU_STANDALONE.get(id).fetch(
-        new Request(new URL("/kick", request.url).toString(), { method: "POST" }),
-      );
-      return new Response(await resp.text(), { status: resp.status });
-    }
-
-    // ── /qd-status/:id → QEMU DO status ──────────────────────────────────
-    const qdStatusMatch = url.pathname.match(QEMU_DO_STATUS_RE);
-    if (qdStatusMatch) {
-      const sessionId = qdStatusMatch[1];
-      const imageKey = url.searchParams.get("image") || "aqeous";
-      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
-      return env.QEMU_STANDALONE.get(id).fetch(
-        new Request(new URL("/status", request.url).toString()),
-      );
-    }
-
-    // ── /qd-test-import/:id → test WASM loading on QEMU DO ──────────────
-    const qdTestMatch = url.pathname.match(/^\/qd-test-import\/([a-zA-Z0-9_-]+)$/);
-    if (qdTestMatch) {
-      const sessionId = qdTestMatch[1];
-      const imageKey = url.searchParams.get("image") || "aqeous";
-      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
-      // Forward with query params preserved
-      const doUrl = new URL("/test-import", request.url);
-      doUrl.search = url.search;
-      return env.QEMU_STANDALONE.get(id).fetch(new Request(doUrl.toString()));
-    }
-
-    // ── /qd/:id → WebSocket to QEMU standalone DO ────────────────────────
-    const qdMatch = url.pathname.match(QEMU_DO_RE);
-    if (qdMatch) {
-      if (request.headers.get("Upgrade") === "websocket") {
-        const sessionId = qdMatch[1];
-        const imageKey = url.searchParams.get("image") || "aqeous";
-        const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
-        return env.QEMU_STANDALONE.get(id).fetch(request);
-      }
-      return env.ASSETS.fetch(new Request(new URL("/session.html", request.url).toString()));
-    }
-
-    // /smp/:sessionId → distributed SMP session via CoordinatorDO
-    const smpMatch = url.pathname.match(SMP_SESSION_RE);
-    if (smpMatch) {
-      if (request.headers.get("Upgrade") === "websocket") {
-        const imageKey = url.searchParams.get("image") || "aqeous";
-        const imageDef = IMAGES[imageKey] || IMAGES.aqeous;
-
-        const id = env.COORDINATOR.idFromName(`smp-${imageKey}`);
-        const stub = env.COORDINATOR.get(id);
-
-        // Check if already running
-        const statusResp = await stub.fetch(
-          new Request(new URL("/status", request.url).toString()),
-        );
-        const { running } = await statusResp.json<{ running: boolean }>();
-
-        if (!running) {
-          const meta: Record<string, any> = {
-            imageKey,
-            drive: imageDef.drive,
-            memory: imageDef.memory,
-            vgaMemory: imageDef.vgaMemory,
-            label: imageDef.label,
-            noSnapshot: true, // No snapshots for SMP (yet)
-            numCores: 2, // distributed SMP (BSP + 1 AP)
-          };
-
-          // v86 cores need BIOS ROMs — fetch alongside disk
-          const [bios, vgaBios] = await Promise.all([
-            getAsset(env, "/assets/seabios.bin", request.url),
-            getAsset(env, "/assets/vgabios.bin", request.url),
-          ]);
-
-          const assets: Record<string, ArrayBuffer> = { bios, vgaBios };
-
-          // Get disk image — try local ASSETS first, fall back to remote URL
-          try {
-            const localResp = await env.ASSETS.fetch(
-              new URL(`/assets/${imageDef.file}`, request.url).toString(),
-            );
-            if (localResp.ok) {
-              assets.disk = await localResp.arrayBuffer();
-            }
-          } catch { /* not available locally */ }
-
-          if (!assets.disk && imageDef.url) {
-            meta.diskUrl = imageDef.url;
-            meta.diskFile = imageDef.file;
-          }
-
-          if (!assets.disk && !meta.diskUrl) {
-            return new Response("Disk image not found for SMP boot", { status: 500 });
-          }
-
-          assets.metadata = new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer;
-          const packed = packAssets(assets);
-
-          const initResp = await stub.fetch(
-            new Request(new URL("/init", request.url).toString(), {
-              method: "POST",
-              body: packed,
-            }),
-          );
-          if (!initResp.ok) return new Response("Failed to init SMP VM", { status: 500 });
-        }
-
-        // Forward WebSocket upgrade to coordinator
-        return stub.fetch(request);
-      }
-
-      // Regular GET → serve the same session page (client is image-agnostic)
-      return env.ASSETS.fetch(new Request(new URL("/session.html", request.url).toString()));
-    }
-
-    // /s/:sessionId → session VM (original single-DO path)
+    // /s/:sessionId
     const sessionMatch = url.pathname.match(SESSION_RE);
     if (sessionMatch) {
       const imageKey = url.searchParams.get("image") || "kolibri";
@@ -370,6 +184,8 @@ export default {
             vgaMemory: imageDef.vgaMemory,
             label: imageDef.label,
             noSnapshot: imageDef.noSnapshot || false,
+            ...(imageDef.ahciDiskSize ? { ahciDiskSize: imageDef.ahciDiskSize } : {}),
+            ...(imageDef.logicalMemory ? { logicalMemory: imageDef.logicalMemory } : {}),
             ...(freshBoot ? { fresh: true } : {}),
           };
 
@@ -414,25 +230,103 @@ export default {
           label: def.label,
           description: def.description,
           drive: def.drive,
-          memory: def.memory,
-          backends: ["v86", "v86-smp"],
+          memory: def.memory === DEFAULT_MEMORY_MB ? 256 : def.memory,
         })),
       );
+    }
+
+    // /stats/:sessionId — proxy to DO's /stats handler, returns JSON counters
+    const statsMatch = url.pathname.match(STATS_RE);
+    if (statsMatch && request.method === "GET") {
+      const sessionId = statsMatch[1];
+      const id = env.LINUX_VM.idFromName(`vm-${sessionId}`);
+      const stub = env.LINUX_VM.get(id);
+      const resp = await stub.fetch(new Request(new URL("/stats", request.url).toString()));
+      return new Response(resp.body, {
+        status: resp.status,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
     }
 
     if (url.pathname === "/api/health") {
       return Response.json({ status: "ok" });
     }
 
-    // Everything else → static assets
-    // Add COOP/COEP headers for all assets when serving QEMU-related files
-    // (needed for SharedArrayBuffer in the browser)
-    const assetResp = await env.ASSETS.fetch(request);
-    if (url.pathname.startsWith("/qemu/") ||
-        url.pathname === "/coi-serviceworker.js" ||
-        url.pathname.startsWith("/assets/")) {
-      return withCoopCoep(assetResp);
+    // ── QEMU standalone DO routes ─────────────────────────────────────────
+
+    const qdInitMatch = url.pathname.match(QEMU_DO_INIT_RE);
+    if (qdInitMatch) {
+      const sessionId = qdInitMatch[1];
+      const imageKey = url.searchParams.get("image") || "kolibri";
+      const imageDef = IMAGES[imageKey] || IMAGES.kolibri;
+      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+      const stub = env.QEMU_STANDALONE.get(id);
+      const meta: Record<string, unknown> = {
+        imageKey, drive: imageDef.drive, memory: Math.min(imageDef.memory || 32, 64), label: imageDef.label,
+      };
+      const assets: Record<string, ArrayBuffer> = {};
+      assets.metadata = new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer;
+      // Fetch BIOS firmware
+      const firmware = [
+        { path: "/assets/bios-256k.bin", key: "qemu_bios_256k_bin" },
+        { path: "/assets/vgabios-stdvga.bin", key: "qemu_vgabios_stdvga_bin" },
+      ];
+      await Promise.all(firmware.map(async ({ path, key }) => {
+        const resp = await env.ASSETS.fetch(new URL(path, request.url).toString());
+        if (resp.ok) assets[key] = await resp.arrayBuffer();
+      }));
+      // Fetch disk
+      try {
+        const diskResp = await env.ASSETS.fetch(new URL(`/assets/${imageDef.file}`, request.url).toString());
+        if (diskResp.ok) assets.disk = await diskResp.arrayBuffer();
+      } catch { /* not local */ }
+      if (!assets.disk && imageDef.url) {
+        const r = await fetch(imageDef.url);
+        if (r.ok) assets.disk = await r.arrayBuffer();
+      }
+      if (!assets.disk) return new Response(`Disk not found: ${imageKey}`, { status: 500 });
+      await stub.fetch(new Request(new URL("/init", request.url).toString(), { method: "POST", body: packAssets(assets) }));
+      return Response.json({ status: "ok", sessionId, imageKey });
     }
-    return assetResp;
+
+    const qdKickMatch = url.pathname.match(QEMU_DO_KICK_RE);
+    if (qdKickMatch) {
+      const sessionId = qdKickMatch[1];
+      const imageKey = url.searchParams.get("image") || "kolibri";
+      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+      return env.QEMU_STANDALONE.get(id).fetch(new Request(new URL("/kick", request.url).toString(), { method: "POST" }));
+    }
+
+    const qdStatusMatch = url.pathname.match(QEMU_DO_STATUS_RE);
+    if (qdStatusMatch) {
+      const sessionId = qdStatusMatch[1];
+      const imageKey = url.searchParams.get("image") || "kolibri";
+      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+      return env.QEMU_STANDALONE.get(id).fetch(new Request(new URL("/status", request.url).toString()));
+    }
+
+    const qdTestMatch = url.pathname.match(QEMU_DO_TEST_RE);
+    if (qdTestMatch) {
+      const sessionId = qdTestMatch[1];
+      const imageKey = url.searchParams.get("image") || "kolibri";
+      const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+      const doUrl = new URL("/test-import", request.url);
+      doUrl.search = url.search;
+      return env.QEMU_STANDALONE.get(id).fetch(new Request(doUrl.toString()));
+    }
+
+    const qdMatch = url.pathname.match(QEMU_DO_RE);
+    if (qdMatch) {
+      if (request.headers.get("Upgrade") === "websocket") {
+        const sessionId = qdMatch[1];
+        const imageKey = url.searchParams.get("image") || "kolibri";
+        const id = env.QEMU_STANDALONE.idFromName(`qemu-${sessionId}-${imageKey}`);
+        return env.QEMU_STANDALONE.get(id).fetch(request);
+      }
+      return env.ASSETS.fetch(new Request(new URL("/session.html", request.url).toString()));
+    }
+
+    // Everything else → static assets
+    return env.ASSETS.fetch(request);
   },
 };
