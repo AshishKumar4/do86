@@ -19437,6 +19437,7 @@ CPU.prototype.create_memory = function(size, minimum_size) {
   this.mem32s = view(Uint32Array, this.wasm_memory, memory_offset, alloc_size >> 2);
 };
 CPU.prototype.init = function(settings, device_bus) {
+  this._logical_memory_size = settings.logical_memory_size || settings.memory_size || 64 * 1024 * 1024;
   this.create_memory(
     settings.memory_size || 64 * 1024 * 1024,
     settings.initrd ? 64 * 1024 * 1024 : 1024 * 1024
