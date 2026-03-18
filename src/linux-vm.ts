@@ -765,8 +765,11 @@ export class LinuxVM extends DurableObject<Env> {
                 try {
                   v86Internal.yield_callback(tick);
                 } catch (e) {
-                  this._yieldError = `sync: ${e}`;
-                  console.error(`${LOG_PREFIX} FATAL: sync yield_callback threw:`, e);
+                  const cpu = (this.emulator as any)?.v86?.cpu;
+                  const eip = cpu?.instruction_pointer?.[0];
+                  const cr0 = cpu?.cr?.[0];
+                  this._yieldError = `sync: ${e} [eip=${eip?.toString(16)} cr0=${cr0?.toString(16)} yields=${this._perf.yields}]`;
+                  console.error(`${LOG_PREFIX} FATAL: sync yield_callback threw:`, e, `eip=${eip?.toString(16)} cr0=${cr0?.toString(16)}`);
                   this._yieldDead = true;
                 }
                 return;
