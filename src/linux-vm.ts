@@ -874,34 +874,14 @@ export class LinuxVM extends DurableObject<Env> {
    *
    *  For idle guests the bitmap is empty most ticks → cheap no-op.
    *  For active guests dirty pages accumulate between ticks and are batch-processed.
-   *
-   *  Every KEYFRAME_EVERY ticks, a full keyframe is forced so that idle desktops
-   *  still deliver ≥5fps.  This also forces svga_mark_dirty() so the fill has data.
+   *  At 8fps, each tick sees ~125ms of accumulated VGA writes — enough for
+   *  natural dirty detection without forced full-frame redraws.
    */
-  private static readonly KEYFRAME_EVERY = 2; // every 2nd tick = ~4fps forced keyframes
-  private _renderTick = 0;
-
   private startRenderLoop(): void {
     if (this.renderInterval) {
       clearInterval(this.renderInterval);
     }
     this.renderInterval = setInterval(() => {
-      this._renderTick++;
-      if (this._renderTick % LinuxVM.KEYFRAME_EVERY === 0) {
-        // Periodically force a full dirty + keyframe.  svga_mark_dirty() sets all
-        // bits in the WASM bitmap so screen_fill_buffer will produce a full convert.
-        // needsKeyframe ensures the delta encoder emits output even if content
-        // hasn't changed, guaranteeing the client receives ≥4fps.
-        try {
-          const vga = this.getVga();
-          if (vga?.graphical_mode && vga?.svga_enabled) {
-            vga.cpu.svga_mark_dirty();
-          }
-          for (const state of this.sessions.values()) {
-            state.needsKeyframe = true;
-          }
-        } catch { /* non-fatal */ }
-      }
       try { this.renderFrame(); } catch (_) {}
     }, 125); // 8 fps
   }
