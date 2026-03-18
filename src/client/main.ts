@@ -432,8 +432,8 @@ function connect() {
     if (qs) wsUrl += `?${qs}`;
     firstConnect = false;
   } else if (isSMP && imageParam) {
-    // SMP route always needs ?image on the WS URL — the server uses it
-    // to resolve the CoordinatorDO stub on every request (including reconnects)
+    // SMP route always needs ?image — the server resolves the CoordinatorDO
+    // stub by image key on every request, including WS reconnects
     wsUrl += `?image=${encodeURIComponent(imageParam)}`;
   }
 
