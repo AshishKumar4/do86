@@ -209,7 +209,7 @@ export default {
           label: def.label,
           description: def.description,
           drive: def.drive,
-          memory: def.memory,
+          memory: def.memory === DEFAULT_MEMORY_MB ? 256 : def.memory,
         })),
       );
     }
