@@ -19,6 +19,10 @@ interface ImageDef {
   /** If true, never save/restore snapshots for this image (unstable OS) */
   noSnapshot?: boolean;
   ahciDiskSize?: number;
+  /** Logical memory the guest BIOS reports (MB).  Defaults to VM_CONFIG.LOGICAL_MB (64).
+   *  GPAs beyond memory_size are demand-paged via swap_page_in.  Set higher for
+   *  OSes that need to see more RAM than the WASM allocation provides. */
+  logicalMemory?: number;
 }
 
 // ── DO memory budget ─────────────────────────────────────────────────────────
@@ -53,7 +57,7 @@ const DEFAULT_VGA_MB     =  8; // == VM_CONFIG.VGA_MB
 const IMAGES: Record<string, ImageDef> = {
   kolibri:    { file: "kolibri.img",             drive: "fda",   memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-    aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true, ahciDiskSize: 32 },
+    aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true, ahciDiskSize: 32, logicalMemory: 256 },
   tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
   tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
@@ -174,6 +178,7 @@ export default {
             label: imageDef.label,
             noSnapshot: imageDef.noSnapshot || false,
             ...(imageDef.ahciDiskSize ? { ahciDiskSize: imageDef.ahciDiskSize } : {}),
+            ...(imageDef.logicalMemory ? { logicalMemory: imageDef.logicalMemory } : {}),
             ...(freshBoot ? { fresh: true } : {}),
           };
 

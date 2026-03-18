@@ -92,6 +92,7 @@ interface ImageDef {
   url?: string;
   noSnapshot?: boolean;
   ahciDiskSize?: number;
+  logicalMemory?: number;
 }
 
 // memory/vgaMemory in IMAGES are the values passed as memory_size/vga_memory_size to v86.
@@ -101,7 +102,7 @@ const { WASM_MB, VGA_MB } = VM_CONFIG;
 const IMAGES: Record<string, ImageDef> = {
   kolibri:    { file: "kolibri.img",             drive: "fda",   memory: WASM_MB, vgaMemory: VGA_MB, label: "KolibriOS",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: WASM_MB, vgaMemory: VGA_MB, label: "AqeousOS", noSnapshot: true, ahciDiskSize: 32 },
+  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: WASM_MB, vgaMemory: VGA_MB, label: "AqeousOS", noSnapshot: true, ahciDiskSize: 32, logicalMemory: 256 },
   tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 15",
                 url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
   tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 11",
@@ -409,6 +410,7 @@ export class LinuxVM extends DurableObject<Env> {
       let diskUrl: string | null = null;
       let diskFile: string | null = null;
       let ahciDiskSize: number | undefined;
+      let logicalMemoryMB = VM_CONFIG.LOGICAL_MB;
 
       const metadataRaw = this.cachedAssets.get("metadata");
       if (metadataRaw) {
@@ -423,6 +425,7 @@ export class LinuxVM extends DurableObject<Env> {
           diskFile = meta.diskFile || null;
           this.noSnapshot = !!meta.noSnapshot;
           if (meta.ahciDiskSize) ahciDiskSize = meta.ahciDiskSize;
+          if (meta.logicalMemory) logicalMemoryMB = meta.logicalMemory;
         } catch (e) {
           console.error(`${LOG_PREFIX} Failed to parse boot metadata:`, e);
         }
@@ -607,10 +610,11 @@ export class LinuxVM extends DurableObject<Env> {
         // fires for hot pool frame offsets.  See VM_CONFIG for full explanation.
         memory_size:         memorySizeMB * 1024 * 1024,
         vga_memory_size:     vgaMemoryMB  * 1024 * 1024,
-        // logical_memory_size: what the guest BIOS/CMOS reports (VM_CONFIG.LOGICAL_MB).
-        // GPAs ≥ RESIDENT_MB are demand-paged from DO SQLite via the swap_page_in
-        // WASM import hook wired in the emulator-loaded listener below.
-        logical_memory_size: VM_CONFIG.LOGICAL_MB * 1024 * 1024,
+        // logical_memory_size: what the guest BIOS/CMOS reports.
+        // Defaults to VM_CONFIG.LOGICAL_MB (64), but can be overridden per image
+        // (e.g. AqeousOS needs 256 MB).  GPAs beyond memory_size (WASM allocation)
+        // are demand-paged from DO SQLite via swap_page_in.
+        logical_memory_size: logicalMemoryMB * 1024 * 1024,
         autostart: false,
         disable_speaker: true,
         fastboot: true,
