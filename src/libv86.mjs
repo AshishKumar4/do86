@@ -20016,14 +20016,13 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
     if (this.test_hook_did_finalize_wasm) {
       this.test_hook_did_finalize_wasm(code);
     }
-  });
-  if (DEBUG) {
-    result.catch((e) => {
-      console.log(e);
+  }).catch((err) => {
+    this.codegen_finalize_finished(wasm_table_index, start, state_flags);
+    if (DEBUG) {
+      console.log(err);
       debugger;
-      throw e;
-    });
-  }
+    }
+  });
 };
 CPU.prototype.log_uncompiled_code = function(start, end) {
   if (!DEBUG || !DUMP_UNCOMPILED_ASSEMBLY) {
