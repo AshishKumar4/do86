@@ -18,10 +18,16 @@
     .card h3{font-size:15px;font-weight:600;color:#e6edf3;margin-bottom:4px}
     .card p{font-size:13px;color:#8b949e;line-height:1.4}
     .card-meta{font-size:11px;color:#484f58;margin-top:6px}
-    .card button{flex-shrink:0;background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 20px;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s,opacity .15s;min-width:90px}
-    .card button:hover:not(:disabled){background:#ea580c}
-    .card button:disabled{opacity:.7;cursor:default}
-    .btn-spinner{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px}
+    .card-actions{flex-shrink:0;display:flex;gap:6px}
+    .btn-backend{display:inline-flex;align-items:center;gap:5px;background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:20px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;transition:border-color .15s,background .15s,opacity .15s;white-space:nowrap}
+    .btn-backend:hover:not(:disabled){border-color:#8b949e;background:#30363d}
+    .btn-backend:disabled{opacity:.45;cursor:default}
+    .btn-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+    .btn-dot--v86{background:#3fb950}
+    .btn-dot--smp{background:#58a6ff}
+    .btn-dot--qemu{background:#484f58}
+    .btn-tag{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#484f58;margin-left:2px}
+    .btn-spinner{display:inline-block;width:10px;height:10px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle}
     @keyframes spin{to{transform:rotate(360deg)}}
     .footer{text-align:center;color:#484f58;font-size:12px;margin-top:48px}
     /* Skeleton loading state for cards */
@@ -40,11 +46,31 @@
     <div class="footer">VMs are shared per image &mdash; instant boot via state snapshots.</div>
   </div>
   <script>
-    function launch(image, btn) {
+    function launch(backend, image, btn) {
       btn.disabled = true;
-      btn.innerHTML = '<span class="btn-spinner"></span>Starting\u2026';
+      btn.innerHTML = '<span class="btn-spinner"></span>';
       var id = crypto.randomUUID();
-      location.href = '/s/' + id + '?image=' + image;
+      var prefix = backend === 'v86-smp' ? '/smp/' : '/s/';
+      location.href = prefix + id + '?image=' + image;
+    }
+
+    function backendButtons(img) {
+      var bs = img.backends || ['v86'];
+      var html = '';
+      // v86 button
+      if (bs.indexOf('v86') !== -1) {
+        html += '<button class="btn-backend" onclick="launch(\'v86\',\'' + img.key + '\',this)">' +
+          '<span class="btn-dot btn-dot--v86"></span>v86</button>';
+      }
+      // SMP button
+      if (bs.indexOf('v86-smp') !== -1) {
+        html += '<button class="btn-backend" onclick="launch(\'v86-smp\',\'' + img.key + '\',this)">' +
+          '<span class="btn-dot btn-dot--smp"></span>SMP</button>';
+      }
+      // QEMU button (always shown, always disabled)
+      html += '<button class="btn-backend" disabled>' +
+        '<span class="btn-dot btn-dot--qemu"></span>QEMU<span class="btn-tag">Soon</span></button>';
+      return html;
     }
 
     (async function() {
@@ -60,7 +86,7 @@
               '<p>' + img.description + '</p>' +
               '<div class="card-meta">' + media + ' \u00b7 ' + img.memory + ' MB RAM</div>' +
             '</div>' +
-            '<button onclick="launch(\'' + img.key + '\', this)">Launch</button>' +
+            '<div class="card-actions">' + backendButtons(img) + '</div>' +
           '</div>';
         }).join('');
       } catch (e) {
