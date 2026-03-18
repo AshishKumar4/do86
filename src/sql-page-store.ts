@@ -139,6 +139,13 @@ export class SqlPageStore {
 
   private schemaReady = false;
 
+  // ── Deferred eviction write queue ──────────────────────────────────────────
+  // During page fault storms, multiple clockEvict() calls happen synchronously.
+  // Instead of writing each dirty evicted frame individually, we queue the writes
+  // and flush them in a single multi-row INSERT on the next microtask.
+  private _pendingWrites: Array<{ gpa: number; data: Uint8Array }> = [];
+  private _writeFlushScheduled = false;
+
   // ── Counters ──────────────────────────────────────────────────────────────
 
   private _swapIns       = 0;
@@ -148,6 +155,8 @@ export class SqlPageStore {
   private _sqlWrites     = 0;
   private _sqlReadMs     = 0;
   private _sqlWriteMs    = 0;
+  private _batchWrites   = 0;   // number of batched write flushes
+  private _batchWriteRows = 0;  // total rows written in batches
 
   constructor(
     private readonly sql: SqlHandle,
@@ -307,18 +316,60 @@ export class SqlPageStore {
   /**
    * Flush all dirty frames to SQLite.
    * Call before snapshot save to ensure guest RAM is fully persisted.
+   * Uses multi-row INSERT OR REPLACE for batch efficiency.
+   * Also flushes any pending deferred writes.
    * SYNCHRONOUS.
    */
   flushDirty(): void {
+    // First, flush any deferred eviction writes
+    this.flushPendingWrites();
+
     const heap = this.heap;
     if (!heap) return;
+
+    // Collect all dirty frames
+    const BATCH = 64;
+    const batch: Array<{ gpa: number; data: Uint8Array }> = [];
+
     for (let i = 0; i < this.cfg.maxFrames; i++) {
       if (this.frameDirty[i] && this.frameGpa[i] >= 0) {
         const offset = this.poolBase + i * PAGE_SIZE;
-        this.writeToSql(this.frameGpa[i], heap.subarray(offset, offset + PAGE_SIZE));
+        // Copy data since we may process many frames
+        const copy = new Uint8Array(PAGE_SIZE);
+        copy.set(heap.subarray(offset, offset + PAGE_SIZE));
+        batch.push({ gpa: this.frameGpa[i], data: copy });
         this.frameDirty[i] = 0;
       }
     }
+
+    if (batch.length === 0) return;
+    this.init();
+    const t0 = performance.now();
+
+    for (let i = 0; i < batch.length; i += BATCH) {
+      const chunk = batch.slice(i, i + BATCH);
+      if (chunk.length === 1) {
+        this.sql.exec(
+          `INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES (?, ?)`,
+          chunk[0].gpa, chunk[0].data,
+        );
+      } else {
+        const placeholders = chunk.map(() => "(?,?)").join(",");
+        const params: any[] = [];
+        for (const entry of chunk) {
+          params.push(entry.gpa, entry.data);
+        }
+        this.sql.exec(
+          `INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES ${placeholders}`,
+          ...params,
+        );
+      }
+      this._sqlWrites += chunk.length;
+      this._batchWriteRows += chunk.length;
+    }
+
+    this._batchWrites++;
+    this._sqlWriteMs += performance.now() - t0;
   }
 
   // ── Clock eviction ────────────────────────────────────────────────────────
@@ -372,11 +423,11 @@ export class SqlPageStore {
       return -1;
     }
 
-    // Flush dirty frame to SQLite before reuse.
+    // Defer dirty frame write — batched on next microtask for storm efficiency.
     const heap = this.heap;
     if (this.frameDirty[evicted] && heap) {
       const offset = this.poolBase + evicted * PAGE_SIZE;
-      this.writeToSql(this.frameGpa[evicted], heap.subarray(offset, offset + PAGE_SIZE));
+      this.deferWrite(this.frameGpa[evicted], heap.subarray(offset, offset + PAGE_SIZE));
       this.frameDirty[evicted] = 0;
     }
 
@@ -438,6 +489,65 @@ export class SqlPageStore {
     this._sqlWriteMs += performance.now() - t0;
   }
 
+  /**
+   * Queue a dirty page for deferred batch write.
+   * The actual SQL write happens on the next microtask via flushPendingWrites().
+   * During page fault storms this batches many eviction writes into one statement.
+   */
+  private deferWrite(gpa: number, data: Uint8Array): void {
+    // Copy the data since the frame will be reused immediately after eviction
+    const copy = new Uint8Array(PAGE_SIZE);
+    copy.set(data.subarray(0, PAGE_SIZE));
+    this._pendingWrites.push({ gpa, data: copy });
+
+    if (!this._writeFlushScheduled) {
+      this._writeFlushScheduled = true;
+      queueMicrotask(() => this.flushPendingWrites());
+    }
+  }
+
+  /**
+   * Flush all deferred writes in batched multi-row INSERT OR REPLACE statements.
+   * Batch size capped at 64 rows per statement to avoid SQLite query limits.
+   */
+  private flushPendingWrites(): void {
+    this._writeFlushScheduled = false;
+    const pending = this._pendingWrites;
+    if (pending.length === 0) return;
+    this._pendingWrites = [];
+
+    this.init();
+    const t0 = performance.now();
+    const BATCH = 64;
+
+    for (let i = 0; i < pending.length; i += BATCH) {
+      const chunk = pending.slice(i, i + BATCH);
+      if (chunk.length === 1) {
+        // Single row — no overhead for non-storm case
+        this.sql.exec(
+          `INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES (?, ?)`,
+          chunk[0].gpa, chunk[0].data,
+        );
+      } else {
+        // Multi-row batch: INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES (?,?),(?,?),...
+        const placeholders = chunk.map(() => "(?,?)").join(",");
+        const params: any[] = [];
+        for (const entry of chunk) {
+          params.push(entry.gpa, entry.data);
+        }
+        this.sql.exec(
+          `INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES ${placeholders}`,
+          ...params,
+        );
+      }
+      this._sqlWrites += chunk.length;
+      this._batchWriteRows += chunk.length;
+    }
+
+    this._batchWrites++;
+    this._sqlWriteMs += performance.now() - t0;
+  }
+
   // ── Internal helpers ──────────────────────────────────────────────────────
 
   private get heap(): Uint8Array | null {
@@ -448,16 +558,19 @@ export class SqlPageStore {
 
   get stats() {
     return {
-      hotPages:    this.usedFrames,
-      totalFrames: this.cfg.maxFrames,
-      freeFrames:  this.cfg.maxFrames - this.usedFrames,
-      swapIns:     this._swapIns,
-      evictions:   this._evictions,
-      sqlReads:    this._sqlReads,
-      sqlWrites:   this._sqlWrites,
-      sqlReadMs:   Math.round(this._sqlReadMs),
-      sqlWriteMs:  Math.round(this._sqlWriteMs),
-      hasWasmPool: this.pool !== null,
+      hotPages:       this.usedFrames,
+      totalFrames:    this.cfg.maxFrames,
+      freeFrames:     this.cfg.maxFrames - this.usedFrames,
+      swapIns:        this._swapIns,
+      evictions:      this._evictions,
+      sqlReads:       this._sqlReads,
+      sqlWrites:      this._sqlWrites,
+      sqlReadMs:      Math.round(this._sqlReadMs),
+      sqlWriteMs:     Math.round(this._sqlWriteMs),
+      batchWrites:    this._batchWrites,
+      batchWriteRows: this._batchWriteRows,
+      pendingWrites:  this._pendingWrites.length,
+      hasWasmPool:    this.pool !== null,
     };
   }
 

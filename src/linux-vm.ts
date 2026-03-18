@@ -140,6 +140,13 @@ export class LinuxVM extends DurableObject<Env> {
   private consecutiveLargeFrames = 0;
   private framesSkippedBackpressure = 0;
 
+  // ── Adaptive FPS state (2-30fps) ────────────────────────────────────────
+  // The render loop runs at 33ms (30fps ceiling).  When no dirty pages are
+  // detected for 3+ consecutive ticks, we skip frames to drop to ~2fps.
+  // Any dirty detection immediately renders and resets the counter.
+  private _cleanTicks = 0;
+  private _adaptiveSkips = 0;  // perf counter: frames skipped due to idle
+
   // ── Storage state ───────────────────────────────────────────────────────
   private storage: SqliteStorage | null = null;
   private imageCache: SqliteImageCache | null = null;
@@ -347,6 +354,10 @@ export class LinuxVM extends DurableObject<Env> {
       pixelsOk:       p.pixelsOk,
       deltaNull:      p.deltaNull,
       svgaDirtyPages: p.svgaDirtyPages,
+      // Adaptive FPS
+      adaptiveSkips: this._adaptiveSkips,
+      cleanTicks:    this._cleanTicks,
+      effectiveFps:  uptimeMs > 0 ? +(p.framesSent / (uptimeMs / 1000)).toFixed(1) : 0,
       // Page store
       pageStore:   ps,
     };
@@ -426,7 +437,7 @@ export class LinuxVM extends DurableObject<Env> {
         if (!disk) {
           console.log(`${LOG_PREFIX} Fetching ${cacheName} from ${diskUrl}`);
           this.broadcast(encodeStatus(`downloading: ${label}`));
-          const resp = await fetch(diskUrl, { redirect: "follow" });
+          const resp = await this.cachedFetch(diskUrl);
           if (!resp.ok) throw new Error(`Failed to fetch ${diskUrl}: ${resp.status} ${resp.statusText}`);
           disk = await resp.arrayBuffer();
           const etag = resp.headers.get("etag") || undefined;
@@ -503,6 +514,8 @@ export class LinuxVM extends DurableObject<Env> {
 
       // Reset perf counters for this boot
       this._perf = { yields: 0, syncYields: 0, renders: 0, renderMs: 0, framesSent: 0, bootTimeMs: 0, pixelsNull: 0, pixelsOk: 0, deltaNull: 0, notDirty: 0, svgaDirtyPages: 0 };
+      this._adaptiveSkips = 0;
+      this._cleanTicks = 0;
 
       // ── SqlPageStore: created BEFORE new V86() so the swap hook is live ───────
       // SeaBIOS runs during cpu.init() which is called synchronously inside the
@@ -864,26 +877,25 @@ export class LinuxVM extends DurableObject<Env> {
     this.startRenderLoop();
   }
 
-  /** Fixed-cadence render loop at 8fps (125ms).
+  /** Adaptive render loop: 30fps ceiling, 2fps floor.
    *
-   *  Decoupled from the yield override so rendering happens at a steady rate
-   *  regardless of how fast/slow the CPU yields.  Each tick:
+   *  Runs setInterval at 33ms (≈30fps).  Each tick:
    *    1. Calls screen_fill_buffer() which drains the WASM dirty bitmap
-   *    2. Checks post-fill min/max to see if any pages were dirty
-   *    3. Encodes + sends a frame if pixels changed
+   *    2. If dirty: render + send frame, reset _cleanTicks to 0
+   *    3. If clean: increment _cleanTicks.  When _cleanTicks ≥ 3, skip frames
+   *       (only render every ~15th tick ≈ 2fps).
    *
-   *  For idle guests the bitmap is empty most ticks → cheap no-op.
-   *  For active guests dirty pages accumulate between ticks and are batch-processed.
-   *  At 8fps, each tick sees ~125ms of accumulated VGA writes — enough for
-   *  natural dirty detection without forced full-frame redraws.
+   *  This gives 30fps when the guest is actively drawing and drops to ~2fps
+   *  when idle — no clearInterval/setInterval churn.
    */
   private startRenderLoop(): void {
     if (this.renderInterval) {
       clearInterval(this.renderInterval);
     }
+    this._cleanTicks = 0;
     this.renderInterval = setInterval(() => {
       try { this.renderFrame(); } catch (_) {}
-    }, 125); // 8 fps
+    }, 33); // 30fps ceiling
   }
 
   private startStatsInterval(): void {
@@ -1006,6 +1018,12 @@ export class LinuxVM extends DurableObject<Env> {
    private _dbgPixelsNullReason: string | null = null;
    private _dbgFirstPixels = false;
    private _dbgFirstEncNull = false;
+
+   /** Adaptive render: 30fps when active, ~2fps when idle.
+    *  At 33ms interval, 15 ticks ≈ 500ms ≈ 2fps. */
+   private static readonly IDLE_SKIP_THRESHOLD = 3;   // clean ticks before throttling
+   private static readonly IDLE_RENDER_EVERY   = 15;  // render every Nth tick when idle (~2fps)
+
    private renderFrame(): void {
      this._renderCount++;
      this._perf.renders++;
@@ -1020,11 +1038,28 @@ export class LinuxVM extends DurableObject<Env> {
     if (!vga) return;
 
     if (vga.graphical_mode) {
-      const frame = this.getVgaPixels(vga);
-      if (!frame) {
-        this._perf.pixelsNull++;
+      // Adaptive idle skip: when 3+ consecutive clean ticks, only check every
+      // IDLE_RENDER_EVERY ticks (~2fps). This avoids calling screen_fill_buffer
+      // and getVgaPixels 30 times/sec on an idle desktop.
+      if (this._cleanTicks >= LinuxVM.IDLE_SKIP_THRESHOLD &&
+          this._renderCount % LinuxVM.IDLE_RENDER_EVERY !== 0) {
+        this._adaptiveSkips++;
+        this._perf.renderMs += performance.now() - _rfT0;
         return;
       }
+
+      const frame = this.getVgaPixels(vga);
+      if (!frame) {
+        // No dirty pixels — track consecutive clean ticks for adaptive throttle
+        this._cleanTicks++;
+        this._perf.pixelsNull++;
+        this._perf.renderMs += performance.now() - _rfT0;
+        return;
+      }
+
+      // Dirty detection — reset to active (30fps)
+      this._cleanTicks = 0;
+
       this._perf.pixelsOk++;
 
       // First successful pixel read — log it once
@@ -1050,11 +1085,14 @@ export class LinuxVM extends DurableObject<Env> {
         return;
       }
       if (!result) {
+        // Delta encoder says no tiles changed — treat as clean tick
+        this._cleanTicks++;
         this._perf.deltaNull++;
         if (!this._dbgFirstEncNull) {
           this._dbgFirstEncNull = true;
           console.log(`${LOG_PREFIX} encode returned null (no changed tiles) — forceKeyframe=${anyNeedsKeyframe} w=${frame.width} h=${frame.height}`);
         }
+        this._perf.renderMs += performance.now() - _rfT0;
         return;
       }
 
@@ -1062,11 +1100,28 @@ export class LinuxVM extends DurableObject<Env> {
       this._perf.renderMs += performance.now() - _rfT0;
       this.sendFrameToClients(result, frame);
     } else {
+      // Text mode — also adaptive: skip if idle
+      if (this._cleanTicks >= LinuxVM.IDLE_SKIP_THRESHOLD &&
+          this._renderCount % LinuxVM.IDLE_RENDER_EVERY !== 0) {
+        this._adaptiveSkips++;
+        this._perf.renderMs += performance.now() - _rfT0;
+        return;
+      }
+
       const textRows = this.screenAdapter.getTextScreen();
-      if (textRows.length === 0) { this._perf.renderMs += performance.now() - _rfT0; return; }
+      if (textRows.length === 0) {
+        this._cleanTicks++;
+        this._perf.renderMs += performance.now() - _rfT0;
+        return;
+      }
 
       const textContent = textRows.join("\n");
-      if (textContent === this.lastTextContent) { this._perf.renderMs += performance.now() - _rfT0; return; }
+      if (textContent === this.lastTextContent) {
+        this._cleanTicks++;
+        this._perf.renderMs += performance.now() - _rfT0;
+        return;
+      }
+      this._cleanTicks = 0;
       this.lastTextContent = textContent;
 
       this._perf.renderMs += performance.now() - _rfT0;
@@ -1344,7 +1399,7 @@ export class LinuxVM extends DurableObject<Env> {
 
       console.log(`${LOG_PREFIX} Self-recovery: fetching ${cacheName} from ${imageDef.url}`);
       this.broadcast(encodeStatus(`downloading: ${imageDef.label}`));
-      const resp = await fetch(imageDef.url, { redirect: "follow" });
+      const resp = await this.cachedFetch(imageDef.url);
       if (!resp.ok) {
         throw new Error(`Disk fetch ${imageDef.url}: ${resp.status} ${resp.statusText}`);
       }
@@ -1378,6 +1433,57 @@ export class LinuxVM extends DurableObject<Env> {
     this.cachedAssets = assets;
     this.imageKey = resolvedKey;
     console.log(`${LOG_PREFIX} Self-recovery complete for ${resolvedKey} — ${assets.size} assets loaded`);
+  }
+
+  /**
+   * Fetch a disk image URL with Cache API (caches.default) wrapping.
+   * On cache hit, returns the cached response directly (CDN edge cache).
+   * On miss, fetches from origin, caches the response, returns the body.
+   */
+  private async cachedFetch(url: string): Promise<Response> {
+    // Cache API uses Request objects; normalize URL to HTTPS for cache key consistency
+    const cacheKey = new Request(url.replace(/^http:\/\//, "https://"), { redirect: "follow" });
+    try {
+      const cache = (caches as any).default;
+      if (cache) {
+        const cached = await cache.match(cacheKey);
+        if (cached) {
+          console.log(`${LOG_PREFIX} Cache API hit for ${url}`);
+          return cached;
+        }
+      }
+    } catch (e) {
+      // Cache API may not be available in all environments — fall through
+      console.warn(`${LOG_PREFIX} Cache API match failed (non-fatal):`, e);
+    }
+
+    const resp = await fetch(url, { redirect: "follow" });
+    if (!resp.ok) return resp;
+
+    // Clone before reading body — put the clone in cache, return the original
+    try {
+      const cache = (caches as any).default;
+      if (cache) {
+        // Only cache successful responses with a body
+        const cloned = resp.clone();
+        // Set cache-control if origin didn't provide one (disk images rarely change)
+        const headers = new Headers(cloned.headers);
+        if (!headers.has("cache-control")) {
+          headers.set("cache-control", "public, max-age=604800"); // 7 days
+        }
+        const cacheResp = new Response(cloned.body, {
+          status: cloned.status,
+          statusText: cloned.statusText,
+          headers,
+        });
+        await cache.put(cacheKey, cacheResp);
+        console.log(`${LOG_PREFIX} Cache API stored ${url}`);
+      }
+    } catch (e) {
+      console.warn(`${LOG_PREFIX} Cache API put failed (non-fatal):`, e);
+    }
+
+    return resp;
   }
 
   /** Initialize SQLite storage + image cache (idempotent) */
