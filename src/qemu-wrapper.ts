@@ -198,7 +198,7 @@ export class QEMUWrapper {
   // ── Execution pump (JS-driven via setTimeout) ──────────────────────
   private stepTimer: ReturnType<typeof setTimeout> | null = null;
   private eventTimer: ReturnType<typeof setTimeout> | null = null;
-  private static readonly STEP_ITERATIONS = 4096;  // TBs per step call
+  private static readonly STEP_ITERATIONS = 16384; // TBs per step call (high throughput)
 
   /** Whether the QEMU module has been loaded and callMain() has returned. */
   get isLoaded(): boolean {
@@ -595,7 +595,7 @@ export class QEMUWrapper {
     args.push("-L", "/usr/local/share/qemu"); // BIOS search path
     args.push("-nic", "none");                 // No network
     args.push("-monitor", "none");             // No QMP monitor
-    args.push("-icount", "shift=0");             // 1 insn = 1ns virtual time — fastest timer delivery
+    args.push("-icount", "shift=7");             // 128 insns = 1ns — balanced timer delivery + throughput
 
     // AP starts paused, waiting for SIPI
     if (!config.isBSP) {

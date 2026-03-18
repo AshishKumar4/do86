@@ -975,7 +975,7 @@ static void do86_drive_vcpus(void)
                 icount_process_data(cpu);
             }
             bql_lock();
-            do86_debug_exec_count++;
+            do86_debug_exec_count++; // debug counter only
             if (do86_debug_exec_count <= 10 || do86_debug_exec_count % 5000 == 0) {
                 fprintf(stdout, "[EXEC] count=%u ret=%d pcpu=%p halted=%d exit_request=%d irq=%x\n",
                         do86_debug_exec_count, r, cpu, cpu->halted, cpu->exit_request, cpu->interrupt_request);
@@ -1486,11 +1486,11 @@ int wasm_step(int iterations)
          * We avoid main_loop_wait() here because it triggers ASYNCIFY
          * unwinds via AIO coroutine processing, which breaks the step pump.
          * Instead, directly run the timer subsystem. */
-        /* With -icount, run virtual clock timers to fire PIT/APIC
-         * callbacks based on instruction count. This doesn't involve
-         * AIO or coroutines — pure timer expiry checking. */
-        qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
-        qemu_clock_run_timers(QEMU_CLOCK_REALTIME);
+        /* Run timers every 256 TBs or on HLT to reduce overhead */
+        if ((i & 0xFF) == 0xFF || (first_cpu && first_cpu->halted)) {
+            qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+            qemu_clock_run_timers(QEMU_CLOCK_REALTIME);
+        }
 
         if (first_cpu && first_cpu->halted) {
             first_cpu->halted = 0;
