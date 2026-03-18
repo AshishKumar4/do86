@@ -19629,6 +19629,7 @@ CPU.prototype.init = function(settings, device_bus) {
     } else if (settings.net_device.type === "virtio") {
       this.devices.virtio_net = new VirtioNet(this, device_bus, settings.preserve_mac_from_state_image, settings.net_device.mtu);
     }
+    // type: "none" — no network PCI device registered.  Guest sees no NIC.
     if (settings.fs9p) {
       this.devices.virtio_9p = new Virtio9p(settings.fs9p, this, device_bus);
     } else if (settings.handle9p) {
@@ -24477,6 +24478,7 @@ V86.prototype.continue_init = async function(emulator, options) {
       this.network_adapter = new NetworkAdapter(relay_url, this.bus);
     }
   }
+  // type: "none" skips network PCI device registration entirely.
   settings.net_device = options.net_device || { type: "ne2k" };
   const screen_options = options.screen || {};
   if (options.screen_container) {
