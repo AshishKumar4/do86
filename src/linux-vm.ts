@@ -427,9 +427,14 @@ export class LinuxVM extends DurableObject<Env> {
       (V86 as any).microtick = () => {
         const realNow = performance.now();
         if (realNow > lastRealTime) {
-          // I/O happened — real time advanced. Sync up.
-          syntheticTime = realNow;
           lastRealTime = realNow;
+          // Only advance syntheticTime if real time is ahead — never go backwards.
+          // If syntheticTime already leads realNow (from synthetic increments),
+          // keep it as-is; resetting to realNow would cause time to go backwards,
+          // triggering the ACPI pmtimer dbg_assert(t > timer_last_value).
+          if (realNow > syntheticTime) {
+            syntheticTime = realNow;
+          }
         } else {
           // Still in synchronous execution — advance synthetically.
           syntheticTime += MICROTICK_INCREMENT;
