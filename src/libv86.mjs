@@ -19717,15 +19717,27 @@ CPU.prototype.load_multiboot_option_rom = function(buffer, initrd, cmdline) {
         cpu.write_blob(cmdline_utf8, multiboot_data);
         multiboot_data += cmdline_utf8.length;
       }
+      {
+        const reported_mem = cpu._logical_memory_size || cpu.memory_size[0];
+        info |= 1;
+        cpu.write32(multiboot_info_addr + 4, 640);
+        cpu.write32(
+          multiboot_info_addr + 8,
+          Math.max(0, reported_mem - 1024 * 1024) >> 10
+        );
+      }
       if (flags & MULTIBOOT_HEADER_MEMORY_INFO) {
         info |= MULTIBOOT_INFO_MEM_MAP;
         let multiboot_mmap_count = 0;
         cpu.write32(multiboot_info_addr + 44, 0);
         cpu.write32(multiboot_info_addr + 48, multiboot_data);
+        const reported_size = cpu._logical_memory_size || cpu.memory_size[0];
         let start = 0;
         let was_memory = false;
         for (let addr = 0; addr < MMAP_MAX; addr += MMAP_BLOCK_SIZE) {
-          if (was_memory && cpu.memory_map_read8[addr >>> MMAP_BLOCK_BITS] !== void 0) {
+          const has_handler = cpu.memory_map_read8[addr >>> MMAP_BLOCK_BITS] !== void 0;
+          const is_ram = addr < reported_size && (!has_handler || addr >= cpu.memory_size[0]);
+          if (was_memory && !is_ram) {
             cpu.write32(multiboot_data, 20);
             cpu.write32(multiboot_data + 4, start);
             cpu.write32(multiboot_data + 8, 0);
@@ -19735,12 +19747,21 @@ CPU.prototype.load_multiboot_option_rom = function(buffer, initrd, cmdline) {
             multiboot_data += 24;
             multiboot_mmap_count += 24;
             was_memory = false;
-          } else if (!was_memory && cpu.memory_map_read8[addr >>> MMAP_BLOCK_BITS] === void 0) {
+          } else if (!was_memory && is_ram) {
             start = addr;
             was_memory = true;
           }
         }
-        dbg_assert(!was_memory, "top of 4GB shouldn't have memory");
+        if (was_memory) {
+          cpu.write32(multiboot_data, 20);
+          cpu.write32(multiboot_data + 4, start);
+          cpu.write32(multiboot_data + 8, 0);
+          cpu.write32(multiboot_data + 12, reported_size - start);
+          cpu.write32(multiboot_data + 16, 0);
+          cpu.write32(multiboot_data + 20, 1);
+          multiboot_data += 24;
+          multiboot_mmap_count += 24;
+        }
         cpu.write32(multiboot_info_addr + 44, multiboot_mmap_count);
       }
       let entrypoint = 0;
