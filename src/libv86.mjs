@@ -18930,6 +18930,12 @@ CPU.prototype.mmap_write128 = function(addr, value0, value1, value2, value3) {
   write_func32(addr + 8, value2);
   write_func32(addr + 12, value3);
 };
+CPU.prototype.swap_page_in = function(gpa) {
+  if (this._swap_page_in_hook) {
+    return this._swap_page_in_hook(gpa) | 0;
+  }
+  return -1;
+};
 CPU.prototype.write_blob = function(blob, offset) {
   dbg_assert(blob && blob.length >= 0);
   if (blob.length) {
@@ -19440,6 +19446,7 @@ CPU.prototype.init = function(settings, device_bus) {
   }
   settings.cpuid_level && this.set_cpuid_level(settings.cpuid_level);
   this.acpi_enabled[0] = +settings.acpi;
+  this._logical_memory_size = settings.logical_memory_size || this.memory_size[0];
   this.reset_cpu();
   if (this.smp_init) {
     const cpu_count = settings.cpu_count | 0 || 1;
@@ -19539,7 +19546,7 @@ CPU.prototype.init = function(settings, device_bus) {
     } else if (value === FW_CFG_ID) {
       this.fw_value = i32(0);
     } else if (value === FW_CFG_RAM_SIZE) {
-      this.fw_value = i32(this.memory_size[0]);
+      this.fw_value = i32(this._logical_memory_size || this.memory_size[0]);
     } else if (value === FW_CFG_NB_CPUS) {
       this.fw_value = i32(1);
     } else if (value === FW_CFG_MAX_CPUS) {
@@ -19890,9 +19897,10 @@ CPU.prototype.fill_cmos = function(rtc, settings) {
   rtc.cmos_write(CMOS_BIOS_BOOTFLAG2, boot_order & 255);
   rtc.cmos_write(CMOS_MEM_BASE_LOW, 640 & 255);
   rtc.cmos_write(CMOS_MEM_BASE_HIGH, 640 >> 8);
+  var reported_mem = this._logical_memory_size || this.memory_size[0];
   var memory_above_1m = 0;
-  if (this.memory_size[0] >= 1024 * 1024) {
-    memory_above_1m = this.memory_size[0] - 1024 * 1024 >> 10;
+  if (reported_mem >= 1024 * 1024) {
+    memory_above_1m = reported_mem - 1024 * 1024 >> 10;
     memory_above_1m = Math.min(memory_above_1m, 65535);
   }
   rtc.cmos_write(CMOS_MEM_OLD_EXT_LOW, memory_above_1m & 255);
@@ -19900,8 +19908,8 @@ CPU.prototype.fill_cmos = function(rtc, settings) {
   rtc.cmos_write(CMOS_MEM_EXTMEM_LOW, memory_above_1m & 255);
   rtc.cmos_write(CMOS_MEM_EXTMEM_HIGH, memory_above_1m >> 8 & 255);
   var memory_above_16m = 0;
-  if (this.memory_size[0] >= 16 * 1024 * 1024) {
-    memory_above_16m = this.memory_size[0] - 16 * 1024 * 1024 >> 16;
+  if (reported_mem >= 16 * 1024 * 1024) {
+    memory_above_16m = reported_mem - 16 * 1024 * 1024 >> 16;
     memory_above_16m = Math.min(memory_above_16m, 65535);
   }
   rtc.cmos_write(CMOS_MEM_EXTMEM2_LOW, memory_above_16m & 255);
@@ -24206,6 +24214,12 @@ function V86(options) {
     "mmap_write128": function(addr, value0, value1, value2, value3) {
       cpu.mmap_write128(addr, value0, value1, value2, value3);
     },
+    // Demand-paging hook: called from do_page_walk when GPA >= PAGED_THRESHOLD.
+    // Delegates to cpu._swap_page_in_hook (set by do86/linux-vm.ts after emulator-loaded).
+    // Returns the WASM byte offset of the hot frame, or -1 if paging is not enabled.
+    "swap_page_in": function(gpa) {
+      return cpu.swap_page_in(gpa);
+    },
     "log_from_wasm": function(offset, len) {
       const str = read_sized_string_from_mem(wasm_memory, offset, len);
       dbg_log(str, LOG_CPU);
@@ -24297,6 +24311,7 @@ V86.prototype.continue_init = async function(emulator, options) {
   settings.load_devices = true;
   settings.memory_size = options.memory_size || 64 * 1024 * 1024;
   settings.vga_memory_size = options.vga_memory_size || 8 * 1024 * 1024;
+  settings.logical_memory_size = options.logical_memory_size || settings.memory_size;
   settings.boot_order = boot_order;
   settings.fastboot = options.fastboot || false;
   settings.fda = void 0;

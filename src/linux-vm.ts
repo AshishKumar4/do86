@@ -14,6 +14,7 @@ import {
 import { DOScreenAdapter } from "./screen-adapter";
 import { DeltaEncoder, encodeSerialData, encodeStatus, encodeTextScreen } from "./delta-encoder";
 import { SqliteStorage, SqliteImageCache, SQLiteBlockDevice, unpackAssets } from "./sqlite-storage";
+import { SqlPageStore } from "./sql-page-store";
 import type { Env } from "./index";
 
 // ── Image registry (mirrored from index.ts for DO self-recovery) ─────────────
@@ -383,6 +384,11 @@ export class LinuxVM extends DurableObject<Env> {
         vga_bios: { buffer: vgaBios },
         memory_size: memorySizeMB * 1024 * 1024,
         vga_memory_size: vgaMemoryMB * 1024 * 1024,
+        // logical_memory_size: what the guest BIOS reports (128 MB).
+        // WASM only allocates memory_size (48 MB); the upper 80 MB is demand-paged
+        // from DO SQLite via the swap_page_in WASM import hook installed below.
+        // The hot pool occupies mem8[32MB..48MB] — 4096 × 4KB = 16MB hot window.
+        logical_memory_size: 128 * 1024 * 1024,
         autostart: false,
         disable_speaker: true,
         fastboot: true,
@@ -443,6 +449,48 @@ export class LinuxVM extends DurableObject<Env> {
         this.emulator!.add_listener("emulator-loaded", () => {
           console.log(`${LOG_PREFIX} emulator-loaded fired`);
           clearTimeout(timeout);
+
+          // ── SQLite demand-paging hook ─────────────────────────────────────────
+          // Install SqlPageStore on the v86 CPU object so that swap_page_in()
+          // calls (from do_page_walk in WASM) are served synchronously from
+          // DO SQLite.  Hot pool: mem8[HOT_POOL_BASE..48MB] = 4096 × 4KB frames.
+          //
+          // HOT_POOL_BASE must match PAGED_THRESHOLD in stratum/src/rust/cpu/memory.rs.
+          const HOT_POOL_BASE = 32 * 1024 * 1024; // 32 MB
+          const HOT_POOL_FRAMES = 4096;             // 4096 × 4KB = 16MB
+
+          try {
+            const cpu = (this.emulator as any).v86?.cpu;
+            if (cpu && cpu.wasm_memory?.buffer) {
+              const pageStore = new SqlPageStore(
+                this.ctx.storage.sql as any,
+                HOT_POOL_FRAMES,
+              );
+              pageStore.init();
+
+              // Point at the top 16MB of WASM linear memory (the hot pool window).
+              const wasmHeap = new Uint8Array(cpu.wasm_memory.buffer);
+              pageStore.setWasmHeap(wasmHeap, HOT_POOL_BASE);
+
+              // Give the store a reference to the CPU for TLB flush after eviction.
+              pageStore.setCpu(cpu);
+
+              // Install the swap hook — called by cpu.swap_page_in() (WASM import).
+              cpu._swap_page_in_hook = (gpa: number): number => pageStore.swapIn(gpa);
+
+              console.log(
+                `${LOG_PREFIX} SqlPageStore ready: hot pool at WASM offset ` +
+                `0x${HOT_POOL_BASE.toString(16)}–0x${(HOT_POOL_BASE + HOT_POOL_FRAMES * 4096).toString(16)} ` +
+                `(${HOT_POOL_FRAMES} frames × 4KB = ${HOT_POOL_FRAMES * 4096 / 1024 / 1024}MB)`,
+              );
+            } else {
+              console.warn(`${LOG_PREFIX} SqlPageStore: cpu or wasm_memory not available — demand-paging disabled`);
+            }
+          } catch (e) {
+            console.error(`${LOG_PREFIX} SqlPageStore init failed (non-fatal):`, e);
+            // Non-fatal: guest runs with 48MB resident RAM (no paging). Same as before.
+          }
+
           const vga = this.getVga();
           if (vga) {
             vga.screen = this.screenAdapter;

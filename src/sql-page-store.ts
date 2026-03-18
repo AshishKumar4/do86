@@ -199,6 +199,13 @@ export class SqlPageStore {
   /** Maximum number of frames in the pool. */
   private maxFrames: number;
 
+  /**
+   * v86 CPU object reference — set by setCpu() after emulator-loaded fires.
+   * Used to call full_clear_tlb() after frame eviction so stale TLB entries
+   * that pointed to the evicted frames are invalidated before reuse.
+   */
+  private cpu: { full_clear_tlb: () => void } | null = null;
+
   /** Public read-only access to max frame count (used by QEMUWrapper to size pool). */
   get maxFrameCount(): number {
     return this.maxFrames;
@@ -243,6 +250,16 @@ export class SqlPageStore {
   setWasmHeap(heap: Uint8Array, poolBase: number): void {
     this.wasmHeap = heap;
     this.poolBase = poolBase;
+  }
+
+  /**
+   * Set the v86 CPU reference so we can call full_clear_tlb() after eviction.
+   * Must be called after `emulator-loaded` fires (before swapIn is first used).
+   * Eviction invalidates the entire TLB to ensure no stale entries point to
+   * frames that have been reassigned to a different GPA.
+   */
+  setCpu(cpu: { full_clear_tlb: () => void }): void {
+    this.cpu = cpu;
   }
 
   // ── Core page operations (all SYNCHRONOUS) ────────────────────────────
@@ -462,6 +479,13 @@ export class SqlPageStore {
 
     if (evicted > 0) {
       this.dirtyCount = 0; // Reset after flush
+
+      // Invalidate the entire TLB so no stale entries reference evicted frames.
+      // Cost: ~microseconds (clears ~4096-entry array + list); paid once per
+      // EVICT_BATCH page-ins — negligible vs the SQLite I/O we just did.
+      if (this.cpu) {
+        try { this.cpu.full_clear_tlb(); } catch { /* non-fatal if not yet running */ }
+      }
     }
   }
 
