@@ -1456,30 +1456,28 @@ export class LinuxVM extends DurableObject<Env> {
 
     if (!disk) {
       if (!imageDef.url) {
-        // Inline-only image (e.g. aqeous) — cannot self-recover without the
-        // Worker re-sending the binary. Tell the client to reload the page.
-        throw new Error(
-          `Image "${resolvedKey}" has no public URL and is not cached — reload the page to re-initialize`,
+        console.log(`${LOG_PREFIX} Self-recovery: fetching ${cacheName} from ASSETS`);
+        this.broadcast(encodeStatus(`downloading: ${imageDef.label}`));
+        disk = await fetchAsset(`/assets/${imageDef.file}`);
+      } else {
+        console.log(`${LOG_PREFIX} Self-recovery: fetching ${cacheName} from ${imageDef.url}`);
+        this.broadcast(encodeStatus(`downloading: ${imageDef.label}`));
+        const resp = await this.cachedFetch(imageDef.url);
+        if (!resp.ok) {
+          throw new Error(`Disk fetch ${imageDef.url}: ${resp.status} ${resp.statusText}`);
+        }
+        disk = await resp.arrayBuffer();
+        const etag = resp.headers.get("etag") ?? undefined;
+        console.log(
+          `${LOG_PREFIX} Self-recovery: downloaded ${cacheName} ` +
+          `(${(disk.byteLength / 1024 / 1024).toFixed(1)} MB)`,
         );
-      }
 
-      console.log(`${LOG_PREFIX} Self-recovery: fetching ${cacheName} from ${imageDef.url}`);
-      this.broadcast(encodeStatus(`downloading: ${imageDef.label}`));
-      const resp = await this.cachedFetch(imageDef.url);
-      if (!resp.ok) {
-        throw new Error(`Disk fetch ${imageDef.url}: ${resp.status} ${resp.statusText}`);
-      }
-      disk = await resp.arrayBuffer();
-      const etag = resp.headers.get("etag") ?? undefined;
-      console.log(
-        `${LOG_PREFIX} Self-recovery: downloaded ${cacheName} ` +
-        `(${(disk.byteLength / 1024 / 1024).toFixed(1)} MB)`,
-      );
-
-      try {
-        this.imageCache!.images.put(cacheName, disk, { etag, fetchedAt: new Date().toISOString() });
-      } catch (e) {
-        console.error(`${LOG_PREFIX} Self-recovery: cache write failed (non-fatal):`, e);
+        try {
+          this.imageCache!.images.put(cacheName, disk, { etag, fetchedAt: new Date().toISOString() });
+        } catch (e) {
+          console.error(`${LOG_PREFIX} Self-recovery: cache write failed (non-fatal):`, e);
+        }
       }
     }
 
