@@ -188,6 +188,7 @@ export class LinuxVM extends DurableObject<Env> {
   private _pageStore: SqlPageStore | null = null;
   private _statsInterval: ReturnType<typeof setInterval> | null = null;
   private _yieldDead = false;
+  private _yieldError = "";
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
@@ -377,6 +378,7 @@ export class LinuxVM extends DurableObject<Env> {
       svgaDirtyPages: p.svgaDirtyPages,
       // Yield health
       yieldDead:     this._yieldDead,
+      yieldError:    this._yieldError || null,
       // Adaptive FPS
       adaptiveSkips: this._adaptiveSkips,
       cleanTicks:    this._cleanTicks,
@@ -751,6 +753,7 @@ export class LinuxVM extends DurableObject<Env> {
                 try {
                   v86Internal.yield_callback(tick);
                 } catch (e) {
+                  this._yieldError = `sync: ${e}`;
                   console.error(`${LOG_PREFIX} FATAL: sync yield_callback threw:`, e);
                   this._yieldDead = true;
                 }
@@ -760,12 +763,12 @@ export class LinuxVM extends DurableObject<Env> {
               if (t > 10) {
                 setTimeout(() => {
                   try { v86Internal.yield_callback(tick); }
-                  catch (e) { console.error(`${LOG_PREFIX} FATAL: async yield_callback threw:`, e); this._yieldDead = true; }
+                  catch (e) { this._yieldError = `async(idle): ${e}`; console.error(`${LOG_PREFIX} FATAL: async yield_callback threw:`, e); this._yieldDead = true; }
                 }, Math.min(t, 40));
               } else {
                 setTimeout(() => {
                   try { v86Internal.yield_callback(tick); }
-                  catch (e) { console.error(`${LOG_PREFIX} FATAL: async yield_callback threw:`, e); this._yieldDead = true; }
+                  catch (e) { this._yieldError = `async: ${e}`; console.error(`${LOG_PREFIX} FATAL: async yield_callback threw:`, e); this._yieldDead = true; }
                 }, 1);
               }
             };
