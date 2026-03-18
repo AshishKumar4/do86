@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { V86 as V86Type } from "v86";
+import type { V86 as V86Type } from "./libv86.mjs";
 import v86WasmModule from "./v86.wasm";
 
 // Side-effect import: registers the ImageData polyfill on globalThis
@@ -63,16 +63,8 @@ export class LinuxVM extends DurableObject<unknown> {
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
-
-    // Restore sessions from hibernation
-    for (const ws of this.ctx.getWebSockets()) {
-      const tag = ws.deserializeAttachment() as string | null;
-      if (tag) {
-        this.sessions.set(ws, { needsKeyframe: true, droppedFrames: 0, lastSendTime: 0 });
-      }
-    }
-
-    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    // Non-hibernating DO: no session restore needed.
+    // The VM lives entirely in memory; hibernation would destroy emulator state.
   }
 
   // ── HTTP handler ────────────────────────────────────────────────────────
@@ -148,34 +140,40 @@ export class LinuxVM extends DurableObject<unknown> {
       }
     }
 
-    // WebSocket upgrade
+    // WebSocket upgrade — use server.accept() (non-hibernating) so the DO is
+    // never evicted from memory while the v86 emulator is running.
+    // ctx.acceptWebSocket() (hibernation API) would destroy all in-memory
+    // emulator state on eviction.
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    this.ctx.acceptWebSocket(server);
+    server.accept();
 
-    const sessionId = crypto.randomUUID();
-    server.serializeAttachment(sessionId);
     this.sessions.set(server, { needsKeyframe: true, droppedFrames: 0, lastSendTime: 0 });
+
+    server.addEventListener("message", async (event: MessageEvent) => {
+      await this.webSocketMessage(server, event.data);
+    });
+    server.addEventListener("close", (event: CloseEvent) => {
+      this.webSocketClose(server, event.code, event.reason);
+    });
+    server.addEventListener("error", () => {
+      this.webSocketError(server);
+    });
 
     this.wsSend(server, encodeStatus("connected"));
 
     if (this.bootError) {
       this.wsSend(server, encodeStatus("error: " + this.bootError));
-    } else if (!this.booting && !this.booted) {
-      if (this.cachedAssets) {
-        this.bootVM().catch((err) => {
-          this.bootError = String(err);
-          this.broadcast(encodeStatus("error: " + String(err)));
-        });
-      } else {
-        this.wsSend(server, encodeStatus("waiting_for_assets"));
-      }
     } else if (this.booted) {
       this.wsSend(server, encodeStatus("running"));
       this.sendCurrentFrame(server);
       this.startRenderLoop();
-    } else {
+    } else if (this.booting) {
       this.wsSend(server, encodeStatus("booting"));
+    } else {
+      // Tell client to send {type:"boot"} — boot will run inside that handler,
+      // keeping the event loop active for the full async chain.
+      this.wsSend(server, encodeStatus("waiting_for_boot"));
     }
 
     return new Response(null, { status: 101, webSocket: client });
@@ -293,19 +291,25 @@ export class LinuxVM extends DurableObject<unknown> {
       // Free packed assets before allocating v86 WASM memory — reduces peak usage
       this.cachedAssets = null;
 
-      const { V86 } = await import("v86");
+      const { V86 } = await import("./libv86.mjs");
 
-      // Monkey-patch microtick for Workers environment where performance.now() is coarsened
-      // to only return the time of the last I/O. The WASM main_loop calls microtick() repeatedly
-      // to check if TIME_PER_FRAME (1ms) has elapsed — but since no I/O happens during synchronous
-      // WASM execution, performance.now() never advances and the loop spins forever, exhausting cpu_ms.
+      // Microtick fix for Workers environment where performance.now() is frozen between I/O.
       //
-      // Hybrid approach: advance synthetically during synchronous WASM execution (~50 calls per frame
-      // at 0.02ms increment = 1ms), but sync to real time whenever I/O causes it to advance.
-      // The PIT/guest OS timer is driven by cycle count, not wall clock, so synthetic time is fine.
+      // F.microtick (JS-side) is called directly by ACPI, PIT, RTC, and APIC device code —
+      // NOT only via the WASM import. We must patch V86.microtick BEFORE new V86() so that:
+      //   1. The global JS device calls use our hybrid timer.
+      //   2. The WASM import table (bound at WebAssembly.instantiate time) also captures it,
+      //      because libv86.mjs passes `v86.microtick` by value into the WASM env object.
+      //
+      // V86.microtick has a getter/setter that forwards to the internal `v86.microtick` variable,
+      // so assigning here propagates to both the JS devices and the WASM import capture.
+      //
+      // Hybrid approach: advance synthetically during synchronous WASM execution (~50 calls per
+      // frame at 0.02ms increment = 1ms), but sync to real time whenever I/O advances it.
       let syntheticTime = performance.now();
       let lastRealTime = syntheticTime;
-      const MICROTICK_INCREMENT = 0.02; // 20μs per call — ~50 calls to hit 1ms TIME_PER_FRAME
+      const MICROTICK_INCREMENT = 0.005; // 20μs per call — ~50 calls to hit 1ms TIME_PER_FRAME
+
       (V86 as any).microtick = () => {
         const realNow = performance.now();
         if (realNow > lastRealTime) {
@@ -313,7 +317,7 @@ export class LinuxVM extends DurableObject<unknown> {
           syntheticTime = realNow;
           lastRealTime = realNow;
         } else {
-          // Still in synchronous WASM execution — advance synthetically
+          // Still in synchronous execution — advance synthetically.
           syntheticTime += MICROTICK_INCREMENT;
         }
         return syntheticTime;
@@ -321,7 +325,9 @@ export class LinuxVM extends DurableObject<unknown> {
 
       const v86Config: Record<string, any> = {
         wasm_fn: async (importObj: any) => {
+          console.log(`${LOG_PREFIX} wasm_fn: calling WebAssembly.instantiate`);
           const instance = await WebAssembly.instantiate(v86WasmModule, importObj);
+          console.log(`${LOG_PREFIX} wasm_fn: WebAssembly.instantiate complete, exports=${Object.keys(instance.exports).length}`);
           return instance.exports;
         },
         disable_jit: false,
@@ -334,6 +340,7 @@ export class LinuxVM extends DurableObject<unknown> {
         fastboot: true,
         acpi: true,
         boot_order: drive === "cdrom" ? BOOT_ORDER_CDROM_FIRST : BOOT_ORDER_HDA_FIRST,
+        cpu_count: 4,
       };
 
       if (drive === "fda") v86Config.fda = { buffer: disk };
@@ -347,7 +354,10 @@ export class LinuxVM extends DurableObject<unknown> {
         v86Config.initial_state = { buffer: savedState };
       }
 
+      const origOnError = globalThis.onerror;
+      console.log(`${LOG_PREFIX} Calling new V86(config)`);
       this.emulator = new V86(v86Config);
+      console.log(`${LOG_PREFIX} new V86() returned — waiting for emulator-loaded`);
 
       this.emulator.add_listener("emulator-stopped", () => {
         this.broadcast(encodeStatus("error: emulator stopped"));
@@ -379,6 +389,7 @@ export class LinuxVM extends DurableObject<unknown> {
         );
 
         this.emulator!.add_listener("emulator-loaded", () => {
+          console.log(`${LOG_PREFIX} emulator-loaded fired`);
           clearTimeout(timeout);
           const vga = this.getVga();
           if (vga) {
@@ -392,6 +403,28 @@ export class LinuxVM extends DurableObject<unknown> {
             }
           }
           this.emulator!.run();
+
+          // In deployed Workers the yield→main_loop→yield chain monopolizes the
+          // macrotask queue: setTimeout(fn, 0) re-enqueues faster than setInterval
+          // callbacks can fire. The render loop and WS handlers starve.
+          //
+          // Fix: every 16th yield, call renderFrame() directly (synchronous, inside
+          // this macrotask) before scheduling the next yield. This guarantees frames
+          // are produced without depending on setInterval winning the scheduler race.
+          // The closure over `this` makes it feasible without any plumbing changes.
+          // The other 15 yields are plain setTimeout(fn, 0) for full throughput.
+          const v86Internal = (this.emulator as any).v86;
+          if (v86Internal) {
+            let yieldCount = 0;
+            v86Internal.yield = (t: number, tick: number) => {
+              yieldCount++;
+              if (yieldCount % 16 === 0) {
+                try { this.renderFrame(); } catch (_) {}
+              }
+              setTimeout(() => v86Internal.yield_callback(tick), 0);
+            };
+          }
+
           resolve();
         });
       });
@@ -432,6 +465,9 @@ export class LinuxVM extends DurableObject<unknown> {
         }
       }
     } catch (err) {
+      if (this.imageKey && this.imageCache) {
+        try { console.log(`${LOG_PREFIX} Clearing corrupted snapshot for ${this.imageKey}`); this.snapshotSaved = false; } catch { }
+      }
       this.bootError = String(err);
       this.cachedAssets = null;
       this.inputGated = false; // Don't leave input gated on boot failure
@@ -568,15 +604,24 @@ export class LinuxVM extends DurableObject<unknown> {
     rgba: Uint8ClampedArray; width: number; height: number; bufferWidth: number;
   } | null {
     const cpu = vga.cpu;
-    if (!cpu?.wasm_memory?.buffer) return null;
+    if (!cpu?.wasm_memory?.buffer) {
+      this._dbgPixelsNullReason = "no_wasm_buf";
+      return null;
+    }
 
     const width = vga.screen_width;
     const height = vga.screen_height;
-    if (!width || !height || width * height > MAX_RESOLUTION) return null;
+    if (!width || !height || width * height > MAX_RESOLUTION) {
+      this._dbgPixelsNullReason = `bad_size(${width}x${height})`;
+      return null;
+    }
 
     const bufferWidth = vga.virtual_width || width;
     const offset = vga.dest_buffet_offset;
-    if (offset == null) return null;
+    if (offset == null) {
+      this._dbgPixelsNullReason = "no_offset";
+      return null;
+    }
 
     // Fix detached buffer — see comment above
     const wasmBuf = cpu.wasm_memory.buffer;
@@ -591,12 +636,29 @@ export class LinuxVM extends DurableObject<unknown> {
       }
     }
 
-    // Mark entire screen dirty so screen_fill_buffer processes all pixels
-    vga.complete_redraw();
+    // Skip rendering when the screen hasn't changed.
+    // SVGA mode: svga_dirty_bitmap_min/max_offset are *output* values written by
+    // the wasm svga_fill_pixel_buffer() call inside screen_fill_buffer — they are
+    // not pre-set input dirty flags. Reading them before the call gives last frame's
+    // range, not a "has anything changed" signal. So for SVGA we always call
+    // screen_fill_buffer() and let v86's own update_buffer/screen.set_buffer handle
+    // the no-op when nothing changed.
+    // Legacy VGA mode: diff_addr_min/max are JS-side flags set by port writes;
+    // min >= max means no pixels changed since the last reset_diffs().
+    if (!vga.svga_enabled && vga.diff_addr_min >= vga.diff_addr_max) {
+      this._dbgPixelsNullReason = `legacy_not_dirty(${vga.diff_addr_min}..${vga.diff_addr_max})`;
+      return null;
+    }
+
+    // screen_fill_buffer() renders pixels and calls reset_diffs() internally.
     vga.screen_fill_buffer();
 
     const byteLen = bufferWidth * height * 4;
-    if (offset + byteLen > wasmBuf.byteLength) return null;
+    if (offset + byteLen > wasmBuf.byteLength) {
+      this._dbgPixelsNullReason = `oob(off=${offset} len=${byteLen} buf=${wasmBuf.byteLength})`;
+      return null;
+    }
+    this._dbgPixelsNullReason = null;
     const rgba = new Uint8ClampedArray(wasmBuf, offset, byteLen);
 
     return { rgba, width, height, bufferWidth };
@@ -605,21 +667,46 @@ export class LinuxVM extends DurableObject<unknown> {
   // ── Render loop ───────────────────────────────────────────────────────
 
    private _renderCount = 0;
+   private _dbgPixelsNullReason: string | null = null;
+   private _dbgFirstPixels = false;
+   private _dbgFirstEncNull = false;
    private renderFrame(): void {
     this._renderCount++;
-    if (this._renderCount % 50 === 0) {
-      const sa = this.screenAdapter;
-      const preview = sa ? sa.getTextScreen().filter(r => r.trim()).slice(0, 3).join(" | ") : "(no adapter)";
-      console.log(`${LOG_PREFIX} renderFrame #${this._renderCount} sessions=${this.sessions.size} preview="${preview.substring(0,120)}"`);
-    }
     if (!this.emulator || !this.screenAdapter || this.sessions.size === 0) return;
 
     const vga = this.getVga();
+
+    // Periodic VGA state dump — every 50 frames regardless of outcome
+    if (this._renderCount % 50 === 0) {
+      if (!vga) {
+        console.log(`${LOG_PREFIX} renderFrame #${this._renderCount}: no vga device`);
+      } else {
+        console.log(
+          `${LOG_PREFIX} renderFrame #${this._renderCount}` +
+          ` graphical=${vga.graphical_mode} svga=${vga.svga_enabled}` +
+          ` w=${vga.screen_width} h=${vga.screen_height}` +
+          ` vw=${vga.virtual_width} vh=${vga.virtual_height}` +
+          ` offset=${vga.dest_buffet_offset}` +
+          ` diff=${vga.diff_addr_min}..${vga.diff_addr_max}` +
+          ` wasmBuf=${vga.cpu?.wasm_memory?.buffer?.byteLength ?? 'none'}` +
+          ` imgData=${vga.image_data ? 'yes' : 'null'}` +
+          ` sessions=${this.sessions.size}` +
+          ` lastNullReason=${this._dbgPixelsNullReason ?? 'none'}`
+        );
+      }
+    }
+
     if (!vga) return;
 
     if (vga.graphical_mode) {
       const frame = this.getVgaPixels(vga);
       if (!frame) return;
+
+      // First successful pixel read — log it once
+      if (!this._dbgFirstPixels) {
+        this._dbgFirstPixels = true;
+        console.log(`${LOG_PREFIX} getVgaPixels: first success w=${frame.width} h=${frame.height} bufW=${frame.bufferWidth} rgbaLen=${frame.rgba.length}`);
+      }
 
       let anyNeedsKeyframe = false;
       for (const state of this.sessions.values()) {
@@ -636,6 +723,11 @@ export class LinuxVM extends DurableObject<unknown> {
         this.deltaEncoder.reset();
         for (const state of this.sessions.values()) state.needsKeyframe = true;
         return;
+      }
+      // First time encoder returns null (changedCount === 0) — log once
+      if (!result && !this._dbgFirstEncNull) {
+        this._dbgFirstEncNull = true;
+        console.log(`${LOG_PREFIX} encode returned null (no changed tiles) — forceKeyframe=${anyNeedsKeyframe} w=${frame.width} h=${frame.height}`);
       }
       if (!result) return;
 
@@ -727,17 +819,54 @@ export class LinuxVM extends DurableObject<unknown> {
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
     try {
-      if (!this.emulator || message instanceof ArrayBuffer) return;
+      if (message instanceof ArrayBuffer) return;
 
       let msg: ClientMessage;
       try { msg = JSON.parse(message); }
       catch { return; /* ignore malformed JSON */ }
+
+      // ── Boot trigger ───────────────────────────────────────────────────
+      // Boot is intentionally triggered from webSocketMessage so that the
+      // entire async chain (WASM instantiation, disk fetch, emulator-loaded)
+      // runs inside an active event handler. In Durable Objects the runtime
+      // keeps the event loop alive for the duration of an active handler,
+      // so v86's internal setTimeout(d, 0) fires correctly.
+      if (msg.type === "boot") {
+        if (this.booted) {
+          this.wsSend(ws, encodeStatus("running"));
+          this.sendCurrentFrame(ws);
+          this.startRenderLoop();
+          return;
+        }
+        if (this.booting) {
+          this.wsSend(ws, encodeStatus("booting"));
+          return;
+        }
+        if (this.bootError) {
+          this.wsSend(ws, encodeStatus("error: " + this.bootError));
+          return;
+        }
+        if (!this.cachedAssets) {
+          this.wsSend(ws, encodeStatus("waiting_for_assets"));
+          return;
+        }
+        // Run boot fully awaited — keeps this handler alive until emulator-loaded fires
+        await this.bootVM().catch((err) => {
+          this.bootError = String(err);
+          this.broadcast(encodeStatus("error: " + String(err)));
+        });
+        return;
+      }
+
+      if (msg.type === "heartbeat") return;
 
       // Drop all user input while the boot snapshot is pending.
       // This prevents keyboard/mouse activity from contaminating the
       // pristine boot state that gets persisted for future sessions.
       if (this.inputGated) return;
 
+      // ── Input messages — require running emulator ──────────────────────
+      if (!this.emulator) return;
       const bus = this.emulator.bus;
       if (!bus) return;
 
@@ -787,7 +916,7 @@ export class LinuxVM extends DurableObject<unknown> {
     }
   }
 
-  async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+  webSocketClose(ws: WebSocket, code: number, reason: string): void {
     this.sessions.delete(ws);
     try { ws.close(code, reason); }
     catch { /* already closed */ }

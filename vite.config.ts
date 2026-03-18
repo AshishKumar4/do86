@@ -27,6 +27,7 @@ export default defineConfig({
   environments: {
     client: {
       build: {
+        emptyOutDir: false,
         rollupOptions: {
           input: {
             main: resolve(__dirname, "index.html"),

@@ -29,6 +29,9 @@ declare module "v86" {
     fastboot?: boolean;
     boot_order?: number;
     net_device?: any;
+    /** Number of virtual CPUs to expose (SMP). 1 = single-core, up to 8.
+     *  Requires the extended v86-extensions.wasm with SMP WASM exports. */
+    cpu_count?: number;
   }
 
   export class V86 {

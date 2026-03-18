@@ -44,7 +44,9 @@ export type ClientMessage =
   | { type: "mousedown" | "mouseup"; button: number }
   | { type: "serial"; data: string }
   | { type: "text"; data: string }
-  | { type: "scancodes"; codes: number[] };
+  | { type: "scancodes"; codes: number[] }
+  | { type: "heartbeat" }
+  | { type: "boot" };
 
 export interface ClientState {
   needsKeyframe: boolean;
@@ -58,6 +60,8 @@ export interface ClientState {
 export interface VgaDevice {
   cpu: {
     wasm_memory: WebAssembly.Memory;
+    svga_dirty_bitmap_min_offset: Uint32Array;
+    svga_dirty_bitmap_max_offset: Uint32Array;
   };
   screen: any;
   graphical_mode: boolean;
@@ -66,10 +70,15 @@ export interface VgaDevice {
   virtual_width: number;
   virtual_height: number;
   svga_enabled: boolean;
+  // Legacy VGA dirty range — set by port writes, consumed by screen_fill_buffer
+  diff_addr_min: number;
+  diff_addr_max: number;
+  vga_memory_size: number;
   image_data: ImageData | null;
   dest_buffet_offset: number; // v86's typo, not ours
   screen_fill_buffer(): void;
   complete_redraw(): void;
+  reset_diffs(): void;
   update_layers(): void;
 }
 
