@@ -143,6 +143,7 @@ export class LinuxVM extends DurableObject<Env> {
   private _cleanTicks = 0;
   private _adaptiveSkips = 0;  // perf counter: frames skipped due to idle
   private _lastYieldRenderTime = 0;  // throttle yield-boundary renders to 30fps
+  private _lastFrameProducedTime = 0;  // last time a VGA frame was actually sent
   private _textSent = 0;       // text frames actually broadcast
   private _textEmpty = 0;      // text mode: getTextScreen returned empty
   private _textSame = 0;       // text mode: content unchanged
@@ -1052,9 +1053,13 @@ export class LinuxVM extends DurableObject<Env> {
 
       this.booted = true;
       this._perf.bootTimeMs = performance.now();
+      this._lastFrameProducedTime = performance.now(); // start active, not throttled
       this.restoredFromSnapshot = !!savedState;
       this.cachedAssets = null;
       this.startRenderLoop();
+      // Render immediately — capture text/VGA state from the synchronous
+      // BIOS POST that ran during `new V86()` before the yield loop started.
+      try { this.renderFrame(); } catch { /* non-fatal */ }
       this.startStatsInterval();
 
       if (savedState) {
@@ -1354,10 +1359,20 @@ export class LinuxVM extends DurableObject<Env> {
     if (!vga) { this._vgaNull++; return; }
 
     if (vga.graphical_mode) {
-      // Adaptive idle skip: when 3+ consecutive clean ticks, only check every
-      // IDLE_RENDER_EVERY ticks (~2fps). This avoids calling screen_fill_buffer
-      // and getVgaPixels 30 times/sec on an idle desktop.
-      if (this._cleanTicks >= LinuxVM.IDLE_SKIP_THRESHOLD &&
+      // ── Adaptive idle detection ──────────────────────────────────────
+      //
+      // Problem: screen_fill_buffer() clears the dirty bitmap each call.
+      // At 30fps, the bitmap is cleared every 33ms.  If the emulator only
+      // dirties VGA memory in bursts, most polls see an empty bitmap.
+      // Counting consecutive empty polls (cleanTicks) causes premature
+      // throttling → jerky, low FPS output.
+      //
+      // Solution: throttle based on TIME since last successful frame, not
+      // consecutive empty polls.  If no frame was produced for 2+ seconds,
+      // drop to low-frequency probing.  This keeps full 30fps during
+      // active rendering while still saving CPU when truly idle.
+      const timeSinceLastFrame = _rfT0 - this._lastFrameProducedTime;
+      if (timeSinceLastFrame > 2000 &&
           this._renderCount % LinuxVM.IDLE_RENDER_EVERY !== 0) {
         this._adaptiveSkips++;
         this._perf.renderMs += performance.now() - _rfT0;
@@ -1366,15 +1381,10 @@ export class LinuxVM extends DurableObject<Env> {
 
       const frame = this.getVgaPixels(vga);
       if (!frame) {
-        // No dirty pixels — track consecutive clean ticks for adaptive throttle
-        this._cleanTicks++;
         this._perf.pixelsNull++;
         this._perf.renderMs += performance.now() - _rfT0;
         return;
       }
-
-      // Dirty detection — reset to active (30fps)
-      this._cleanTicks = 0;
 
       this._perf.pixelsOk++;
 
@@ -1412,12 +1422,14 @@ export class LinuxVM extends DurableObject<Env> {
         return;
       }
 
+      this._lastFrameProducedTime = _rfT0;
       this.adjustFrameRate(result.data.byteLength);
       this._perf.renderMs += performance.now() - _rfT0;
       this.sendFrameToClients(result, frame);
     } else {
-      // Text mode — also adaptive: skip if idle
-      if (this._cleanTicks >= LinuxVM.IDLE_SKIP_THRESHOLD &&
+      // Text mode — same time-based idle detection
+      const textTimeSince = _rfT0 - this._lastFrameProducedTime;
+      if (textTimeSince > 2000 &&
           this._renderCount % LinuxVM.IDLE_RENDER_EVERY !== 0) {
         this._adaptiveSkips++;
         this._perf.renderMs += performance.now() - _rfT0;
@@ -1427,7 +1439,6 @@ export class LinuxVM extends DurableObject<Env> {
       const textRows = this.screenAdapter.getTextScreen();
       if (textRows.length === 0) {
         this._textEmpty++;
-        this._cleanTicks++;
         this._perf.renderMs += performance.now() - _rfT0;
         return;
       }
@@ -1435,11 +1446,10 @@ export class LinuxVM extends DurableObject<Env> {
       const textContent = textRows.join("\n");
       if (textContent === this.lastTextContent) {
         this._textSame++;
-        this._cleanTicks++;
         this._perf.renderMs += performance.now() - _rfT0;
         return;
       }
-      this._cleanTicks = 0;
+      this._lastFrameProducedTime = _rfT0;
       this.lastTextContent = textContent;
       this._textSent++;
 
