@@ -724,20 +724,43 @@ export class LinuxVM extends DurableObject<Env> {
       const mt = { calls: 0, real: 0, instr: 0, hlt: 0, activeZero: 0, preWasm: 0, lastLogTime: 0 };
       (this as any)._mt = mt;
 
-      // ── Fixed-increment microtick for Cloudflare Workers ─────────────────
+      // ── Hybrid instruction-counter microtick ─────────────────────────
       //
       // In Cloudflare Workers, performance.now() is frozen during synchronous
-      // WASM execution (Spectre mitigation).  v86's main_loop() uses microtick()
-      // to decide when to yield (now - start > TIME_PER_FRAME = 1.0ms).
+      // WASM execution (Spectre mitigation).  We use the WASM instruction
+      // counter (offset 664) to derive synthetic time, with a per-call floor
+      // to keep device I/O timing healthy.
       //
-      // Fixed increment of 0.005ms per call means ~200 microtick calls to reach
-      // 1ms (one main_loop yield).  PIT and ACPI device code also call microtick
-      // during I/O port reads — the fixed increment ensures they see monotonically
-      // advancing time regardless of interpreter vs JIT execution path.
+      // Two callers with very different delta profiles:
       //
-      // On I/O boundaries (when performance.now() actually advances), we sync
-      // synthetic time to real time to prevent long-term drift.
-      const MICROTICK_INCREMENT = 0.005; // 5μs per call — ~200 calls to hit 1ms TIME_PER_FRAME
+      // 1. main_loop (lines 3243/3263 in cpu.rs): called twice per
+      //    do_many_cycles_native() — delta ~100K instructions.
+      //    Controls yield timing (now - start >= TIME_PER_FRAME = 1.0ms).
+      //    We want ~4-8 main_loop iterations per yield → each call
+      //    should advance ~0.125–0.25ms → msPerInstruction tuned for this.
+      //
+      // 2. Device I/O (PIT port 0x61, ACPI pmtimer 0xB008): called from
+      //    within instruction dispatch — delta is tiny (tens of instructions).
+      //    PIT ref_toggle needs ~0.015ms between toggles.
+      //    MIN_INCREMENT guarantees device I/O always sees useful time.
+      //
+      // The JIT flush fix (stratum 7eb2c73) ensures the instruction counter
+      // is flushed before every I/O opcode, so device reads see non-stale
+      // values.  MIN_INCREMENT is the safety net.
+      //
+      // TARGET_ITERATIONS: how many main_loop iterations before yield.
+      // Lower = more yields/sec = more event loop breaks = responsive DO.
+      // Higher = fewer yields/sec = more throughput per yield.
+      // 6 is a good balance: 6 × do_many_cycles_native (100K instr each)
+      // = 600K instructions per yield ≈ 120ms wall time at 5 MIPS.
+      // With BATCH_SIZE=8, sync batch = 8 × 120ms = ~960ms worst case.
+      // The async break every 8th yield keeps the event loop alive.
+      const TARGET_ITERATIONS = 6;
+      const LOOP_COUNTER = 100003;
+      const MS_PER_INSTRUCTION = 1.0 / (LOOP_COUNTER * TARGET_ITERATIONS);
+      const MIN_INCREMENT = 0.005;  // 5μs floor per call — keeps PIT/ACPI happy
+      const FALLBACK_INCREMENT = 0.005;  // delta=0 fallback (same as floor)
+      let lastInstrCount = 0;
 
       (V86 as any).microtick = () => {
         mt.calls++;
@@ -745,17 +768,25 @@ export class LinuxVM extends DurableObject<Env> {
         if (realNow > lastRealTime) {
           mt.real++;
           lastRealTime = realNow;
-          // Only advance syntheticTime if real time is ahead — never go backwards.
-          // If syntheticTime already leads realNow (from synthetic increments),
-          // keep it as-is; resetting to realNow would cause time to go backwards,
-          // triggering the ACPI pmtimer dbg_assert(t > timer_last_value).
           if (realNow > syntheticTime) {
             syntheticTime = realNow;
           }
+          lastInstrCount = readInstrCounter();
         } else {
-          // Still in synchronous execution — advance synthetically.
           mt.instr++;
-          syntheticTime += MICROTICK_INCREMENT;
+          const currentInstr = readInstrCounter();
+          const delta = (currentInstr - lastInstrCount) >>> 0;
+          lastInstrCount = currentInstr;
+          if (delta > 0) {
+            // Instruction-counter time, floored at MIN_INCREMENT.
+            // Large deltas (main_loop): delta * MS_PER_INSTRUCTION >> MIN_INCREMENT → uses counter.
+            // Small deltas (device I/O): delta * MS_PER_INSTRUCTION << MIN_INCREMENT → uses floor.
+            const instrTime = delta * MS_PER_INSTRUCTION;
+            syntheticTime += instrTime > MIN_INCREMENT ? instrTime : MIN_INCREMENT;
+          } else {
+            mt.activeZero++;
+            syntheticTime += FALLBACK_INCREMENT;
+          }
         }
         return syntheticTime;
       };
@@ -985,6 +1016,8 @@ export class LinuxVM extends DurableObject<Env> {
                 return;
               }
               // Async yield: break to event loop.
+              // Push detailed stats to subscribed WS clients (throttled to 2/sec).
+              this.pushDetailedStats();
               if (t > 10) {
                 setTimeout(() => {
                   try { v86Internal.yield_callback(tick); }
