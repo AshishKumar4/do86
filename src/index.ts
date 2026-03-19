@@ -19,10 +19,12 @@ interface ImageDef {
   /** If true, never save/restore snapshots for this image (unstable OS) */
   noSnapshot?: boolean;
   ahciDiskSize?: number;
-  /** Logical memory the guest BIOS reports (MB).  Defaults to VM_CONFIG.LOGICAL_MB (64).
+  /** Logical memory the guest BIOS reports (MB).  Defaults to VM_CONFIG.LOGICAL_MB (256).
    *  GPAs beyond memory_size are demand-paged via swap_page_in.  Set higher for
    *  OSes that need to see more RAM than the WASM allocation provides. */
   logicalMemory?: number;
+  /** SMP CPU count. Default: 1 (BSP only). Set 2 for OSes that use SMP. */
+  cpuCount?: number;
 }
 
 // ── DO memory budget ─────────────────────────────────────────────────────────
@@ -37,10 +39,10 @@ interface ImageDef {
 //   ──────────────────────────────────
 //   Total              ~102 MB ← safe headroom below 128 MB limit
 //
-// Guest sees 64 MB via CMOS/e820 (VM_CONFIG.LOGICAL_MB = WASM_MB).
-// LOGICAL_MB must equal WASM_MB: SeaBIOS places ACPI tables at ~logical_memory_size-7KB;
-// if that exceeds WASM allocation, writes hit MMIO no-op and KolibriOS loops on RSDT.
-// GPAs [32 MB, 64 MB) are demand-paged from DO SQLite via swap_page_in.
+// Guest sees logicalMemory MB via CMOS/e820 (default 256 MB, per-image override).
+// SeaBIOS places ACPI tables at ~logical_memory_size-7KB.  patch_dsdt_s5 now uses
+// resolveGPA to read them, so ACPI works correctly even when tables are above 64MB.
+// GPAs [32 MB, logicalMemory MB) are demand-paged from DO SQLite via swap_page_in.
 // linux4 (text-only, no demand-paging) uses a smaller budget: 32 MB RAM, 2 MB VGA.
 //
 // memory/vgaMemory values in IMAGES are the values passed as memory_size to v86.
@@ -57,11 +59,9 @@ const DEFAULT_VGA_MB     =  8; // == VM_CONFIG.VGA_MB
 const IMAGES: Record<string, ImageDef> = {
   kolibri:    { file: "kolibri.img",             drive: "fda",   memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-    aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true, ahciDiskSize: 32, logicalMemory: 3584 },
-  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager.",
-                url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
-  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop.",
-                url: "http://tinycorelinux.net/11.x/x86/release/TinyCore-11.1.iso" },
+  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true, ahciDiskSize: 32, logicalMemory: 3584, cpuCount: 2 },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager." },
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop." },
   dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
                 url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
   helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
@@ -179,6 +179,7 @@ export default {
             noSnapshot: imageDef.noSnapshot || false,
             ...(imageDef.ahciDiskSize ? { ahciDiskSize: imageDef.ahciDiskSize } : {}),
             ...(imageDef.logicalMemory ? { logicalMemory: imageDef.logicalMemory } : {}),
+            ...(imageDef.cpuCount ? { cpuCount: imageDef.cpuCount } : {}),
             ...(freshBoot ? { fresh: true } : {}),
           };
 

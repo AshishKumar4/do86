@@ -34,8 +34,9 @@
  *
  * TLB flush on eviction
  * ─────────────────────
- * After evicting a frame, full_clear_tlb() is called once to invalidate all
- * TLB entries.  Cost: ~µs; paid at most once per eviction event.
+ * After evicting frames, full_clear_tlb() is called ONCE per swapPageIn that
+ * triggered eviction — not per individual frame.  This avoids cascade TLB
+ * thrashing during page fault storms.
  *
  * All public methods are SYNCHRONOUS.  No async, no Promises.
  * ctx.storage.sql.exec() is synchronous — returns SqlStorageCursor.
@@ -117,6 +118,13 @@ export class SqlPageStore {
   /** Number of frames currently occupied. */
   private usedFrames = 0;
 
+  // ── Free-list (stack) ────────────────────────────────────────────────────
+  // O(1) frame allocation/deallocation instead of O(N) linear scan.
+  // _freeList[0.._freeTop) contains indices of free frames.
+
+  private readonly _freeList: Int32Array;
+  private _freeTop: number;
+
   // ── WASM handles ─────────────────────────────────────────────────────────
 
   /**
@@ -131,6 +139,13 @@ export class SqlPageStore {
   /** Exported pool_* functions from page_pool.rs (set via setWasmExports). */
   private pool: PoolExports | null = null;
 
+  // ── Cached heap view ─────────────────────────────────────────────────────
+  // Avoids creating new Uint8Array(wasmMemory.buffer) on every hot-path call.
+  // Invalidated when the underlying ArrayBuffer is detached (WASM memory grow).
+
+  private _heapView: Uint8Array | null = null;
+  private _heapBuffer: ArrayBuffer | null = null;
+
   // ── CPU reference (for TLB flush) ─────────────────────────────────────────
 
   private cpu: { full_clear_tlb: () => void } | null = null;
@@ -143,7 +158,8 @@ export class SqlPageStore {
   // During page fault storms, multiple clockEvict() calls happen synchronously.
   // Instead of writing each dirty evicted frame individually, we queue the writes
   // and flush them in a single multi-row INSERT on the next microtask.
-  private _pendingWrites: Array<{ gpa: number; data: Uint8Array }> = [];
+  // Uses a Map for O(1) lookup/delete by GPA.
+  private _pendingWriteMap = new Map<number, Uint8Array>();
   private _writeFlushScheduled = false;
 
   // ── Counters ──────────────────────────────────────────────────────────────
@@ -151,6 +167,7 @@ export class SqlPageStore {
   private _swapIns       = 0;
   private _wasmHits      = 0;
   private _evictions     = 0;
+  private _tlbFlushes    = 0;
   private _sqlReads      = 0;
   private _sqlWrites     = 0;
   private _sqlReadMs     = 0;
@@ -166,6 +183,14 @@ export class SqlPageStore {
 
     this.frameGpa   = new Int32Array(this.cfg.maxFrames).fill(-1);
     this.frameDirty = new Uint8Array(this.cfg.maxFrames);
+
+    // Initialize free-list: all frames are free, pushed in reverse order
+    // so that frame 0 is allocated first (popped last → LIFO).
+    this._freeList = new Int32Array(this.cfg.maxFrames);
+    for (let i = 0; i < this.cfg.maxFrames; i++) {
+      this._freeList[i] = this.cfg.maxFrames - 1 - i;
+    }
+    this._freeTop = this.cfg.maxFrames;
   }
 
   // ── Setup ─────────────────────────────────────────────────────────────────
@@ -190,6 +215,9 @@ export class SqlPageStore {
   setWasmMemory(memory: WebAssembly.Memory, poolBase: number): void {
     this.wasmMemory = memory;
     this.poolBase = poolBase;
+    // Invalidate cached heap view — will be recreated on next access
+    this._heapView = null;
+    this._heapBuffer = null;
   }
 
   /**
@@ -227,6 +255,8 @@ export class SqlPageStore {
   setWasmHeap(heap: Uint8Array, poolBase: number): void {
     this.wasmMemory = { buffer: heap.buffer } as unknown as WebAssembly.Memory;
     this.poolBase = poolBase;
+    this._heapView = null;
+    this._heapBuffer = null;
   }
 
   /**
@@ -279,6 +309,9 @@ export class SqlPageStore {
       this.frameDirty[frameIdx] = forWriting ? 1 : 0;
       this.frameMap.set(pageGpa, frameIdx);
       this.usedFrames++;
+      // Remove from free-list if present (identity frames are pre-populated,
+      // but the free-list was initialized with all indices).
+      // This is a no-op cost since identity path only fires during early boot.
       if (this.pool) {
         this.pool.pool_register(pageGpa, pageGpa); // wasm_offset == gpa for pool region
       }
@@ -299,7 +332,7 @@ export class SqlPageStore {
       data = this.readFromSql(pageGpa);
     }
 
-    const heap   = this.heap;
+    const heap = this.getHeap();
     if (heap) {
       if (data) {
         heap.set(data, offset);
@@ -332,7 +365,7 @@ export class SqlPageStore {
     // First, flush any deferred eviction writes
     this.flushPendingWrites();
 
-    const heap = this.heap;
+    const heap = this.getHeap();
     if (!heap) return;
 
     // Collect all dirty frames
@@ -380,24 +413,46 @@ export class SqlPageStore {
     this._sqlWriteMs += performance.now() - t0;
   }
 
-  // ── Clock eviction ────────────────────────────────────────────────────────
+  // ── Frame allocation ─────────────────────────────────────────────────────
 
+  /**
+   * Allocate a free frame.  Uses the free-list (O(1) amortized) when available,
+   * falls back to Clock eviction when pool is full.
+   *
+   * When eviction occurs, full_clear_tlb() is called ONCE after eviction
+   * completes — not inside clockEvict itself.
+   *
+   * Note: the free-list may contain stale entries (frames claimed by the
+   * identity path without popping).  We skip those by checking frameGpa.
+   */
   private allocateFrame(): number {
-    if (this.usedFrames < this.cfg.maxFrames) {
-      for (let i = 0; i < this.cfg.maxFrames; i++) {
-        const idx = (this.clockHand + i) % this.cfg.maxFrames;
-        if (this.frameGpa[idx] < 0) {
-          this.clockHand = (idx + 1) % this.cfg.maxFrames;
-          return idx;
-        }
+    // O(1) free-list pop — skip stale entries (claimed by identity path)
+    while (this._freeTop > 0) {
+      const idx = this._freeList[--this._freeTop];
+      if (this.frameGpa[idx] < 0) {
+        return idx;
       }
+      // Stale entry — frame was claimed by identity path; discard and try next
     }
-    return this.clockEvict();
+
+    // Pool full — evict via Clock algorithm
+    const evicted = this.clockEvict();
+    if (evicted >= 0) {
+      // Single TLB flush after eviction — avoids per-eviction cascade
+      if (this.cpu) {
+        try { this.cpu.full_clear_tlb(); } catch { /* non-fatal */ }
+      }
+      this._tlbFlushes++;
+    }
+    return evicted;
   }
 
   /**
    * Clock sweep using WASM-side reference bits (pool_get_ref / pool_clear_ref).
    * This keeps the ref bit authoritative in WASM while JS drives the sweep.
+   *
+   * Does NOT call full_clear_tlb() — the caller (allocateFrame) does that
+   * once after eviction to avoid cascade TLB thrashing.
    */
   private clockEvict(): number {
     const limit = this.cfg.maxFrames * 2;
@@ -432,7 +487,7 @@ export class SqlPageStore {
     }
 
     // Defer dirty frame write — batched on next microtask for storm efficiency.
-    const heap = this.heap;
+    const heap = this.getHeap();
     if (this.frameDirty[evicted] && heap) {
       const offset = this.poolBase + evicted * PAGE_SIZE;
       this.deferWrite(this.frameGpa[evicted], heap.subarray(offset, offset + PAGE_SIZE));
@@ -450,10 +505,7 @@ export class SqlPageStore {
     this.usedFrames--;
     this._evictions++;
 
-    // Invalidate TLB — stale entries referencing this frame must be flushed.
-    if (this.cpu) {
-      try { this.cpu.full_clear_tlb(); } catch { /* non-fatal */ }
-    }
+    // NOTE: TLB flush is done by the caller (allocateFrame), not here.
 
     return evicted;
   }
@@ -498,21 +550,19 @@ export class SqlPageStore {
   }
 
   /**
-   * Extract a page from the pending write queue, if present.
-   * Returns the page data and removes it from the queue, or null if not found.
+   * Extract a page from the pending write Map, if present.
+   * Returns the page data and removes it from the Map, or null if not found.
+   * O(1) lookup + delete via Map (replaces O(N) linear scan + splice).
    *
    * Called by swapPageIn to recover dirty data that was evicted but not yet
    * flushed to SQLite (microtask hasn't fired).  Without this, re-loading an
    * evicted page reads stale/null data from SQLite — silent data corruption.
    */
   private takePendingWrite(gpa: number): Uint8Array | null {
-    for (let i = 0; i < this._pendingWrites.length; i++) {
-      if (this._pendingWrites[i].gpa === gpa) {
-        const entry = this._pendingWrites[i];
-        // Remove from queue — splice is fine since pending writes are small (<64)
-        this._pendingWrites.splice(i, 1);
-        return entry.data;
-      }
+    const data = this._pendingWriteMap.get(gpa);
+    if (data !== undefined) {
+      this._pendingWriteMap.delete(gpa);
+      return data;
     }
     return null;
   }
@@ -526,7 +576,7 @@ export class SqlPageStore {
     // Copy the data since the frame will be reused immediately after eviction
     const copy = new Uint8Array(PAGE_SIZE);
     copy.set(data.subarray(0, PAGE_SIZE));
-    this._pendingWrites.push({ gpa, data: copy });
+    this._pendingWriteMap.set(gpa, copy);
 
     if (!this._writeFlushScheduled) {
       this._writeFlushScheduled = true;
@@ -540,28 +590,31 @@ export class SqlPageStore {
    */
   private flushPendingWrites(): void {
     this._writeFlushScheduled = false;
-    const pending = this._pendingWrites;
-    if (pending.length === 0) return;
-    this._pendingWrites = [];
+    const pending = this._pendingWriteMap;
+    if (pending.size === 0) return;
+
+    // Snapshot and clear the map atomically
+    const entries = Array.from(pending.entries());
+    pending.clear();
 
     this.init();
     const t0 = performance.now();
     const BATCH = 64;
 
-    for (let i = 0; i < pending.length; i += BATCH) {
-      const chunk = pending.slice(i, i + BATCH);
+    for (let i = 0; i < entries.length; i += BATCH) {
+      const chunk = entries.slice(i, i + BATCH);
       if (chunk.length === 1) {
         // Single row — no overhead for non-storm case
         this.sql.exec(
           `INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES (?, ?)`,
-          chunk[0].gpa, chunk[0].data,
+          chunk[0][0], chunk[0][1],
         );
       } else {
         // Multi-row batch: INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES (?,?),(?,?),...
         const placeholders = chunk.map(() => "(?,?)").join(",");
         const params: any[] = [];
-        for (const entry of chunk) {
-          params.push(entry.gpa, entry.data);
+        for (const [entryGpa, entryData] of chunk) {
+          params.push(entryGpa, entryData);
         }
         this.sql.exec(
           `INSERT OR REPLACE INTO ram_pages (gpa, data) VALUES ${placeholders}`,
@@ -578,8 +631,24 @@ export class SqlPageStore {
 
   // ── Internal helpers ──────────────────────────────────────────────────────
 
+  /**
+   * Return a cached Uint8Array view of WASM linear memory.
+   * The view is recreated only when the underlying ArrayBuffer changes
+   * (WASM memory growth detaches the old buffer).
+   */
+  private getHeap(): Uint8Array | null {
+    if (!this.wasmMemory) return null;
+    const buf = this.wasmMemory.buffer;
+    if (buf !== this._heapBuffer || !this._heapView) {
+      this._heapBuffer = buf;
+      this._heapView = new Uint8Array(buf);
+    }
+    return this._heapView;
+  }
+
+  /** @deprecated Use getHeap(). Kept for any external callers. */
   private get heap(): Uint8Array | null {
-    return this.wasmMemory ? new Uint8Array(this.wasmMemory.buffer) : null;
+    return this.getHeap();
   }
 
   // ── Stats ─────────────────────────────────────────────────────────────────
@@ -591,13 +660,14 @@ export class SqlPageStore {
       freeFrames:     this.cfg.maxFrames - this.usedFrames,
       swapIns:        this._swapIns,
       evictions:      this._evictions,
+      tlbFlushes:     this._tlbFlushes,
       sqlReads:       this._sqlReads,
       sqlWrites:      this._sqlWrites,
       sqlReadMs:      Math.round(this._sqlReadMs),
       sqlWriteMs:     Math.round(this._sqlWriteMs),
       batchWrites:    this._batchWrites,
       batchWriteRows: this._batchWriteRows,
-      pendingWrites:  this._pendingWrites.length,
+      pendingWrites:  this._pendingWriteMap.size,
       hasWasmPool:    this.pool !== null,
     };
   }

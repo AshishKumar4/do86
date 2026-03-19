@@ -40,6 +40,66 @@
         </div>
       </div>
     </div>
+    <!-- Stats sidebar (collapsible, right side) -->
+    <aside id="stats-sidebar" class="collapsed">
+      <button id="stats-toggle" title="Toggle stats panel (Ctrl+Shift+S)">Stats</button>
+      <div id="stats-content">
+        <div class="stats-section">
+          <h3>Memory</h3>
+          <div class="stats-bar-container">
+            <div class="stats-bar" id="pool-bar"><span id="pool-bar-text"></span></div>
+          </div>
+          <div class="stats-row"><span>Hot pages</span><span id="s-hot">-</span></div>
+          <div class="stats-row"><span>Free frames</span><span id="s-free">-</span></div>
+          <div class="stats-row"><span>Pool usage</span><span id="s-pool-pct">-</span></div>
+        </div>
+
+        <div class="stats-section">
+          <h3>Paging</h3>
+          <div class="stats-row"><span>Swap-ins</span><span id="s-swapins">-</span></div>
+          <div class="stats-row"><span>Swap-ins/s</span><span id="s-swapins-rate">-</span></div>
+          <div class="stats-row"><span>Evictions</span><span id="s-evictions">-</span></div>
+          <div class="stats-row"><span>Evictions/s</span><span id="s-evictions-rate">-</span></div>
+          <div class="stats-row"><span>TLB flushes</span><span id="s-tlb">-</span></div>
+          <div class="stats-row"><span>Pending writes</span><span id="s-pending">-</span></div>
+          <canvas id="chart-swapins" width="200" height="40"></canvas>
+        </div>
+
+        <div class="stats-section">
+          <h3>SQLite</h3>
+          <div class="stats-row"><span>Reads</span><span id="s-sql-reads">-</span></div>
+          <div class="stats-row"><span>Reads/s</span><span id="s-sql-reads-rate">-</span></div>
+          <div class="stats-row"><span>Read latency</span><span id="s-sql-read-ms">-</span></div>
+          <div class="stats-row"><span>Writes</span><span id="s-sql-writes">-</span></div>
+          <div class="stats-row"><span>Write latency</span><span id="s-sql-write-ms">-</span></div>
+        </div>
+
+        <div class="stats-section">
+          <h3>CPU</h3>
+          <div class="stats-row"><span>Yields</span><span id="s-yields">-</span></div>
+          <div class="stats-row"><span>Yields/s</span><span id="s-yields-rate">-</span></div>
+          <div class="stats-row"><span>Sync ratio</span><span id="s-sync-ratio">-</span></div>
+          <div class="stats-row"><span>Instructions</span><span id="s-instructions">-</span></div>
+          <div class="stats-row"><span>MIPS</span><span id="s-mips">-</span></div>
+          <canvas id="chart-yields" width="200" height="40"></canvas>
+        </div>
+
+        <div class="stats-section">
+          <h3>Render</h3>
+          <div class="stats-row"><span>Frames sent</span><span id="s-frames">-</span></div>
+          <div class="stats-row"><span>Render time</span><span id="s-render-ms">-</span></div>
+        </div>
+
+        <div class="stats-section">
+          <h3>Health</h3>
+          <div class="stats-row"><span>Uptime</span><span id="s-uptime">-</span></div>
+          <div class="stats-row"><span>Image</span><span id="s-image">-</span></div>
+          <div class="stats-row"><span>Sessions</span><span id="s-sessions">-</span></div>
+          <div class="stats-row"><span>Yield dead</span><span id="s-dead">-</span></div>
+        </div>
+      </div>
+    </aside>
+
     <div id="serial-panel" class="collapsed">
       <button id="serial-toggle">Serial &#9650;</button>
       <div id="serial-output"></div>

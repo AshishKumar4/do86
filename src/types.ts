@@ -6,12 +6,13 @@ export const MSG_SERIAL_DATA = 2;
 export const MSG_STATUS = 3;
 export const MSG_TEXT_SCREEN = 4;
 export const MSG_STATS = 5;
+export const MSG_DETAILED_STATS = 6;
 
 // ── Rendering constants ─────────────────────────────────────────────────────
 
 export const TILE_SIZE = 64;
 export const FPS_MIN = 2;
-export const FPS_MAX = 15;
+export const FPS_MAX = 30;
 export const FPS_DEFAULT = 8;
 export const LARGE_FRAME_BYTES = 50_000;
 export const MAX_RESOLUTION = 1280 * 1024;
@@ -45,12 +46,16 @@ export type ClientMessage =
   | { type: "mousedown" | "mouseup"; button: number }
   | { type: "serial"; data: string }
   | { type: "heartbeat" }
-  | { type: "boot" };
+  | { type: "boot" }
+  | { type: "subscribe_stats" }
+  | { type: "unsubscribe_stats" };
 
 export interface ClientState {
   needsKeyframe: boolean;
   droppedFrames: number;
   lastSendTime: number;
+  /** When true, this client receives MSG_DETAILED_STATS at high frequency */
+  wantsDetailedStats: boolean;
 }
 
 // ── v86 VGA device interface ────────────────────────────────────────────────

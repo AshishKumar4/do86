@@ -6,6 +6,7 @@ import {
   MSG_STATUS,
   MSG_TEXT_SCREEN,
   MSG_STATS,
+  MSG_DETAILED_STATS,
   decodeFullFrame,
   decodeDeltaFrame,
   decodeTextScreen,
@@ -107,6 +108,151 @@ function updateDebugOverlay(stats: Record<string, unknown>) {
     ] : [`── page store: N/A ──`]),
   ];
   debugOverlay.textContent = lines.join("\n");
+}
+
+// ── Stats sidebar ────────────────────────────────────────────────────────────
+
+const sidebar = document.getElementById("stats-sidebar")!;
+const sidebarToggle = document.getElementById("stats-toggle")!;
+const sidebarContent = document.getElementById("stats-content")!;
+let sidebarOpen = false;
+let statsSubscribed = false;
+
+// Sparkline ring buffers (last 60 samples)
+const SPARKLINE_LEN = 60;
+const sparkSwapIns: number[] = [];
+const sparkYields: number[] = [];
+
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  sidebar.classList.toggle("collapsed", !sidebarOpen);
+  if (sidebarOpen && !statsSubscribed) {
+    sendJSON({ type: "subscribe_stats" });
+    statsSubscribed = true;
+  } else if (!sidebarOpen && statsSubscribed) {
+    sendJSON({ type: "unsubscribe_stats" });
+    statsSubscribed = false;
+  }
+}
+
+sidebarToggle.addEventListener("click", toggleSidebar);
+
+// Ctrl+Shift+S toggles sidebar
+document.addEventListener("keydown", (e) => {
+  if (e.ctrlKey && e.shiftKey && e.code === "KeyS") {
+    e.preventDefault();
+    toggleSidebar();
+  }
+});
+
+function fmt(n: number | undefined | null): string {
+  if (n == null) return "-";
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
+  return String(Math.round(n));
+}
+
+function fmtMs(ms: number | undefined | null): string {
+  if (ms == null) return "-";
+  if (ms >= 1000) return (ms / 1000).toFixed(1) + "s";
+  return Math.round(ms) + "ms";
+}
+
+function drawSparkline(canvasId: string, data: number[], color: string) {
+  const c = document.getElementById(canvasId) as HTMLCanvasElement;
+  if (!c) return;
+  const ctx2 = c.getContext("2d");
+  if (!ctx2) return;
+  const w = c.width;
+  const h = c.height;
+  ctx2.clearRect(0, 0, w, h);
+  if (data.length < 2) return;
+  const max = Math.max(...data, 1);
+  ctx2.beginPath();
+  ctx2.strokeStyle = color;
+  ctx2.lineWidth = 1.5;
+  for (let i = 0; i < data.length; i++) {
+    const x = (i / (SPARKLINE_LEN - 1)) * w;
+    const y = h - (data[i] / max) * (h - 2) - 1;
+    if (i === 0) ctx2.moveTo(x, y);
+    else ctx2.lineTo(x, y);
+  }
+  ctx2.stroke();
+  // Label max value
+  ctx2.fillStyle = "#8b949e";
+  ctx2.font = "9px monospace";
+  ctx2.textAlign = "right";
+  ctx2.fillText(fmt(max) + "/s", w - 2, 10);
+}
+
+function updateSidebar(stats: Record<string, unknown>) {
+  const ps = stats.ps as Record<string, unknown> | null;
+
+  // Pool bar
+  if (ps) {
+    const hot = (ps.hot as number) || 0;
+    const total = (ps.total as number) || 1;
+    const pct = Math.round((hot / total) * 100);
+    const bar = document.getElementById("pool-bar") as HTMLElement;
+    bar.style.width = pct + "%";
+    bar.style.background = pct > 90 ? "#da3633" : pct > 70 ? "#d29922" : "#238636";
+    const barText = document.getElementById("pool-bar-text");
+    if (barText) barText.textContent = pct > 10 ? pct + "%" : "";
+
+    setText("s-hot", fmt(hot) + " / " + fmt(total));
+    setText("s-free", fmt(ps.free as number));
+    setText("s-pool-pct", pct + "%");
+    setText("s-swapins", fmt(ps.swapIns as number));
+    setText("s-evictions", fmt(ps.evictions as number));
+    setText("s-tlb", fmt(ps.tlbFlushes as number));
+    setText("s-pending", fmt(ps.pending as number));
+    setText("s-sql-reads", fmt(ps.sqlR as number));
+    setText("s-sql-writes", fmt(ps.sqlW as number));
+    setText("s-sql-read-ms", fmtMs(ps.sqlRms as number));
+    setText("s-sql-write-ms", fmtMs(ps.sqlWms as number));
+  }
+
+  // Rates
+  setText("s-swapins-rate", fmt(stats.swapInsPerSec as number));
+  setText("s-evictions-rate", fmt(stats.evictionsPerSec as number));
+  setText("s-sql-reads-rate", fmt(stats.sqlReadsPerSec as number));
+  setText("s-yields", fmt(stats.yields as number));
+  setText("s-yields-rate", fmt(stats.yieldsPerSec as number));
+
+  const yields = (stats.yields as number) || 0;
+  const syncYields = (stats.syncYields as number) || 0;
+  setText("s-sync-ratio", yields > 0 ? Math.round((syncYields / yields) * 100) + "%" : "-");
+
+  setText("s-instructions", fmt(stats.instructions as number));
+  const ips = (stats.instructionsPerSec as number) || 0;
+  setText("s-mips", ips > 0 ? (ips / 1_000_000).toFixed(2) : "-");
+
+  setText("s-frames", fmt(stats.framesSent as number));
+  setText("s-render-ms", fmtMs(stats.renderMs as number));
+
+  setText("s-uptime", fmtMs(stats.uptimeMs as number));
+  setText("s-image", (stats.imageKey as string) || "-");
+  setText("s-sessions", String(stats.sessions ?? "-"));
+  const dead = stats.yieldDead as boolean;
+  const deadEl = document.getElementById("s-dead");
+  if (deadEl) {
+    deadEl.textContent = dead ? "YES" : "no";
+    deadEl.style.color = dead ? "#da3633" : "#238636";
+  }
+
+  // Sparklines
+  sparkSwapIns.push((stats.swapInsPerSec as number) || 0);
+  if (sparkSwapIns.length > SPARKLINE_LEN) sparkSwapIns.shift();
+  drawSparkline("chart-swapins", sparkSwapIns, "#f97316");
+
+  sparkYields.push((stats.yieldsPerSec as number) || 0);
+  if (sparkYields.length > SPARKLINE_LEN) sparkYields.shift();
+  drawSparkline("chart-yields", sparkYields, "#58a6ff");
+}
+
+function setText(id: string, value: string) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -433,6 +579,14 @@ function handleBinaryMessage(data: ArrayBuffer) {
       } catch { /* malformed stats — ignore */ }
       break;
     }
+
+    case MSG_DETAILED_STATS: {
+      try {
+        const stats = JSON.parse(textDecoder.decode(new Uint8Array(data, 1)));
+        if (sidebarOpen) updateSidebar(stats);
+      } catch { /* malformed stats — ignore */ }
+      break;
+    }
   }
 }
 
@@ -562,6 +716,12 @@ function connect() {
     // Trigger boot from the server side. Boot runs inside webSocketMessage so
     // v86's internal setTimeout(d,0) fires within an active DO event handler.
     ws.send(JSON.stringify({ type: "boot" }));
+
+    // Re-subscribe to detailed stats if sidebar was open before reconnect
+    if (sidebarOpen) {
+      sendJSON({ type: "subscribe_stats" });
+      statsSubscribed = true;
+    }
 
     // Heartbeat every 10s to keep the non-hibernating DO alive
     heartbeatInterval = setInterval(() => {

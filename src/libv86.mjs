@@ -2946,10 +2946,43 @@ ACPI.prototype.get_timer = function(now) {
   return this.timer_last_value + this.timer_imprecision_offset;
 };
 ACPI.prototype.patch_dsdt_s5 = function() {
-  const mem = this.cpu.mem8;
+  const cpu = this.cpu;
+  const mem = cpu.mem8;
   if (!mem || mem.length < 1048576) {
     dbg_log("ACPI patch_dsdt_s5: mem8 not ready yet", LOG_ACPI);
     return;
+  }
+  const logical_limit = cpu._logical_memory_size || mem.length;
+  function gpa_read8(gpa) {
+    if (gpa < mem.length) return mem[gpa];
+    if (!cpu.resolveGPA) return 255;
+    const off = cpu.resolveGPA(gpa);
+    return off >= 0 ? mem[off] : 255;
+  }
+  function gpa_read32(gpa) {
+    return gpa_read8(gpa) | gpa_read8(gpa + 1) << 8 | gpa_read8(gpa + 2) << 16 | gpa_read8(gpa + 3) << 24;
+  }
+  function gpa_write8(gpa, value) {
+    if (gpa < mem.length) {
+      mem[gpa] = value;
+      return;
+    }
+    if (!cpu.resolveGPA) return;
+    const page_gpa = gpa & ~4095;
+    let off;
+    if (cpu.pool_lookup) {
+      const frame = cpu.pool_lookup(page_gpa);
+      if (frame > 0) {
+        off = frame + (gpa & 4095);
+      }
+    }
+    if (off === void 0) {
+      const frame = cpu.swap_page_in(page_gpa, 1);
+      if (frame > 0) {
+        off = frame + (gpa & 4095);
+      }
+    }
+    if (off !== void 0 && off >= 0) mem[off] = value;
   }
   const RSD_SIG = [82, 83, 68, 32, 80, 84, 82, 32];
   let rsdp_addr = -1;
@@ -2965,24 +2998,24 @@ ACPI.prototype.patch_dsdt_s5 = function() {
     return;
   }
   dbg_log("ACPI patch_dsdt_s5: RSDP at " + h(rsdp_addr), LOG_ACPI);
-  const rsdt_addr = mem[rsdp_addr + 16] | mem[rsdp_addr + 17] << 8 | mem[rsdp_addr + 18] << 16 | mem[rsdp_addr + 19] << 24;
-  if (rsdt_addr === 0 || rsdt_addr >= mem.length) {
+  const rsdt_addr = gpa_read32(rsdp_addr + 16);
+  if (rsdt_addr === 0 || rsdt_addr >>> 0 >= logical_limit) {
     dbg_log("ACPI patch_dsdt_s5: invalid RSDT address " + h(rsdt_addr >>> 0), LOG_ACPI);
     return;
   }
   dbg_log("ACPI patch_dsdt_s5: RSDT at " + h(rsdt_addr >>> 0), LOG_ACPI);
-  if (mem[rsdt_addr] !== 82 || mem[rsdt_addr + 1] !== 83 || mem[rsdt_addr + 2] !== 68 || mem[rsdt_addr + 3] !== 84) {
+  if (gpa_read8(rsdt_addr) !== 82 || gpa_read8(rsdt_addr + 1) !== 83 || gpa_read8(rsdt_addr + 2) !== 68 || gpa_read8(rsdt_addr + 3) !== 84) {
     dbg_log("ACPI patch_dsdt_s5: RSDT signature mismatch", LOG_ACPI);
     return;
   }
-  const rsdt_len = mem[rsdt_addr + 4] | mem[rsdt_addr + 5] << 8 | mem[rsdt_addr + 6] << 16 | mem[rsdt_addr + 7] << 24;
+  const rsdt_len = gpa_read32(rsdt_addr + 4);
   const entry_count = rsdt_len - 36 >>> 2;
   let facp_addr = -1;
   for (let i = 0; i < entry_count; i++) {
     const ptr_off = rsdt_addr + 36 + i * 4;
-    const entry = mem[ptr_off] | mem[ptr_off + 1] << 8 | mem[ptr_off + 2] << 16 | mem[ptr_off + 3] << 24;
-    if (entry === 0 || entry >= mem.length) continue;
-    if (mem[entry] === 70 && mem[entry + 1] === 65 && mem[entry + 2] === 67 && mem[entry + 3] === 80) {
+    const entry = gpa_read32(ptr_off);
+    if (entry === 0 || entry >>> 0 >= logical_limit) continue;
+    if (gpa_read8(entry) === 70 && gpa_read8(entry + 1) === 65 && gpa_read8(entry + 2) === 67 && gpa_read8(entry + 3) === 80) {
       facp_addr = entry;
       break;
     }
@@ -2992,25 +3025,25 @@ ACPI.prototype.patch_dsdt_s5 = function() {
     return;
   }
   dbg_log("ACPI patch_dsdt_s5: FACP at " + h(facp_addr >>> 0), LOG_ACPI);
-  const dsdt_addr = mem[facp_addr + 40] | mem[facp_addr + 41] << 8 | mem[facp_addr + 42] << 16 | mem[facp_addr + 43] << 24;
-  if (dsdt_addr === 0 || dsdt_addr >= mem.length) {
+  const dsdt_addr = gpa_read32(facp_addr + 40);
+  if (dsdt_addr === 0 || dsdt_addr >>> 0 >= logical_limit) {
     dbg_log("ACPI patch_dsdt_s5: invalid DSDT address " + h(dsdt_addr >>> 0), LOG_ACPI);
     return;
   }
   dbg_log("ACPI patch_dsdt_s5: DSDT at " + h(dsdt_addr >>> 0), LOG_ACPI);
-  if (mem[dsdt_addr] !== 68 || mem[dsdt_addr + 1] !== 83 || mem[dsdt_addr + 2] !== 68 || mem[dsdt_addr + 3] !== 84) {
+  if (gpa_read8(dsdt_addr) !== 68 || gpa_read8(dsdt_addr + 1) !== 83 || gpa_read8(dsdt_addr + 2) !== 68 || gpa_read8(dsdt_addr + 3) !== 84) {
     dbg_log("ACPI patch_dsdt_s5: DSDT signature mismatch", LOG_ACPI);
     return;
   }
-  const dsdt_len_orig = mem[dsdt_addr + 4] | mem[dsdt_addr + 5] << 8 | mem[dsdt_addr + 6] << 16 | mem[dsdt_addr + 7] << 24;
+  const dsdt_len_orig = gpa_read32(dsdt_addr + 4);
   const aml_end = dsdt_addr + dsdt_len_orig;
   for (let a = dsdt_addr + 36; a < aml_end - 4; a++) {
-    if (mem[a] === 95 && mem[a + 1] === 83 && mem[a + 2] === 53 && mem[a + 3] === 95) {
+    if (gpa_read8(a) === 95 && gpa_read8(a + 1) === 83 && gpa_read8(a + 2) === 53 && gpa_read8(a + 3) === 95) {
       dbg_log("ACPI patch_dsdt_s5: \\_S5_ already present, skipping patch", LOG_ACPI);
       return;
     }
   }
-  if (aml_end + 16 > mem.length) {
+  if (aml_end + 16 >>> 0 > logical_limit) {
     dbg_log("ACPI patch_dsdt_s5: no room to append \\S5_ AML", LOG_ACPI);
     return;
   }
@@ -3037,19 +3070,19 @@ ACPI.prototype.patch_dsdt_s5 = function() {
     // Reserved entries
   ];
   for (let i = 0; i < S5_AML.length; i++) {
-    mem[aml_end + i] = S5_AML[i];
+    gpa_write8(aml_end + i, S5_AML[i]);
   }
   const new_len = dsdt_len_orig + 16;
-  mem[dsdt_addr + 4] = new_len & 255;
-  mem[dsdt_addr + 5] = new_len >>> 8 & 255;
-  mem[dsdt_addr + 6] = new_len >>> 16 & 255;
-  mem[dsdt_addr + 7] = new_len >>> 24 & 255;
-  mem[dsdt_addr + 9] = 0;
+  gpa_write8(dsdt_addr + 4, new_len & 255);
+  gpa_write8(dsdt_addr + 5, new_len >>> 8 & 255);
+  gpa_write8(dsdt_addr + 6, new_len >>> 16 & 255);
+  gpa_write8(dsdt_addr + 7, new_len >>> 24 & 255);
+  gpa_write8(dsdt_addr + 9, 0);
   let sum = 0;
   for (let i = 0; i < new_len; i++) {
-    sum += mem[dsdt_addr + i];
+    sum += gpa_read8(dsdt_addr + i);
   }
-  mem[dsdt_addr + 9] = 256 - (sum & 255) & 255;
+  gpa_write8(dsdt_addr + 9, 256 - (sum & 255) & 255);
   dbg_log(
     "ACPI patch_dsdt_s5: appended \\_S5_ AML at " + h(aml_end >>> 0) + ", DSDT len " + h(dsdt_len_orig >>> 0) + " \u2192 " + h(new_len >>> 0),
     LOG_ACPI

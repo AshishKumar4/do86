@@ -12,7 +12,7 @@ import {
   EMULATOR_LOAD_TIMEOUT_MS, SNAPSHOT_DELAY_FAST_MS, SNAPSHOT_DELAY_SLOW_MS,
 } from "./types";
 import { DOScreenAdapter } from "./screen-adapter";
-import { DeltaEncoder, encodeSerialData, encodeStats, encodeStatus, encodeTextScreen } from "./delta-encoder";
+import { DeltaEncoder, encodeSerialData, encodeStats, encodeDetailedStats, encodeStatus, encodeTextScreen } from "./delta-encoder";
 import { SqliteStorage, SqliteImageCache, SQLiteBlockDevice, unpackAssets } from "./sqlite-storage";
 import { SqlPageStore, type PageStoreConfig } from "./sql-page-store";
 import type { Env } from "./index";
@@ -58,19 +58,13 @@ const VM_CONFIG = {
   WASM_MB:       64,   // = RESIDENT_MB(32) + HOT_FRAMES×4KB/1MB(32)
   /** VGA SVGA framebuffer size (MB), allocated separately by svga_allocate_memory. */
   VGA_MB:         8,
-  /** Logical RAM reported to guest BIOS/CMOS (MB).
-   *  GPAs in [RESIDENT_MB, LOGICAL_MB) are demand-paged from DO SQLite. */
-  // LOGICAL_MB must equal WASM_MB (not larger) because SeaBIOS places ACPI tables
-  // near the top of logical RAM (logical_memory_size - ~7KB).  If logical RAM
-  // exceeds the WASM physical allocation (memory_size), those writes hit the MMIO
-  // no-op handler (addr >= memory_size triggers in_mapped_range), the ACPI tables
-  // are silently dropped, and KolibriOS loops forever scanning for a valid RSDT.
-  // Demand-paging still helps: the OS can use the 32–64 MB region (hot pool)
-  // without growing WASM — it just can't exceed 64 MB total.
-  LOGICAL_MB:    64,   // must equal WASM_MB
-  /** SMP CPU count: 1 = BSP only, 2 = BSP + 1 AP.
-   *  Each AP adds cooperative ticks; increase only after measuring headroom. */
-  CPU_COUNT:      2,
+  /** Default logical RAM reported to guest BIOS/CMOS (MB).
+   *  GPAs in [WASM_MB, LOGICAL_MB) are demand-paged from DO SQLite.
+   *  Default = WASM_MB (64) so SeaBIOS ACPI tables stay within WASM allocation.
+   *  Per-image logicalMemory overrides this (e.g., AqeousOS uses 3584). */
+  LOGICAL_MB:    64,
+  /** Default SMP CPU count: 1 = BSP only.  Per-image cpuCount overrides. */
+  CPU_COUNT:      1,
   /** PageStore tuning forwarded to SqlPageStore constructor. */
   PAGE_STORE: {
     maxFrames:    8192,  // must equal HOT_FRAMES above
@@ -93,6 +87,8 @@ interface ImageDef {
   noSnapshot?: boolean;
   ahciDiskSize?: number;
   logicalMemory?: number;
+  /** SMP CPU count for this image. Default: VM_CONFIG.CPU_COUNT (1). */
+  cpuCount?: number;
 }
 
 // memory/vgaMemory in IMAGES are the values passed as memory_size/vga_memory_size to v86.
@@ -102,11 +98,9 @@ const { WASM_MB, VGA_MB } = VM_CONFIG;
 const IMAGES: Record<string, ImageDef> = {
   kolibri:    { file: "kolibri.img",             drive: "fda",   memory: WASM_MB, vgaMemory: VGA_MB, label: "KolibriOS",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: WASM_MB, vgaMemory: VGA_MB, label: "AqeousOS", noSnapshot: true, ahciDiskSize: 32, logicalMemory: 3584 },
-  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 15",
-                url: "http://tinycorelinux.net/15.x/x86/release/TinyCore-15.0.iso" },
-  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 11",
-                url: "http://tinycorelinux.net/11.x/x86/release/TinyCore-11.1.iso" },
+  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: WASM_MB, vgaMemory: VGA_MB, label: "AqeousOS", noSnapshot: true, ahciDiskSize: 32, logicalMemory: 3584, cpuCount: 2 },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 15" },
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 11" },
   dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "DSL Linux",
                 url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
   helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "HelenOS",
@@ -195,6 +189,18 @@ export class LinuxVM extends DurableObject<Env> {
   private _statsInterval: ReturnType<typeof setInterval> | null = null;
   private _yieldDead = false;
   private _yieldError = "";
+  private _yieldDiag: any = null;
+
+  // ── Detailed stats subscription ──────────────────────────────────────
+  // When > 0, detailed stats are pushed at each async yield boundary.
+  // Zero overhead when no subscribers — just an integer check.
+  private _detailedStatsSubscribers = 0;
+  private _lastDetailedStatsTime = 0;
+  private _lastDetailedYields = 0;
+  private _lastDetailedSwapIns = 0;
+  private _lastDetailedEvictions = 0;
+  private _lastDetailedSqlReads = 0;
+  private _lastDetailedInstructions = 0;
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
@@ -212,7 +218,10 @@ export class LinuxVM extends DurableObject<Env> {
     }
 
     if (url.pathname === "/stats" && request.method === "GET") {
-      return Response.json(this.collectStats());
+      // Merge base stats with detailed rate stats for full observability
+      const base = this.collectStats();
+      const detailed = this.collectDetailedStats();
+      return Response.json({ ...base, rates: detailed });
     }
 
     if (url.pathname === "/reboot" && request.method === "POST") {
@@ -300,7 +309,7 @@ export class LinuxVM extends DurableObject<Env> {
     const [client, server] = Object.values(pair);
     server.accept();
 
-    this.sessions.set(server, { needsKeyframe: true, droppedFrames: 0, lastSendTime: 0 });
+    this.sessions.set(server, { needsKeyframe: true, droppedFrames: 0, lastSendTime: 0, wantsDetailedStats: false });
 
     server.addEventListener("message", async (event: MessageEvent) => {
       await this.webSocketMessage(server, event.data);
@@ -399,7 +408,149 @@ export class LinuxVM extends DurableObject<Env> {
       pageStore:   ps,
       // JIT
       jit:         this.getJitBlockCount(),
+      mt:          (this as any)._mt ?? null,
+      // Per-yield diagnostics
+      yieldDiag:   this._yieldDiag ? {
+        totalBatches:     this._yieldDiag.totalBatches,
+        lastBatchWallMs:  this._yieldDiag.lastBatchWallMs,
+        maxBatchWallMs:   this._yieldDiag.maxBatchWallMs,
+        avgBatchWallMs:   this._yieldDiag.avgBatchWallMs,
+        totalHltYields:   this._yieldDiag.totalHltYields,
+        totalActiveYields: this._yieldDiag.totalActiveYields,
+        recentBatches:    this._yieldDiag.batches,
+      } : null,
     };
+  }
+
+  /**
+   * Collect high-frequency detailed stats for subscribed clients.
+   * Computes deltas since last rate window for rate metrics.
+   * Rate window minimum is 100ms to avoid noisy per-yield jitter.
+   * Only called when _detailedStatsSubscribers > 0.
+   */
+  private collectDetailedStats(): Record<string, unknown> {
+    const now = performance.now();
+    const dt = now - this._lastDetailedStatsTime;
+    const dtSec = dt / 1000;
+
+    const p = this._perf;
+    const ps = this._pageStore?.getStats() ?? null;
+
+    // Read instruction counter from WASM shared memory
+    let instructions = 0;
+    try {
+      const cpu = (this.emulator as any)?.v86?.cpu;
+      if (cpu?.instruction_counter) instructions = cpu.instruction_counter[0] >>> 0;
+    } catch {}
+
+    // Compute deltas
+    const dYields = p.yields - this._lastDetailedYields;
+    const dSwapIns = (ps?.swapIns ?? 0) - this._lastDetailedSwapIns;
+    const dEvictions = (ps?.evictions ?? 0) - this._lastDetailedEvictions;
+    const dSqlReads = (ps?.sqlReads ?? 0) - this._lastDetailedSqlReads;
+    const dInstructions = instructions - this._lastDetailedInstructions;
+
+    // Only update rate baseline when enough time has passed (100ms minimum)
+    // to avoid per-yield noise. Rates are computed from whatever dt is available.
+    const MIN_RATE_WINDOW = 100; // ms
+    let yieldsPerSec = 0, instructionsPerSec = 0, swapInsPerSec = 0;
+    let evictionsPerSec = 0, sqlReadsPerSec = 0;
+
+    if (dt >= MIN_RATE_WINDOW) {
+      yieldsPerSec = +(dYields / dtSec).toFixed(1);
+      instructionsPerSec = Math.round(dInstructions / dtSec);
+      swapInsPerSec = +(dSwapIns / dtSec).toFixed(1);
+      evictionsPerSec = +(dEvictions / dtSec).toFixed(1);
+      sqlReadsPerSec = +(dSqlReads / dtSec).toFixed(1);
+
+      // Reset rate window
+      this._lastDetailedStatsTime = now;
+      this._lastDetailedYields = p.yields;
+      this._lastDetailedSwapIns = ps?.swapIns ?? 0;
+      this._lastDetailedEvictions = ps?.evictions ?? 0;
+      this._lastDetailedSqlReads = ps?.sqlReads ?? 0;
+      this._lastDetailedInstructions = instructions;
+    }
+    // If dt < MIN_RATE_WINDOW, keep previous baseline — don't update counters.
+    // Rates will show 0 until enough time accumulates.
+
+    const uptimeMs = p.bootTimeMs > 0 ? Math.round(now - p.bootTimeMs) : 0;
+
+    return {
+      t: Math.round(now),           // server timestamp
+      dt: Math.round(dt),           // ms since last rate window reset
+      uptimeMs,
+      // ── Cumulative counters ──
+      yields: p.yields,
+      syncYields: p.syncYields,
+      instructions,
+      // ── Rates (per second, 0 if rate window not yet elapsed) ──
+      yieldsPerSec,
+      instructionsPerSec,
+      swapInsPerSec,
+      evictionsPerSec,
+      sqlReadsPerSec,
+      // ── Page store snapshot ──
+      ps: ps ? {
+        hot: ps.hotPages,
+        total: ps.totalFrames,
+        free: ps.freeFrames,
+        swapIns: ps.swapIns,
+        evictions: ps.evictions,
+        tlbFlushes: ps.tlbFlushes,
+        sqlR: ps.sqlReads,
+        sqlW: ps.sqlWrites,
+        sqlRms: ps.sqlReadMs,
+        sqlWms: ps.sqlWriteMs,
+        pending: ps.pendingWrites,
+      } : null,
+      // ── Render ──
+      renders: p.renders,
+      framesSent: p.framesSent,
+      renderMs: Math.round(p.renderMs),
+      // ── Health ──
+      yieldDead: this._yieldDead,
+      yieldError: this._yieldError || null,
+      booted: this.booted,
+      imageKey: this.imageKey,
+      sessions: this.sessions.size,
+      // ── Yield diagnostics ──
+      diag: this._yieldDiag ? {
+        batches: this._yieldDiag.totalBatches,
+        lastWallMs: this._yieldDiag.lastBatchWallMs,
+        maxWallMs: this._yieldDiag.maxBatchWallMs,
+        avgWallMs: this._yieldDiag.avgBatchWallMs,
+        hltYields: this._yieldDiag.totalHltYields,
+        activeYields: this._yieldDiag.totalActiveYields,
+        recent: this._yieldDiag.batches,
+        // Dead-yield forensics
+        asyncScheduled: (this._yieldDiag as any).asyncScheduled ?? 0,
+        asyncFired: (this._yieldDiag as any).asyncFired ?? 0,
+        asyncTickMismatch: (this._yieldDiag as any).asyncTickMismatch ?? 0,
+        yieldDeathInfo: (this._yieldDiag as any).yieldDeathInfo ?? "",
+      } : null,
+    };
+  }
+
+  private _lastDetailedStatsPushTime = 0;
+
+  /**
+   * Push detailed stats to all subscribed clients.
+   * Called at each async yield boundary — throttled to max 2 pushes/sec
+   * to avoid flooding the WebSocket on fast-running VMs.
+   * Zero cost when no subscribers (just checks an integer).
+   */
+  private pushDetailedStats(): void {
+    if (this._detailedStatsSubscribers <= 0) return;
+    const now = performance.now();
+    if (now - this._lastDetailedStatsPushTime < 500) return; // max 2/sec
+    this._lastDetailedStatsPushTime = now;
+    const stats = this.collectDetailedStats();
+    const data = encodeDetailedStats(stats);
+    for (const [ws, state] of this.sessions) {
+      if (!state.wantsDetailedStats) continue;
+      try { ws.send(data); } catch { /* non-fatal */ }
+    }
   }
 
   // ── Boot pipeline ─────────────────────────────────────────────────────
@@ -421,6 +572,7 @@ export class LinuxVM extends DurableObject<Env> {
       let diskFile: string | null = null;
       let ahciDiskSize: number | undefined;
       let logicalMemoryMB = VM_CONFIG.LOGICAL_MB;
+      let cpuCount = VM_CONFIG.CPU_COUNT;
 
       const metadataRaw = this.cachedAssets.get("metadata");
       if (metadataRaw) {
@@ -436,6 +588,7 @@ export class LinuxVM extends DurableObject<Env> {
           this.noSnapshot = !!meta.noSnapshot;
           if (meta.ahciDiskSize) ahciDiskSize = meta.ahciDiskSize;
           if (meta.logicalMemory) logicalMemoryMB = meta.logicalMemory;
+          if (meta.cpuCount) cpuCount = meta.cpuCount;
         } catch (e) {
           console.error(`${LOG_PREFIX} Failed to parse boot metadata:`, e);
         }
@@ -520,37 +673,103 @@ export class LinuxVM extends DurableObject<Env> {
 
       const { V86 } = await import("./libv86.mjs");
 
-      // Microtick fix for Workers environment where performance.now() is frozen between I/O.
+      // ── Instruction-counter-based microtick ──────────────────────────────────
       //
-      // F.microtick (JS-side) is called directly by ACPI, PIT, RTC, and APIC device code —
-      // NOT only via the WASM import. We must patch V86.microtick BEFORE new V86() so that:
-      //   1. The global JS device calls use our hybrid timer.
-      //   2. The WASM import table (bound at WebAssembly.instantiate time) also captures it,
-      //      because libv86.mjs passes `v86.microtick` by value into the WASM env object.
+      // In Cloudflare Workers, performance.now() is frozen during synchronous
+      // WASM execution (Spectre mitigation).  v86's main_loop() uses microtick()
+      // to decide when to yield (now - start > TIME_PER_FRAME = 1.0ms).
       //
-      // V86.microtick has a getter/setter that forwards to the internal `v86.microtick` variable,
-      // so assigning here propagates to both the JS devices and the WASM import capture.
+      // With a fixed synthetic increment (e.g. 0.005ms), microtick needs ~200 calls
+      // to reach 1ms, and each call runs ~100K instructions via do_many_cycles_native.
+      // Result: 20M instructions per yield = ~4 seconds of blocked event loop at
+      // production WASM speeds (~5 MIPS).
       //
-      // Hybrid approach: advance synthetically during synchronous WASM execution (~50 calls per
-      // frame at 0.02ms increment = 1ms), but sync to real time whenever I/O advances it.
+      // Fix: derive synthetic time from the instruction counter at WASM memory
+      // offset 664 (global_pointers::instruction_counter, Uint32).  This is
+      // incremented by both the interpreter and JIT, and is readable from JS via
+      // a typed array view over WebAssembly.Memory.buffer.
+      //
+      // MS_PER_INSTRUCTION = TIME_PER_FRAME / LOOP_COUNTER ≈ 1.0 / 100,003.
+      // After one do_many_cycles_native() call (~100K instructions), the
+      // instruction delta × MS_PER_INSTRUCTION ≈ 1.0ms, causing main_loop to
+      // yield.  Each yield = ~100K instructions = ~21ms wall time at 5 MIPS.
+      //
+      // On I/O boundaries (performance.now() advances), we sync to real time
+      // and re-baseline the instruction counter.
+      //
       let syntheticTime = performance.now();
       let lastRealTime = syntheticTime;
-      const MICROTICK_INCREMENT = 0.005; // 20μs per call — ~50 calls to hit 1ms TIME_PER_FRAME
 
+      // Shared reference — populated by wasm_fn after WebAssembly.instantiate.
+      // Used for diagnostic instruction counting in batch stats.
+      let instrCounterView: Uint32Array | null = null;
+      let instrCounterBuffer: ArrayBuffer | null = null;
+      let wasmMemRef: WebAssembly.Memory | null = null;
+
+      /** Read the current instruction counter from WASM shared memory (for diagnostics). */
+      const readInstrCounter = (): number => {
+        if (!wasmMemRef) return 0;
+        const buf = wasmMemRef.buffer;
+        if (buf !== instrCounterBuffer) {
+          instrCounterBuffer = buf;
+          instrCounterView = new Uint32Array(buf, 664, 1);
+        }
+        return instrCounterView![0] >>> 0;
+      };
+
+      /** No-op — kept for call sites that haven't been cleaned up yet. */
+      const resetBatchInstrBaseline = () => {};
+
+      // Diagnostic counters for microtick path analysis (stored on `this` for stats access)
+      const mt = { calls: 0, real: 0, instr: 0, hlt: 0, activeZero: 0, preWasm: 0, lastLogTime: 0 };
+      (this as any)._mt = mt;
+
+      // Instruction-counter-based microtick (enabled by Rust flush fix).
+      //
+      // The Rust emulator now flushes instruction_counter before every I/O dispatch,
+      // so readInstrCounter() sees accurate deltas even during synchronous WASM execution
+      // where performance.now() is frozen (Cloudflare Workers Spectre mitigation).
+      //
+      // MS_PER_INSTRUCTION = TIME_PER_FRAME / LOOP_COUNTER ≈ 1.0ms / 100003.
+      // After one do_many_cycles_native() call (~100K instructions), the instruction
+      // delta × MS_PER_INSTRUCTION ≈ 1.0ms, causing main_loop to yield.
+      // Result: main_loop iterates 1-2 times per yield instead of ~200 with fixed increment.
+      //
+      // Safety valve: if instruction delta is 0 (shouldn't happen with the Rust flush,
+      // but just in case), use a minimal 0.001ms increment to guarantee forward progress.
+      const TIME_PER_FRAME = 1.0;     // ms — v86's main_loop yield threshold
+      const LOOP_COUNTER = 100003;     // do_many_cycles_native iteration count
+      const MS_PER_INSTRUCTION = TIME_PER_FRAME / LOOP_COUNTER; // ~0.00001ms
+      const FALLBACK_INCREMENT = 0.001; // 1μs — safety valve when delta is 0
+      let lastInstrCount = 0;
+      
       (V86 as any).microtick = () => {
+        mt.calls++;
         const realNow = performance.now();
         if (realNow > lastRealTime) {
+          mt.real++;
           lastRealTime = realNow;
-          // Only advance syntheticTime if real time is ahead — never go backwards.
-          // If syntheticTime already leads realNow (from synthetic increments),
-          // keep it as-is; resetting to realNow would cause time to go backwards,
-          // triggering the ACPI pmtimer dbg_assert(t > timer_last_value).
+          // I/O boundary: real time advanced. Sync synthetic time forward
+          // (never backwards for ACPI pmtimer monotonicity) and re-baseline
+          // the instruction counter.
           if (realNow > syntheticTime) {
             syntheticTime = realNow;
           }
+          lastInstrCount = readInstrCounter();
         } else {
-          // Still in synchronous execution — advance synthetically.
-          syntheticTime += MICROTICK_INCREMENT;
+          // Frozen performance.now() — derive time from instruction counter.
+          mt.instr++;
+          const currentInstr = readInstrCounter();
+          const delta = (currentInstr - lastInstrCount) >>> 0; // unsigned wrap-safe
+          lastInstrCount = currentInstr;
+          if (delta > 0) {
+            syntheticTime += delta * MS_PER_INSTRUCTION;
+          } else {
+            // Safety valve: instruction counter didn't advance (shouldn't happen
+            // with the Rust flush fix, but guarantees forward progress).
+            mt.activeZero++;
+            syntheticTime += FALLBACK_INCREMENT;
+          }
         }
         return syntheticTime;
       };
@@ -586,6 +805,9 @@ export class LinuxVM extends DurableObject<Env> {
           // allocate_memory() during cpu.init() grows WASM memory, detaching
           // any previously-created ArrayBuffer view.
           const wasmMem = instance.exports.memory as WebAssembly.Memory;
+          // Wire the instruction-counter microtick — must happen before cpu.init()
+          // so that BIOS POST timing uses instruction-based time from the start.
+          wasmMemRef = wasmMem;
           pageStore.setWasmMemory(wasmMem, HOT_POOL_BASE);
 
           // Wire pool_* WASM exports (page_pool.rs) so the JS Clock eviction
@@ -630,9 +852,9 @@ export class LinuxVM extends DurableObject<Env> {
         fastboot: true,
         acpi: true,
         boot_order: drive === "cdrom" ? BOOT_ORDER_CDROM_FIRST : BOOT_ORDER_HDA_FIRST,
-        // cpu_count: stratum WASM supports SMP via smp_init().
-        // VM_CONFIG.CPU_COUNT = 2 (BSP + 1 AP) is conservative for the DO budget.
-        cpu_count: VM_CONFIG.CPU_COUNT,
+        // cpu_count: per-image SMP configuration. Default 1 (BSP only) to avoid
+        // SMP overhead for single-processor OSes. Only AqeousOS sets 2.
+        cpu_count: cpuCount,
         // Networking: NE2K is always created (v86 default).  We don't set
         // network_relay_url — no relay exists, so TX packets vanish and
         // KolibriOS spins on DHCP retries until timeout.  Cannot use
@@ -745,62 +967,47 @@ export class LinuxVM extends DurableObject<Env> {
           }
           this.emulator!.run();
 
-          // ── High-performance yield override ──────────────────────────────────
+          // ── High-throughput yield override ─────────────────────────────────
           //
-          // Strategy: eliminate ~87% of setTimeout overhead by calling
-          // yield_callback() synchronously for (BATCH_SIZE-1) of every BATCH_SIZE
-          // yields. Only the last yield in each batch breaks to the event loop:
-          //   1. Lets WS sends flush (network I/O) and incoming messages land
-          //   2. Prevents a single DO request from monopolising the event loop
-          //   3. Gives us a clean batch boundary to render from (guest has
-          //      finished its draw operations — no mid-draw ghost captures)
+          // Two-level scheduling for maximum instruction throughput:
           //
-          // BATCH_SIZE=8: ~8ms between renders (~125fps capture rate), ~87% sync.
+          // 1. INSTRUCTION-COUNTER MICROTICK: Each active yield runs ~100K
+          //    instructions (one do_many_cycles_native).  At ~5 MIPS this is
+          //    ~20ms wall time per yield.
           //
-          // Idle detection: v86 passes `t` (ms hint) from main_loop. When
-          // t > 10 the guest CPU is halted (HLT) — we sleep min(t, 40)ms instead
-          // of spinning, saving CPU on idle desktops.
+          // 2. FIXED BATCH SIZE: Always run BATCH_SIZE yields synchronously
+          //    before breaking to the event loop.  HLT yields within the batch
+          // ── High-performance yield override ────────────────────────────────
           //
-          // Rendering: renderFrame() fires at every batch boundary and on idle.
-          // No setInterval — all rendering is driven by the yield cadence.
+          // BATCH_SIZE=8: 7 sync yields + 1 async break per batch.
+          // ~87% of yields skip setTimeout entirely.
+          //
+          // Rendering: independent setInterval (startRenderLoop) at adaptive FPS.
+          // Decoupled from yield cadence so it can't starve during heavy boots.
+          //
+          // Idle detection: t > 10 = HLT → sleep min(t, 40)ms.
           const BATCH_SIZE = 8;
           const v86Internal = (this.emulator as any).v86;
           if (v86Internal) {
             let yieldCount = 0;
             v86Internal.yield = (t: number, tick: number) => {
-              if (this._yieldDead) return;
               yieldCount++;
               this._perf.yields++;
               if (yieldCount % BATCH_SIZE !== 0) {
-                // Synchronous fast path: no event loop round-trip, no setTimeout cost.
                 this._perf.syncYields++;
-                try {
-                  v86Internal.yield_callback(tick);
-                } catch (e) {
-                  const cpu = (this.emulator as any)?.v86?.cpu;
-                  const eip = cpu?.instruction_pointer?.[0];
-                  const cr0 = cpu?.cr?.[0];
-                  this._yieldError = `sync: ${e} [eip=${eip?.toString(16)} cr0=${cr0?.toString(16)} yields=${this._perf.yields}]`;
-                  console.error(`${LOG_PREFIX} FATAL: sync yield_callback threw:`, e, `eip=${eip?.toString(16)} cr0=${cr0?.toString(16)}`);
-                  this._yieldDead = true;
-                }
+                v86Internal.yield_callback(tick);
                 return;
               }
               // Async yield: break to event loop.
-              // Render at each async boundary — setInterval can't fire during
-              // synchronous yield batches (WASM + page faults monopolize the
-              // event loop for hundreds of ms in page-fault-heavy boots).
-              try { this.renderFrame(); } catch (_) {}
-
               if (t > 10) {
                 setTimeout(() => {
                   try { v86Internal.yield_callback(tick); }
-                  catch (e) { this._yieldError = `async(idle): ${e}`; console.error(`${LOG_PREFIX} FATAL: async yield_callback threw:`, e); this._yieldDead = true; }
+                  catch (e) { this._yieldError = `async: ${e}`; this._yieldDead = true; }
                 }, Math.min(t, 40));
               } else {
                 setTimeout(() => {
                   try { v86Internal.yield_callback(tick); }
-                  catch (e) { this._yieldError = `async: ${e}`; console.error(`${LOG_PREFIX} FATAL: async yield_callback threw:`, e); this._yieldDead = true; }
+                  catch (e) { this._yieldError = `async: ${e}`; this._yieldDead = true; }
                 }, 1);
               }
             };
@@ -957,28 +1164,15 @@ export class LinuxVM extends DurableObject<Env> {
   }
 
   private restartRenderLoop(): void {
-    this.startRenderLoop();
+    if (this.renderInterval) clearInterval(this.renderInterval);
+    const interval = Math.round(1000 / this.currentFPS);
+    this.renderInterval = setInterval(() => {
+      try { this.renderFrame(); } catch { /* non-fatal */ }
+    }, interval);
   }
 
-  /** Adaptive render loop: 30fps ceiling, 2fps floor.
-   *
-   *  Runs setInterval at 33ms (≈30fps).  Each tick:
-   *    1. Calls screen_fill_buffer() which drains the WASM dirty bitmap
-   *    2. If dirty: render + send frame, reset _cleanTicks to 0
-   *    3. If clean: increment _cleanTicks.  When _cleanTicks ≥ 3, skip frames
-   *       (only render every ~15th tick ≈ 2fps).
-   *
-   *  This gives 30fps when the guest is actively drawing and drops to ~2fps
-   *  when idle — no clearInterval/setInterval churn.
-   */
   private startRenderLoop(): void {
-    if (this.renderInterval) {
-      clearInterval(this.renderInterval);
-    }
-    this._cleanTicks = 0;
-    this.renderInterval = setInterval(() => {
-      try { this.renderFrame(); } catch (_) {}
-    }, 33); // 30fps ceiling
+    this.restartRenderLoop();
   }
 
   private startStatsInterval(): void {
@@ -1345,6 +1539,42 @@ export class LinuxVM extends DurableObject<Env> {
 
       if (msg.type === "heartbeat") return;
 
+      // ── Stats subscription ─────────────────────────────────────────────
+      if (msg.type === "subscribe_stats") {
+        const state = this.sessions.get(ws);
+        if (state && !state.wantsDetailedStats) {
+          state.wantsDetailedStats = true;
+          this._detailedStatsSubscribers++;
+          // Initialize delta tracking on first subscriber
+          if (this._detailedStatsSubscribers === 1) {
+            this._lastDetailedStatsTime = performance.now();
+            this._lastDetailedYields = this._perf.yields;
+            const ps = this._pageStore?.getStats();
+            this._lastDetailedSwapIns = ps?.swapIns ?? 0;
+            this._lastDetailedEvictions = ps?.evictions ?? 0;
+            this._lastDetailedSqlReads = ps?.sqlReads ?? 0;
+            try {
+              const cpu = (this.emulator as any)?.v86?.cpu;
+              this._lastDetailedInstructions = cpu?.instruction_counter?.[0] >>> 0 || 0;
+            } catch { this._lastDetailedInstructions = 0; }
+          }
+          // Send an immediate snapshot so the sidebar populates instantly
+          try {
+            const stats = this.collectDetailedStats();
+            this.wsSend(ws, encodeDetailedStats(stats));
+          } catch {}
+        }
+        return;
+      }
+      if (msg.type === "unsubscribe_stats") {
+        const state = this.sessions.get(ws);
+        if (state && state.wantsDetailedStats) {
+          state.wantsDetailedStats = false;
+          this._detailedStatsSubscribers = Math.max(0, this._detailedStatsSubscribers - 1);
+        }
+        return;
+      }
+
       // Drop keyboard input while the boot snapshot is pending.
       // This prevents key presses from contaminating the pristine boot
       // state that gets persisted for future sessions.
@@ -1404,17 +1634,22 @@ export class LinuxVM extends DurableObject<Env> {
   }
 
   webSocketClose(ws: WebSocket, code: number, reason: string): void {
+    const state = this.sessions.get(ws);
+    if (state?.wantsDetailedStats) {
+      this._detailedStatsSubscribers = Math.max(0, this._detailedStatsSubscribers - 1);
+    }
     this.sessions.delete(ws);
     try { ws.close(code, reason); }
     catch { /* already closed */ }
 
-    if (this.sessions.size === 0 && this.renderInterval) {
-      clearInterval(this.renderInterval);
-      this.renderInterval = null;
-    }
+    // Rendering is yield-driven — no interval to clean up.
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
+    const state = this.sessions.get(ws);
+    if (state?.wantsDetailedStats) {
+      this._detailedStatsSubscribers = Math.max(0, this._detailedStatsSubscribers - 1);
+    }
     this.sessions.delete(ws);
   }
 
@@ -1511,6 +1746,7 @@ export class LinuxVM extends DurableObject<Env> {
       noSnapshot: imageDef.noSnapshot ?? false,
       ...(imageDef.ahciDiskSize ? { ahciDiskSize: imageDef.ahciDiskSize } : {}),
       ...(imageDef.logicalMemory ? { logicalMemory: imageDef.logicalMemory } : {}),
+      ...(imageDef.cpuCount ? { cpuCount: imageDef.cpuCount } : {}),
       // disk was resolved above, no need for diskUrl — pass it inline
     };
     assets.set("disk", disk);

@@ -162,6 +162,112 @@ header a:hover { color: #f97316; }
   margin-top: 8px;
 }
 
+/* ── Stats sidebar (right panel, collapsible) ────────────────────────────── */
+
+#stats-sidebar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100vh;
+  width: 260px;
+  background: #0d1117;
+  border-left: 1px solid #30363d;
+  display: flex;
+  flex-direction: column;
+  z-index: 100;
+  transition: transform 0.2s ease;
+  overflow: hidden;
+}
+#stats-sidebar.collapsed {
+  transform: translateX(calc(100% - 28px));
+}
+
+#stats-toggle {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%) rotate(-90deg) translateX(-50%);
+  transform-origin: left center;
+  font-size: 10px;
+  font-family: inherit;
+  padding: 3px 10px;
+  background: #161b22;
+  color: #8b949e;
+  border: 1px solid #30363d;
+  border-left: none;
+  border-radius: 0 0 4px 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  z-index: 101;
+}
+#stats-toggle:hover { color: #f97316; }
+
+#stats-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 10px 8px 32px;
+  font-size: 11px;
+}
+
+.stats-section {
+  margin-bottom: 12px;
+}
+.stats-section h3 {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #8b949e;
+  margin-bottom: 4px;
+  border-bottom: 1px solid #21262d;
+  padding-bottom: 2px;
+}
+
+.stats-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 1px 0;
+  line-height: 1.4;
+}
+.stats-row span:first-child { color: #8b949e; }
+.stats-row span:last-child { color: #c9d1d9; font-variant-numeric: tabular-nums; }
+
+.stats-bar-container {
+  height: 14px;
+  background: #21262d;
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 3px 0;
+}
+.stats-bar {
+  height: 100%;
+  background: #238636;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+}
+.stats-bar span {
+  font-size: 9px;
+  color: #fff;
+  white-space: nowrap;
+}
+
+#stats-content canvas {
+  width: 100%;
+  height: 40px;
+  background: #161b22;
+  border-radius: 3px;
+  margin-top: 4px;
+  display: block;
+}
+
+/* Adjust main layout when sidebar is open */
+body:has(#stats-sidebar:not(.collapsed)) #display-container {
+  margin-right: 260px;
+}
+
 /* ── Serial panel (below canvas, collapsible) ────────────────────────────── */
 
 #serial-panel {

@@ -13,3 +13,4 @@ package-lock.json
 public/assets/v86.wasm
 images/
 public/assets/kolibri.img
+public/assets/TinyCore-*.iso
