@@ -573,8 +573,8 @@ export class QEMUWrapper {
       "-M", "pc",                             // i440FX machine
       "-m", `${config.wasmHeapMB}M`,          // Hot window allocation only
       "-smp", "1",                             // Single vCPU per DO
-      "-nographic",                            // No SDL/GTK display
-      "-device", "VGA",                        // VGA for framebuffer
+      "-nographic",                            // Redirect VGA text to serial (SeaBIOS output)
+      "-device", "VGA",                        // Add VGA device for framebuffer capture
       "-serial", "stdio",                      // Serial to stdout callbacks
       "-no-reboot",
       "-nodefaults",

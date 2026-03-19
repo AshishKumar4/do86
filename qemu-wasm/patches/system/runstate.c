@@ -1261,13 +1261,45 @@ static DisplaySurface *do86_primary_surface(void)
 
 /* ── Display bridge ──────────────────────────────────────────────────── */
 
+/* Minimal display change listener for headless WASM mode.
+ * Allocates a surface when the VGA device initializes. */
+static void wasm_display_gfx_update(DisplayChangeListener *dcl,
+                                     int x, int y, int w, int h) {}
+static void wasm_display_gfx_switch(DisplayChangeListener *dcl,
+                                     DisplaySurface *new_surface) {}
+static const DisplayChangeListenerOps wasm_dcl_ops = {
+    .dpy_name          = "wasm",
+    .dpy_gfx_update    = wasm_display_gfx_update,
+    .dpy_gfx_switch    = wasm_display_gfx_switch,
+};
+static DisplayChangeListener wasm_dcl = { .ops = &wasm_dcl_ops };
+
 EMSCRIPTEN_KEEPALIVE
 void wasm_display_init(void)
 {
-    /* Force a full display refresh so surface data is populated */
+    /* Register a display listener so QEMU allocates a display surface.
+     * With -display none, no listener is registered automatically.
+     * Our minimal wasm_dcl just provides dpy_gfx_update/switch callbacks
+     * so that the surface allocation happens. */
     QemuConsole *con = qemu_console_lookup_by_index(0);
     if (con) {
+        static bool registered = false;
+        if (!registered) {
+            register_displaychangelistener(&wasm_dcl);
+            registered = true;
+            fprintf(stdout, "[DISPLAY] registered listener, con=%p\n", con);
+            fflush(stdout);
+        }
         graphic_hw_update(con);
+        DisplaySurface *s = qemu_console_surface(con);
+        if (s) {
+            fprintf(stdout, "[DISPLAY] surface: %dx%d stride=%d data=%p\n",
+                    surface_width(s), surface_height(s),
+                    surface_stride(s), surface_data(s));
+        } else {
+            fprintf(stdout, "[DISPLAY] no surface yet\n");
+        }
+        fflush(stdout);
     }
 }
 

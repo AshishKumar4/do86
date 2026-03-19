@@ -284,10 +284,17 @@ export class QemuStandaloneDO extends DurableObject<QemuStandaloneEnv> {
   private startRenderLoop(): void {
     if (this.renderTimer) return;
 
+    let renderCount = 0;
     this.renderTimer = setInterval(() => {
       if (this.sessions.size === 0 || !this.qemu?.isLoaded) return;
+      renderCount++;
 
       try {
+        if (renderCount <= 3 || renderCount % 500 === 0) {
+          const graphical = this.qemu.isGraphicalMode();
+          console.log(`${LOG_PREFIX} render #${renderCount}: graphical=${graphical} clients=${this.sessions.size}`);
+        }
+
         const frame = this.qemu.getScreenFrame();
         if (!frame || frame.byteLength < 12) return;
 
