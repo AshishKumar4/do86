@@ -16,13 +16,13 @@
 
 ---
 
-Full x86 PCs emulated at the edge using [Stratum](https://github.com/AshishKumar4/stratum) (a v86 fork with AHCI, ACPI, and SMP extensions). The browser connects over WebSocket and receives compressed framebuffer updates — no plugins, no VNC client, just a \`<canvas>\`.
+Full x86 PCs emulated at the edge using [Stratum](https://github.com/AshishKumar4/stratum) (a v86 fork with AHCI, ACPI, and SMP extensions). The browser connects over WebSocket and receives compressed framebuffer updates — no plugins, no VNC client, just a `<canvas>`.
 
 **🚀 Try it live: [do86.ashishkumarsingh.com](https://do86.ashishkumarsingh.com)**
 
 ## How It Works
 
-\`\`\`
+```
 ┌────────────┐              ┌────────────┐              ┌─────────────────────┐
 │            │  WebSocket   │            │     RPC      │                     │
 │  Browser   │◄────────────►│   Worker   │◄────────────►│   Durable Object    │
@@ -32,7 +32,7 @@ Full x86 PCs emulated at the edge using [Stratum](https://github.com/AshishKumar
 │  mouse     │              │  assets    │              │   delta encoder     │
 │            │              │            │              │   SQLite storage    │
 └────────────┘              └────────────┘              └─────────────────────┘
-\`\`\`
+```
 
 1. **Browser** opens a WebSocket to the Worker, requesting an OS image
 2. **Worker** loads BIOS + disk image from Assets/CDN, packs them, and forwards to the Durable Object
@@ -44,13 +44,13 @@ Full x86 PCs emulated at the edge using [Stratum](https://github.com/AshishKumar
 
 | Image | OS | Boot | Notes |
 |-------|----|------|-------|
-| \`kolibri\` | [KolibriOS](http://kolibrios.org) | Floppy | Default. Full GUI, boots in seconds |
-| \`aqeous\` | [AqeousOS](https://github.com/AshishKumar4/AqeousOS) | Multiboot | Custom x86 OS with AHCI, window system, EXT2 |
-| \`tinycore\` | TinyCore 15 | CD-ROM | Minimal Linux with X11 + FLWM |
-| \`tinycore11\` | TinyCore 11 | CD-ROM | Classic release |
-| \`dsl\` | Damn Small Linux | CD-ROM | Fluxbox desktop, browser, tools |
-| \`helenos\` | HelenOS | CD-ROM | Research microkernel OS |
-| \`linux4\` | Linux 4.x | CD-ROM | Minimal text-mode kernel |
+| `kolibri` | [KolibriOS](http://kolibrios.org) | Floppy | Default. Full GUI, boots in seconds |
+| `aqeous` | [AqeousOS](https://github.com/AshishKumar4/AqeousOS) | Multiboot | Custom x86 OS with AHCI, window system, EXT2 |
+| `tinycore` | TinyCore 15 | CD-ROM | Minimal Linux with X11 + FLWM |
+| `tinycore11` | TinyCore 11 | CD-ROM | Classic release |
+| `dsl` | Damn Small Linux | CD-ROM | Fluxbox desktop, browser, tools |
+| `helenos` | HelenOS | CD-ROM | Research microkernel OS |
+| `linux4` | Linux 4.x | CD-ROM | Minimal text-mode kernel |
 
 ## Architecture
 
@@ -58,7 +58,7 @@ Full x86 PCs emulated at the edge using [Stratum](https://github.com/AshishKumar
 
 Guest OSes see up to 3.5 GB of logical RAM, but the DO only commits ~60-80 MB of real memory (within the 128 MB DO limit):
 
-\`\`\`
+```
 Guest Physical Address Space (up to 3.5 GB logical)
 ┌──────────────────────┬──────────────────────┬─────────────────────┐
 │   Resident Zone      │   Hot Page Pool      │   Cold Pages        │
@@ -66,10 +66,10 @@ Guest Physical Address Space (up to 3.5 GB logical)
 │   Always in WASM     │   8192 × 4KB frames  │   Stored in SQLite  │
 │   BIOS, kernel, low  │   Clock eviction     │   Paged in on fault │
 └──────────────────────┴──────────────────────┴─────────────────────┘
-\`\`\`
+```
 
-- **WASM-side pool lookup**: TLB miss → \`pool_lookup(gpa)\` — pure WASM, zero FFI
-- **Cold miss**: \`swap_page_in()\` → SQLite read → frame allocation
+- **WASM-side pool lookup**: TLB miss → `pool_lookup(gpa)` — pure WASM, zero FFI
+- **Cold miss**: `swap_page_in()` → SQLite read → frame allocation
 - **Batched SQLite I/O** for page fault storms
 - **CDN-cached disk images** via Cache API
 
@@ -81,31 +81,31 @@ Guest Physical Address Space (up to 3.5 GB logical)
 
 ### JIT Compilation
 
-Hot x86 basic blocks compiled to WASM at runtime via \`WebAssembly.instantiate()\`. Confirmed working in production Workers (200+ compiled blocks).
+Hot x86 basic blocks compiled to WASM at runtime via `WebAssembly.instantiate()`. Confirmed working in production Workers (200+ compiled blocks).
 
 ## Quick Start
 
-\`\`\`sh
+```sh
 bun install
 bun run dev
-\`\`\`
+```
 
 ### Deploy
 
-\`\`\`sh
+```sh
 bun run build
 npx wrangler deploy
-\`\`\`
+```
 
 ## Stratum (v86 Fork)
 
-This project uses [Stratum](https://github.com/AshishKumar4/stratum), a fork of v86 with AHCI, ACPI, SMP scaffolding, demand paging hooks, and \`net_device: "none"\` support.
+This project uses [Stratum](https://github.com/AshishKumar4/stratum), a fork of v86 with AHCI, ACPI, SMP scaffolding, demand paging hooks, and `net_device: "none"` support.
 
 Rebuild after stratum changes:
-\`\`\`sh
+```sh
 cd ../stratum && bun run build
 cp build/libv86.mjs ../do86/src/libv86.mjs
-\`\`\`
+```
 
 ## License
 
