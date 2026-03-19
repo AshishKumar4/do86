@@ -286,6 +286,17 @@ export class QEMUWrapper {
           if (stepCount <= 5 || stepCount % 5000 === 0) {
             console.log(`${LOG_PREFIX} wasm_step #${stepCount} returned ${result}`);
           }
+          // Display diagnostic — check surface state periodically
+          if (stepCount === 100 || stepCount === 1000 || stepCount % 10000 === 0) {
+            const sp = mod._wasm_get_display_surface_data?.() ?? -1;
+            const dw = mod._wasm_get_display_width?.() ?? -1;
+            const dh = mod._wasm_get_display_height?.() ?? -1;
+            const ds = mod._wasm_get_display_stride?.() ?? -1;
+            console.log(`${LOG_PREFIX} display: surface=${sp} ${dw}x${dh} stride=${ds}`);
+            if (sp <= 0 && mod._wasm_display_init) {
+              mod._wasm_display_init(); // retry init
+            }
+          }
           if (result > 0) {
             console.log(`${LOG_PREFIX} QEMU exit requested (status=${result})`);
             this.stop();
