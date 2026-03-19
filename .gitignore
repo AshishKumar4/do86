@@ -5,6 +5,9 @@ dist/
 *.log
 wrangler.jsonc
 
+# Rust build artifacts (WASM output committed separately)
+src/simd-helper/target/
+
 # Large OS images — download separately (see README)
 public/assets/dsl.iso
 public/assets/helenos.iso

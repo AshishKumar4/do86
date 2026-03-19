@@ -2,6 +2,56 @@ import {
   MSG_FULL_FRAME, MSG_DELTA_FRAME, MSG_SERIAL_DATA,
   MSG_STATUS, MSG_TEXT_SCREEN, MSG_STATS, MSG_DETAILED_STATS, TILE_SIZE,
 } from "./types";
+import simdModule from "./simd_helper.wasm";
+
+// ── SIMD WASM Helper ────────────────────────────────────────────────────────
+// Lazy-initialized WASM SIMD module for fast tile comparison.
+// Layout in WASM linear memory:
+//   [0 .. frameBytes)              = new frame (contiguous, stride = width*4)
+//   [frameBytes .. 2*frameBytes)   = prev frame (contiguous, stride = width*4)
+//   [2*frameBytes .. 2*frameBytes + maxTiles) = dirty flags (1 byte per tile)
+
+interface SimdExports {
+  memory: WebAssembly.Memory;
+  tiles_differ(ptr_a: number, ptr_b: number, len: number): number;
+  diff_tiles(
+    old_buf: number, new_buf: number,
+    width: number, height: number,
+    buf_stride_px: number, tile_size: number,
+    out_dirty: number,
+  ): number;
+  copy_strided(
+    src: number, dst: number,
+    width: number, height: number,
+    src_stride_px: number,
+  ): void;
+}
+
+let simdInstance: SimdExports | null = null;
+let simdReady = false;
+let simdFailed = false;
+
+function ensureSimd(): SimdExports | null {
+  if (simdReady) return simdInstance;
+  if (simdFailed) return null;
+  try {
+    const instance = new WebAssembly.Instance(simdModule);
+    simdInstance = instance.exports as unknown as SimdExports;
+    simdReady = true;
+    return simdInstance;
+  } catch {
+    simdFailed = true;
+    return null;
+  }
+}
+
+/** Ensure WASM linear memory is large enough for `needed` bytes. */
+function ensureMemory(simd: SimdExports, needed: number): void {
+  const current = simd.memory.buffer.byteLength;
+  if (current >= needed) return;
+  const pagesNeeded = Math.ceil((needed - current) / 65536);
+  simd.memory.grow(pagesNeeded);
+}
 
 // ── Message Encoders ────────────────────────────────────────────────────────
 // Pre-allocate reusable TextEncoder (shared across all encoder calls).
@@ -171,30 +221,29 @@ export class DeltaEncoder {
     const tilesX = Math.ceil(width / TILE_SIZE);
     const tilesY = Math.ceil(height / TILE_SIZE);
     const prevFrame = this.prevFrame!;
-
-    // Create Uint32Array view over current RGBA — once per frame, not per tile
-    let rgbaU32: Uint32Array | null = null;
-    const prevU32 = this.prevU32;
-    if ((rgba.byteOffset & 3) === 0 && prevU32) {
-      rgbaU32 = new Uint32Array(rgba.buffer, rgba.byteOffset, rgba.byteLength >> 2);
-    }
+    const totalTiles = tilesX * tilesY;
 
     // Reuse pre-allocated coordinate buffer when possible
-    const neededCoords = tilesX * tilesY * 2;
+    const neededCoords = totalTiles * 2;
     if (!this.changedCoordsBuffer || this.changedCoordsBuffer.length < neededCoords) {
       this.changedCoordsBuffer = new Int32Array(neededCoords);
     }
     const changedCoords = this.changedCoordsBuffer;
     let changedCount = 0;
 
-    for (let ty = 0; ty < tilesY; ty++) {
-      for (let tx = 0; tx < tilesX; tx++) {
-        if (this.tileChanged(tx, ty, width, height, bufferWidth, rgbaU32, prevU32, rgba, prevFrame)) {
-          changedCoords[changedCount * 2] = tx;
-          changedCoords[changedCount * 2 + 1] = ty;
-          changedCount++;
-        }
-      }
+    // ── SIMD fast path: bulk tile diff via WASM ──
+    const simd = ensureSimd();
+    if (simd) {
+      changedCount = this.encodeDeltaSimd(
+        simd, width, height, bufferWidth, rgba, prevFrame,
+        tilesX, tilesY, changedCoords,
+      );
+    } else {
+      // ── JS fallback: per-tile comparison ──
+      changedCount = this.encodeDeltaJS(
+        width, height, bufferWidth, rgba, prevFrame,
+        tilesX, tilesY, changedCoords,
+      );
     }
 
     if (changedCount === 0) return null;
@@ -330,9 +379,105 @@ export class DeltaEncoder {
     this.prevHeight = height;
   }
 
+  // ── SIMD bulk tile diff ──────────────────────────────────────────────────
+  // Copies both framebuffers into WASM linear memory, calls diff_tiles (SIMD),
+  // reads back per-tile dirty flags, populates changedCoords.
+  private encodeDeltaSimd(
+    simd: SimdExports,
+    width: number, height: number, bufferWidth: number,
+    rgba: Uint8ClampedArray, prevFrame: Uint8Array,
+    tilesX: number, tilesY: number,
+    changedCoords: Int32Array,
+  ): number {
+    const frameBytes = width * height * 4;
+    const totalTiles = tilesX * tilesY;
+    // Memory layout: [new_frame | prev_frame | dirty_flags]
+    // Align dirty flags to 16 bytes for safety
+    const dirtyOffset = frameBytes * 2;
+    const needed = dirtyOffset + ((totalTiles + 15) & ~15);
+
+    ensureMemory(simd, needed);
+
+    const wasmBuf = new Uint8Array(simd.memory.buffer);
+
+    // Copy new frame into WASM memory at offset 0 (contiguous layout)
+    if (bufferWidth === width) {
+      wasmBuf.set(rgba.subarray(0, frameBytes), 0);
+    } else {
+      // Use SIMD copy_strided if buffer is already in WASM — but we need to
+      // get it there first. Do a row-by-row JS copy into WASM offset 0.
+      const rowBytes = width * 4;
+      for (let row = 0; row < height; row++) {
+        const srcOff = row * bufferWidth * 4;
+        wasmBuf.set(
+          rgba.subarray(srcOff, srcOff + rowBytes),
+          row * rowBytes,
+        );
+      }
+    }
+
+    // Copy prev frame into WASM memory at offset frameBytes (already contiguous)
+    wasmBuf.set(prevFrame.subarray(0, frameBytes), frameBytes);
+
+    // Call SIMD diff_tiles — new buffer is at 0, old buffer is at frameBytes
+    // new_buf stride = width (contiguous after our copy), old_buf stride = width
+    const dirtyCount = simd.diff_tiles(
+      frameBytes,   // old_buf (prev)
+      0,            // new_buf (current)
+      width, height,
+      width,        // buf_stride_px — both are contiguous after copy
+      TILE_SIZE,
+      dirtyOffset,
+    );
+
+    if (dirtyCount === 0) return 0;
+
+    // Read dirty flags and populate changedCoords
+    // Re-wrap: memory.buffer may have been detached by grow()
+    const dirtyFlags = new Uint8Array(simd.memory.buffer, dirtyOffset, totalTiles);
+    let count = 0;
+    for (let i = 0; i < totalTiles; i++) {
+      if (dirtyFlags[i]) {
+        const tx = i % tilesX;
+        const ty = (i / tilesX) | 0;
+        changedCoords[count * 2] = tx;
+        changedCoords[count * 2 + 1] = ty;
+        count++;
+      }
+    }
+    return count;
+  }
+
+  // ── JS fallback tile diff ─────────────────────────────────────────────────
+  // Uses cached Uint32Array views when available. No allocations in the hot path.
+  private encodeDeltaJS(
+    width: number, height: number, bufferWidth: number,
+    rgba: Uint8ClampedArray, prevFrame: Uint8Array,
+    tilesX: number, tilesY: number,
+    changedCoords: Int32Array,
+  ): number {
+    let rgbaU32: Uint32Array | null = null;
+    const prevU32 = this.prevU32;
+    if ((rgba.byteOffset & 3) === 0 && prevU32) {
+      rgbaU32 = new Uint32Array(rgba.buffer, rgba.byteOffset, rgba.byteLength >> 2);
+    }
+
+    let changedCount = 0;
+    for (let ty = 0; ty < tilesY; ty++) {
+      for (let tx = 0; tx < tilesX; tx++) {
+        if (this.tileChangedJS(tx, ty, width, height, bufferWidth, rgbaU32, prevU32, rgba, prevFrame)) {
+          changedCoords[changedCount * 2] = tx;
+          changedCoords[changedCount * 2 + 1] = ty;
+          changedCount++;
+        }
+      }
+    }
+    return changedCount;
+  }
+
   // Direct comparison — uses cached Uint32Array views when available.
   // No allocations in the hot path.
-  private tileChanged(
+  private tileChangedJS(
     tx: number, ty: number, width: number, height: number,
     bufferWidth: number,
     rgbaU32: Uint32Array | null, prevU32: Uint32Array | null,
