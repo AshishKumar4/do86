@@ -724,52 +724,38 @@ export class LinuxVM extends DurableObject<Env> {
       const mt = { calls: 0, real: 0, instr: 0, hlt: 0, activeZero: 0, preWasm: 0, lastLogTime: 0 };
       (this as any)._mt = mt;
 
-      // Instruction-counter-based microtick (enabled by Rust flush fix).
+      // ── Fixed-increment microtick for Cloudflare Workers ─────────────────
       //
-      // The Rust emulator now flushes instruction_counter before every I/O dispatch,
-      // so readInstrCounter() sees accurate deltas even during synchronous WASM execution
-      // where performance.now() is frozen (Cloudflare Workers Spectre mitigation).
+      // In Cloudflare Workers, performance.now() is frozen during synchronous
+      // WASM execution (Spectre mitigation).  v86's main_loop() uses microtick()
+      // to decide when to yield (now - start > TIME_PER_FRAME = 1.0ms).
       //
-      // MS_PER_INSTRUCTION = TIME_PER_FRAME / LOOP_COUNTER ≈ 1.0ms / 100003.
-      // After one do_many_cycles_native() call (~100K instructions), the instruction
-      // delta × MS_PER_INSTRUCTION ≈ 1.0ms, causing main_loop to yield.
-      // Result: main_loop iterates 1-2 times per yield instead of ~200 with fixed increment.
+      // Fixed increment of 0.005ms per call means ~200 microtick calls to reach
+      // 1ms (one main_loop yield).  PIT and ACPI device code also call microtick
+      // during I/O port reads — the fixed increment ensures they see monotonically
+      // advancing time regardless of interpreter vs JIT execution path.
       //
-      // Safety valve: if instruction delta is 0 (shouldn't happen with the Rust flush,
-      // but just in case), use a minimal 0.001ms increment to guarantee forward progress.
-      const TIME_PER_FRAME = 1.0;     // ms — v86's main_loop yield threshold
-      const LOOP_COUNTER = 100003;     // do_many_cycles_native iteration count
-      const MS_PER_INSTRUCTION = TIME_PER_FRAME / LOOP_COUNTER; // ~0.00001ms
-      const FALLBACK_INCREMENT = 0.001; // 1μs — safety valve when delta is 0
-      let lastInstrCount = 0;
-      
+      // On I/O boundaries (when performance.now() actually advances), we sync
+      // synthetic time to real time to prevent long-term drift.
+      const MICROTICK_INCREMENT = 0.005; // 5μs per call — ~200 calls to hit 1ms TIME_PER_FRAME
+
       (V86 as any).microtick = () => {
         mt.calls++;
         const realNow = performance.now();
         if (realNow > lastRealTime) {
           mt.real++;
           lastRealTime = realNow;
-          // I/O boundary: real time advanced. Sync synthetic time forward
-          // (never backwards for ACPI pmtimer monotonicity) and re-baseline
-          // the instruction counter.
+          // Only advance syntheticTime if real time is ahead — never go backwards.
+          // If syntheticTime already leads realNow (from synthetic increments),
+          // keep it as-is; resetting to realNow would cause time to go backwards,
+          // triggering the ACPI pmtimer dbg_assert(t > timer_last_value).
           if (realNow > syntheticTime) {
             syntheticTime = realNow;
           }
-          lastInstrCount = readInstrCounter();
         } else {
-          // Frozen performance.now() — derive time from instruction counter.
+          // Still in synchronous execution — advance synthetically.
           mt.instr++;
-          const currentInstr = readInstrCounter();
-          const delta = (currentInstr - lastInstrCount) >>> 0; // unsigned wrap-safe
-          lastInstrCount = currentInstr;
-          if (delta > 0) {
-            syntheticTime += delta * MS_PER_INSTRUCTION;
-          } else {
-            // Safety valve: instruction counter didn't advance (shouldn't happen
-            // with the Rust flush fix, but guarantees forward progress).
-            mt.activeZero++;
-            syntheticTime += FALLBACK_INCREMENT;
-          }
+          syntheticTime += MICROTICK_INCREMENT;
         }
         return syntheticTime;
       };
