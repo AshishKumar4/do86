@@ -142,6 +142,7 @@ export class LinuxVM extends DurableObject<Env> {
   // Any dirty detection immediately renders and resets the counter.
   private _cleanTicks = 0;
   private _adaptiveSkips = 0;  // perf counter: frames skipped due to idle
+  private _lastYieldRenderTime = 0;  // throttle yield-boundary renders to 30fps
   private _textSent = 0;       // text frames actually broadcast
   private _textEmpty = 0;      // text mode: getTextScreen returned empty
   private _textSame = 0;       // text mode: content unchanged
@@ -309,7 +310,7 @@ export class LinuxVM extends DurableObject<Env> {
     const [client, server] = Object.values(pair);
     server.accept();
 
-    this.sessions.set(server, { needsKeyframe: true, droppedFrames: 0, lastSendTime: 0, wantsDetailedStats: false });
+    this.sessions.set(server, { needsKeyframe: true, droppedFrames: 0, lastSendTime: 0, lastMessageTime: Date.now(), wantsDetailedStats: false });
 
     server.addEventListener("message", async (event: MessageEvent) => {
       await this.webSocketMessage(server, event.data);
@@ -984,26 +985,24 @@ export class LinuxVM extends DurableObject<Env> {
           }
           this.emulator!.run();
 
-          // ── High-throughput yield override ─────────────────────────────────
+           // ── Yield override ─────────────────────────────────────────────────
           //
-          // Two-level scheduling for maximum instruction throughput:
+          // BATCH_SIZE sync yields then 1 async break.  The async break is
+          // where setInterval callbacks (render loop), WS sends, and HTTP
+          // handlers get a chance to run.
           //
-          // 1. INSTRUCTION-COUNTER MICROTICK: Each active yield runs ~100K
-          //    instructions (one do_many_cycles_native).  At ~5 MIPS this is
-          //    ~20ms wall time per yield.
+          // BATCH_SIZE=4: 3 sync + 1 async.  Each yield ≈ 20ms wall time
+          // (one do_many_cycles_native of ~100K instructions at ~5 MIPS).
+          // Total sync blocking ≈ 80ms — well under DO CPU alarm threshold
+          // and short enough for 30fps rendering (33ms interval fires
+          // promptly after the 80ms batch).
           //
-          // 2. FIXED BATCH SIZE: Always run BATCH_SIZE yields synchronously
-          //    before breaking to the event loop.  HLT yields within the batch
-          // ── High-performance yield override ────────────────────────────────
+          // At the async boundary we also:
+          //   - render a frame (guarantees rendering is never starved)
+          //   - push detailed stats to subscribed WS clients
           //
-          // BATCH_SIZE=8: 7 sync yields + 1 async break per batch.
-          // ~87% of yields skip setTimeout entirely.
-          //
-          // Rendering: independent setInterval (startRenderLoop) at adaptive FPS.
-          // Decoupled from yield cadence so it can't starve during heavy boots.
-          //
-          // Idle detection: t > 10 = HLT → sleep min(t, 40)ms.
-          const BATCH_SIZE = 8;
+          // Idle detection: t > 10 → HLT (CPU idle), sleep min(t, 40)ms.
+          const BATCH_SIZE = 4;
           const v86Internal = (this.emulator as any).v86;
           if (v86Internal) {
             let yieldCount = 0;
@@ -1015,8 +1014,15 @@ export class LinuxVM extends DurableObject<Env> {
                 v86Internal.yield_callback(tick);
                 return;
               }
-              // Async yield: break to event loop.
-              // Push detailed stats to subscribed WS clients (throttled to 2/sec).
+              // ── Async yield: break to event loop ──
+              // Render a frame if enough time has passed (30fps cap).
+              // This guarantees VGA output stays in sync with emulator
+              // progress even if setInterval is delayed by sync batches.
+              const _yieldNow = performance.now();
+              if (_yieldNow - this._lastYieldRenderTime >= 33) {
+                this._lastYieldRenderTime = _yieldNow;
+                try { this.renderFrame(); } catch { /* non-fatal */ }
+              }
               this.pushDetailedStats();
               if (t > 10) {
                 setTimeout(() => {
@@ -1197,6 +1203,20 @@ export class LinuxVM extends DurableObject<Env> {
   private startStatsInterval(): void {
     if (this._statsInterval) clearInterval(this._statsInterval);
     this._statsInterval = setInterval(() => {
+      // ── Reap stale sessions ──
+      // If a client hasn't sent any message (heartbeat, input, etc.) for
+      // 30 seconds, consider it dead and close the WebSocket.  This prevents
+      // ghost sessions from keeping the DO alive and accumulating state.
+      const now = Date.now();
+      const STALE_TIMEOUT = 30_000;
+      for (const [ws, st] of this.sessions) {
+        if (now - st.lastMessageTime > STALE_TIMEOUT) {
+          if (st.wantsDetailedStats) this._detailedStatsSubscribers = Math.max(0, this._detailedStatsSubscribers - 1);
+          this.sessions.delete(ws);
+          try { ws.close(1000, "heartbeat timeout"); } catch { /* already closed */ }
+        }
+      }
+
       if (!this.booted || this.sessions.size === 0) return;
       try {
         const stats = this.collectStats();
@@ -1317,7 +1337,7 @@ export class LinuxVM extends DurableObject<Env> {
 
    /** Adaptive render: 30fps when active, ~2fps when idle.
     *  At 33ms interval, 15 ticks ≈ 500ms ≈ 2fps. */
-   private static readonly IDLE_SKIP_THRESHOLD = 3;   // clean ticks before throttling
+   private static readonly IDLE_SKIP_THRESHOLD = 10;  // clean ticks before throttling (~330ms at 30fps)
    private static readonly IDLE_RENDER_EVERY   = 15;  // render every Nth tick when idle (~2fps)
 
    private renderFrame(): void {
@@ -1503,6 +1523,10 @@ export class LinuxVM extends DurableObject<Env> {
     try {
       if (message instanceof ArrayBuffer) return;
 
+      // Track client liveness for heartbeat timeout
+      const state = this.sessions.get(ws);
+      if (state) state.lastMessageTime = Date.now();
+
       let msg: ClientMessage;
       try { msg = JSON.parse(message); }
       catch { return; /* ignore malformed JSON */ }
@@ -1556,7 +1580,11 @@ export class LinuxVM extends DurableObject<Env> {
         return;
       }
 
-      if (msg.type === "heartbeat") return;
+      if (msg.type === "heartbeat") {
+        const state = this.sessions.get(ws);
+        if (state) state.lastMessageTime = Date.now();
+        return;
+      }
 
       // ── Stats subscription ─────────────────────────────────────────────
       if (msg.type === "subscribe_stats") {

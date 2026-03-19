@@ -13,7 +13,7 @@ export const MSG_DETAILED_STATS = 6;
 export const TILE_SIZE = 64;
 export const FPS_MIN = 2;
 export const FPS_MAX = 30;
-export const FPS_DEFAULT = 8;
+export const FPS_DEFAULT = 30;
 export const LARGE_FRAME_BYTES = 50_000;
 export const MAX_RESOLUTION = 1280 * 1024;
 
@@ -54,6 +54,8 @@ export interface ClientState {
   needsKeyframe: boolean;
   droppedFrames: number;
   lastSendTime: number;
+  /** Last time we received ANY message from this client (heartbeat, input, etc.) */
+  lastMessageTime: number;
   /** When true, this client receives MSG_DETAILED_STATS at high frequency */
   wantsDetailedStats: boolean;
 }
