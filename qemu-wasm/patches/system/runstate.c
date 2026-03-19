@@ -1518,10 +1518,12 @@ int wasm_step(int iterations)
          * We avoid main_loop_wait() here because it triggers ASYNCIFY
          * unwinds via AIO coroutine processing, which breaks the step pump.
          * Instead, directly run the timer subsystem. */
-        /* Run timers every 256 TBs or on HLT */
+        /* Run timers + BHs every 256 TBs or on HLT.
+         * BHs are needed for IDE interrupt delivery (CDROM ATAPI). */
         if ((i & 0xFF) == 0xFF || (first_cpu && first_cpu->halted)) {
             qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
             qemu_clock_run_timers(QEMU_CLOCK_REALTIME);
+            aio_bh_poll(qemu_get_aio_context());
         }
 
         /* Flush VGA + display update every 4096 TBs (expensive) */

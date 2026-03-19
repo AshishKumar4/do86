@@ -187,9 +187,38 @@ static int cd_read_sector(IDEState *s)
     }
 
     buf = (s->cd_sector_size == 2352) ? s->io_buffer + 16 : s->io_buffer;
-    qemu_iovec_init_buf(&s->qiov, buf, ATAPI_SECTOR_SIZE);
 
     trace_cd_read_sector(s->lba);
+
+#ifdef __EMSCRIPTEN__
+    /* Direct MEMFS read — bypass async block layer */
+    {
+        int64_t offset = (int64_t)s->lba << ATAPI_SECTOR_BITS;
+        int n = EM_ASM_INT({
+            try {
+                var data = Module.FS.readFile('/disk.iso', {encoding:'binary'});
+                var off = $0; var len = $1; var dst = $2;
+                if (off + len > data.length) len = data.length - off;
+                if (off >= data.length || len <= 0) return 0;
+                for (var i = 0; i < len; i++) Module.HEAPU8[dst + i] = data[off + i];
+                return len;
+            } catch(e) { return -1; }
+        }, (int)offset, (int)ATAPI_SECTOR_SIZE, (int)buf);
+
+        if (s->cd_sector_size == 2352 && n > 0) {
+            cd_data_to_raw(s->io_buffer, s->lba);
+        }
+
+        block_acct_start(blk_get_stats(s->blk), &s->acct,
+                         ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
+        block_acct_done(blk_get_stats(s->blk), &s->acct);
+
+        /* Call completion callback directly */
+        cd_read_sector_cb(s, n >= 0 ? 0 : -EIO);
+        return 0;
+    }
+#else
+    qemu_iovec_init_buf(&s->qiov, buf, ATAPI_SECTOR_SIZE);
 
     block_acct_start(blk_get_stats(s->blk), &s->acct,
                      ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
@@ -199,6 +228,7 @@ static int cd_read_sector(IDEState *s)
 
     s->status |= BUSY_STAT;
     return 0;
+#endif
 }
 
 void ide_atapi_cmd_ok(IDEState *s)
