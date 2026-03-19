@@ -290,12 +290,12 @@ export class QemuStandaloneDO extends DurableObject<QemuStandaloneEnv> {
       renderCount++;
 
       try {
-        if (renderCount <= 3 || renderCount % 500 === 0) {
-          const graphical = this.qemu.isGraphicalMode();
-          console.log(`${LOG_PREFIX} render #${renderCount}: graphical=${graphical} clients=${this.sessions.size}`);
-        }
-
         const frame = this.qemu.getScreenFrame();
+        if (renderCount <= 5) {
+          const graphical = this.qemu.isGraphicalMode();
+          this.broadcast(encodeSerialData(
+            `[RENDER] #${renderCount} graphical=${graphical} frame=${frame ? frame.byteLength : 'null'}\n`));
+        }
         if (!frame || frame.byteLength < 12) return;
 
         // Parse header: [width:u32, height:u32, bufferWidth:u32]

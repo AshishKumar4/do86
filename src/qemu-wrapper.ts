@@ -286,16 +286,13 @@ export class QEMUWrapper {
           if (stepCount <= 5 || stepCount % 5000 === 0) {
             console.log(`${LOG_PREFIX} wasm_step #${stepCount} returned ${result}`);
           }
-          // Display diagnostic — check surface state periodically
-          if (stepCount === 100 || stepCount === 1000 || stepCount % 10000 === 0) {
-            const sp = mod._wasm_get_display_surface_data?.() ?? -1;
-            const dw = mod._wasm_get_display_width?.() ?? -1;
-            const dh = mod._wasm_get_display_height?.() ?? -1;
-            const ds = mod._wasm_get_display_stride?.() ?? -1;
-            console.log(`${LOG_PREFIX} display: surface=${sp} ${dw}x${dh} stride=${ds}`);
-            if (sp <= 0 && mod._wasm_display_init) {
-              mod._wasm_display_init(); // retry init
-            }
+          // Display: ensure surface is initialized
+          if (stepCount === 50 || stepCount === 500) {
+            if (mod._wasm_display_init) mod._wasm_display_init();
+            const sp = mod._wasm_get_display_surface_data?.() ?? 0;
+            const dw = mod._wasm_get_display_width?.() ?? 0;
+            const dh = mod._wasm_get_display_height?.() ?? 0;
+            console.log(`${LOG_PREFIX} display: ptr=${sp} ${dw}x${dh}`);
           }
           if (result > 0) {
             console.log(`${LOG_PREFIX} QEMU exit requested (status=${result})`);
@@ -309,10 +306,11 @@ export class QEMUWrapper {
           return;
         }
 
-        // Schedule next step — setTimeout(0) runs after the current event
-        // loop tick, giving HTTP/WS handlers a chance to process.
+        // Schedule next step. Use setTimeout(4) instead of 0 to let
+        // render loop (setInterval) and HTTP/WS handlers fire between steps.
+        // setTimeout(0) in Workers resolves to ~1ms but starves setInterval.
         scheduleStep();
-      }, 0);
+      }, 4);
     };
     scheduleStep();
 
@@ -882,6 +880,9 @@ export class QEMUWrapper {
     const bpp = 4; // BGRA
     const bufferWidth = stride / bpp;
     const heap = this.module.HEAPU8;
+
+    // Surface is in WASM linear memory — validated by bridge exports
+    // No OOB check needed; WASM memory is contiguous and the pointer is valid
 
     // Build frame: 12-byte header + RGBA pixel data
     const byteLen = bufferWidth * height * 4;
