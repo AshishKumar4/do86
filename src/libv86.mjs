@@ -16318,12 +16318,11 @@ VGAScreen.prototype.screen_fill_buffer = function() {
     let min_y = 0;
     let max_y = this.svga_height;
     if (this.svga_bpp === 8) {
-      const buffer = new Int32Array(this.cpu.wasm_memory.buffer, this.dest_buffet_offset, this.screen_width * this.screen_height);
-      const svga_memory = new Uint8Array(this.cpu.wasm_memory.buffer, this.svga_memory.byteOffset, this.vga_memory_size);
-      for (var i = 0; i < buffer.length; i++) {
-        var color = this.vga256_palette[svga_memory[i]];
-        buffer[i] = color & 65280 | color << 16 | color >> 16 | 4278190080;
-      }
+      const palette_ptr = this.cpu.svga_palette_get_ptr();
+      const wasm_palette = new Int32Array(this.cpu.wasm_memory.buffer, palette_ptr, 256);
+      wasm_palette.set(this.vga256_palette);
+      const pixel_count = this.screen_width * this.screen_height;
+      this.cpu.svga_fill_pixel_buffer_8bpp(pixel_count);
     } else {
       this.cpu.svga_fill_pixel_buffer(this.svga_bpp, this.svga_offset);
       const bytes_per_pixel = this.svga_bpp === 15 ? 2 : this.svga_bpp / 8;
@@ -19100,6 +19099,8 @@ CPU.prototype.wasm_patch = function() {
   this.svga_allocate_memory = get_import("svga_allocate_memory");
   this.svga_allocate_dest_buffer = get_import("svga_allocate_dest_buffer");
   this.svga_fill_pixel_buffer = get_import("svga_fill_pixel_buffer");
+  this.svga_fill_pixel_buffer_8bpp = get_import("svga_fill_pixel_buffer_8bpp");
+  this.svga_palette_get_ptr = get_import("svga_palette_get_ptr");
   this.svga_mark_dirty = get_import("svga_mark_dirty");
   this.get_pic_addr_master = get_import("get_pic_addr_master");
   this.get_pic_addr_slave = get_import("get_pic_addr_slave");
