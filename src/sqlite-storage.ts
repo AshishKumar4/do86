@@ -127,7 +127,29 @@ export class SqliteStorage {
       data     BLOB NOT NULL,
       PRIMARY KEY (device, block_id)
     )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS do_config (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )`);
     this.initialized = true;
+  }
+
+  /** Read a config value from the do_config table */
+  getConfig(key: string): string | null {
+    this.init();
+    const rows = [...this.sql.exec(
+      `SELECT value FROM do_config WHERE key = ?`, key,
+    )];
+    return rows.length > 0 ? (rows[0].value as string) : null;
+  }
+
+  /** Write a config value to the do_config table */
+  setConfig(key: string, value: string): void {
+    this.init();
+    this.sql.exec(
+      `INSERT OR REPLACE INTO do_config (key, value) VALUES (?, ?)`,
+      key, value,
+    );
   }
 
   readBlock(device: string, blockId: number): Uint8Array | null {
