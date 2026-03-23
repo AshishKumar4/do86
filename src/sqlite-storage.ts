@@ -3,6 +3,7 @@ import {
   HOT_CACHE_MAX, CACHE_DEVICE, LOG_PREFIX,
   type SqlHandle,
 } from "./types";
+import type { ErrorTracker } from "./error-tracker";
 
 // ── ChunkedBlobStore ────────────────────────────────────────────────────────
 // Generic chunked binary blob storage on DO SQLite.
@@ -372,6 +373,247 @@ export class SQLiteDiskCache {
   get_buffer(callback: (buf: ArrayBuffer | undefined) => void): void { this.inner.get_buffer(callback); }
   get_state(): unknown { return this.inner.get_state(); }
   set_state(state: unknown): void { this.inner.set_state(state); }
+}
+
+// ── SqliteDiskBuffer ────────────────────────────────────────────────────────
+//
+// Implements the v86 disk buffer interface (get/set/load/byteLength) backed by
+// DO SQLite instead of an in-memory ArrayBuffer.  This replaces the 50MB
+// ArrayBuffer that SyncBuffer holds for large ISOs (e.g. DSL Linux) with
+// on-demand SQLite reads through a small LRU cache.
+//
+// Memory savings for DSL: 50MB ArrayBuffer → ~2MB LRU cache.
+//
+// v86's IDE controller calls buffer.get(start, len, callback) synchronously.
+// DO SQLite reads (ctx.storage.sql.exec) are synchronous, so we can serve
+// reads inline without breaking the IDE's callback expectations.
+//
+// The duck-typing check in v86's add_file (starter.js line ~395):
+//   if(file.get && file.set && file.load) { use directly as loadable }
+// means we pass this object as v86Config.cdrom (not wrapped in {buffer:...}).
+//
+// Chunk size: 64KB balances SQLite row overhead vs read amplification.
+// LRU cache: 32 chunks × 64KB = 2MB hot window.
+
+const DISK_CHUNK_SIZE = 64 * 1024;        // 64KB per SQLite row
+const DISK_LRU_MAX    = 32;               // 32 chunks = 2MB cache
+const DISK_DEVICE     = "disk_image";      // device key in block_storage table
+
+export class SqliteDiskBuffer {
+  byteLength: number;
+  onload:     ((e: unknown) => void) | undefined;
+  onprogress: ((e: unknown) => void) | undefined;
+
+  private storage: SqliteStorage;
+  private name: string;                    // unique name (e.g. "dsl-4.11.rc2.iso")
+
+  // ── LRU cache: Map iteration order = insertion order ──────────────────
+  // On hit we delete+re-insert to move to end (most recently used).
+  // Eviction removes from the front (least recently used).
+  private lru = new Map<number, Uint8Array>();
+
+  // ── Write overlay: guest writes go here, overlaid on reads ────────────
+  // Map<chunkId, Uint8Array> — only chunks that were modified by set().
+  // Flushed to SQLite periodically (or we could write-through).
+  private dirty = new Map<number, Uint8Array>();
+
+  // ── Stats ─────────────────────────────────────────────────────────────
+  private _hits  = 0;
+  private _misses = 0;
+  private _writes = 0;
+  private _readErrors = 0;
+  private _writeErrors = 0;
+
+  /** Shared error tracker — set after construction. */
+  _errors: ErrorTracker | null = null;
+
+  constructor(storage: SqliteStorage, name: string, totalSize: number) {
+    this.storage = storage;
+    this.name    = name;
+    this.byteLength = totalSize;
+  }
+
+  // ── Ingest: chunk a raw ArrayBuffer into SQLite ───────────────────────
+  // Call once after downloading the ISO.  After this returns, the original
+  // ArrayBuffer can be freed — all data lives in SQLite.
+  ingest(data: ArrayBuffer): void {
+    this.storage.init();
+    const bytes = new Uint8Array(data);
+    const chunkCount = Math.ceil(bytes.length / DISK_CHUNK_SIZE);
+
+    // Clear any previous data for this image name
+    this.storage.sql.exec(
+      `DELETE FROM block_storage WHERE device = ?`,
+      `${DISK_DEVICE}:${this.name}`,
+    );
+
+    for (let i = 0; i < chunkCount; i++) {
+      const start = i * DISK_CHUNK_SIZE;
+      const end   = Math.min(start + DISK_CHUNK_SIZE, bytes.length);
+      const chunk = bytes.slice(start, end);
+      this.storage.writeBlock(`${DISK_DEVICE}:${this.name}`, i, new Uint8Array(chunk));
+    }
+
+    console.log(
+      `${LOG_PREFIX} SqliteDiskBuffer: ingested ${this.name}: ` +
+      `${(bytes.length / 1024 / 1024).toFixed(1)}MB in ${chunkCount} × ${DISK_CHUNK_SIZE / 1024}KB chunks`,
+    );
+  }
+
+  /** Check if this image is already fully stored in SQLite */
+  hasData(): boolean {
+    this.storage.init();
+    // Check for chunk 0 — if present, assume the image was fully ingested
+    // (ingest deletes all chunks first, then writes sequentially)
+    const row = this.storage.readBlock(`${DISK_DEVICE}:${this.name}`, 0);
+    return row !== null;
+  }
+
+  // ── v86 buffer interface ──────────────────────────────────────────────
+
+  load(): void {
+    this.storage.init();
+    this.onload?.({});
+  }
+
+  get(offset: number, len: number, callback: (data: Uint8Array) => void): void {
+    try {
+      const result = new Uint8Array(len);
+      let pos = 0;
+
+      while (pos < len) {
+        const currentOffset = offset + pos;
+        const chunkId       = Math.floor(currentOffset / DISK_CHUNK_SIZE);
+        const chunkOffset   = currentOffset % DISK_CHUNK_SIZE;
+        const bytesFromChunk = Math.min(DISK_CHUNK_SIZE - chunkOffset, len - pos);
+
+        const chunk = this.getChunk(chunkId);
+        result.set(chunk.subarray(chunkOffset, chunkOffset + bytesFromChunk), pos);
+        pos += bytesFromChunk;
+      }
+
+      callback(result);
+    } catch (e) {
+      this._readErrors++;
+      this._errors?.record("disk", `SqliteDiskBuffer.get failed at offset=0x${offset.toString(16)} len=${len}`, e);
+      // Return zeros so IDE doesn't hang waiting for a callback
+      callback(new Uint8Array(len));
+    }
+  }
+
+  set(offset: number, data: Uint8Array, callback: () => void): void {
+    try {
+      let pos = 0;
+      while (pos < data.length) {
+        const currentOffset = offset + pos;
+        const chunkId       = Math.floor(currentOffset / DISK_CHUNK_SIZE);
+        const chunkOffset   = currentOffset % DISK_CHUNK_SIZE;
+        const bytesInChunk  = Math.min(DISK_CHUNK_SIZE - chunkOffset, data.length - pos);
+
+        const chunk = this.getChunk(chunkId);
+        let dirtyChunk = this.dirty.get(chunkId);
+        if (!dirtyChunk) {
+          dirtyChunk = new Uint8Array(DISK_CHUNK_SIZE);
+          dirtyChunk.set(chunk);
+          this.dirty.set(chunkId, dirtyChunk);
+          this.lru.set(chunkId, dirtyChunk);
+        }
+        dirtyChunk.set(data.subarray(pos, pos + bytesInChunk), chunkOffset);
+        pos += bytesInChunk;
+      }
+      this._writes++;
+
+      for (const [chunkId, chunk] of this.dirty) {
+        this.storage.writeBlock(`${DISK_DEVICE}:${this.name}`, chunkId, chunk);
+      }
+      this.dirty.clear();
+    } catch (e) {
+      this._writeErrors++;
+      this._errors?.record("disk", `SqliteDiskBuffer.set failed at offset=0x${offset.toString(16)} len=${data.length}`, e);
+    }
+    callback();
+  }
+
+  get_buffer(callback: (buf: ArrayBuffer | undefined) => void): void {
+    // Cannot return the full buffer — that's the whole point
+    callback(undefined);
+  }
+
+  get_state(): unknown[] {
+    // Flush any pending dirty chunks
+    for (const [chunkId, chunk] of this.dirty) {
+      this.storage.writeBlock(`${DISK_DEVICE}:${this.name}`, chunkId, chunk);
+    }
+    this.dirty.clear();
+    // State: just the size (data lives in SQLite, survives DO eviction)
+    return [this.byteLength];
+  }
+
+  set_state(state: unknown[]): void {
+    const arr = state as number[];
+    if (arr?.[0]) this.byteLength = arr[0];
+    this.lru.clear();
+    this.dirty.clear();
+  }
+
+  // ── Stats for diagnostics ──────────────────────────────────────────────
+
+  get stats() {
+    return {
+      hits: this._hits,
+      misses: this._misses,
+      writes: this._writes,
+      readErrors: this._readErrors,
+      writeErrors: this._writeErrors,
+      lruSize: this.lru.size,
+      lruMaxSize: DISK_LRU_MAX,
+      chunkSize: DISK_CHUNK_SIZE,
+    };
+  }
+
+  // ── Internal: chunk read with LRU cache ───────────────────────────────
+
+  private getChunk(chunkId: number): Uint8Array {
+    // Check LRU
+    const cached = this.lru.get(chunkId);
+    if (cached) {
+      this._hits++;
+      // Move to end (MRU position)
+      this.lru.delete(chunkId);
+      this.lru.set(chunkId, cached);
+      return cached;
+    }
+
+    // Cache miss — read from SQLite
+    this._misses++;
+    const stored = this.storage.readBlock(`${DISK_DEVICE}:${this.name}`, chunkId);
+
+    let chunk: Uint8Array;
+    if (stored) {
+      // Stored chunk may be smaller than DISK_CHUNK_SIZE (last chunk)
+      if (stored.length === DISK_CHUNK_SIZE) {
+        chunk = stored;
+      } else {
+        chunk = new Uint8Array(DISK_CHUNK_SIZE);
+        chunk.set(stored.subarray(0, Math.min(stored.length, DISK_CHUNK_SIZE)));
+      }
+    } else {
+      // Missing chunk — return zeros (shouldn't happen for a fully ingested image)
+      chunk = new Uint8Array(DISK_CHUNK_SIZE);
+    }
+
+    // Evict LRU if needed
+    if (this.lru.size >= DISK_LRU_MAX) {
+      // Delete the first (oldest) entry
+      const firstKey = this.lru.keys().next().value;
+      if (firstKey !== undefined) {
+        this.lru.delete(firstKey);
+      }
+    }
+
+    this.lru.set(chunkId, chunk);
+    return chunk;
+  }
 }
 
 // ── Asset pack utilities ────────────────────────────────────────────────────

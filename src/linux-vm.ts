@@ -13,8 +13,9 @@ import {
 } from "./types";
 import { DOScreenAdapter } from "./screen-adapter";
 import { DeltaEncoder, encodeSerialData, encodeStats, encodeDetailedStats, encodeStatus, encodeTextScreen } from "./delta-encoder";
-import { SqliteStorage, SqliteImageCache, SQLiteBlockDevice, unpackAssets } from "./sqlite-storage";
+import { SqliteStorage, SqliteImageCache, SQLiteBlockDevice, SqliteDiskBuffer, unpackAssets } from "./sqlite-storage";
 import { SqlPageStore, type PageStoreConfig } from "./sql-page-store";
+import { ErrorTracker } from "./error-tracker";
 import type { Env } from "./index";
 
 // ── VM configuration ──────────────────────────────────────────────────────────
@@ -29,45 +30,47 @@ import type { Env } from "./index";
 //
 // *** CRITICAL: memory_size passed to v86 MUST equal WASM_MB (not RESIDENT_MB).
 // in_mapped_range(addr) returns true when addr >= memory_size.  If memory_size
-// were set to RESIDENT_MB (32 MB), every frame offset the hot pool returns would
+// were set to RESIDENT_MB (16 MB), every frame offset the hot pool returns would
 // be ≥ memory_size, triggering the MMIO path instead of direct mem8 access.
-// Setting memory_size = WASM_MB (64 MB) keeps all hot pool offsets below the
+// Setting memory_size = WASM_MB (48 MB) keeps all hot pool offsets below the
 // threshold, so in_mapped_range() correctly returns false for them.
 //
 // DO isolate memory budget (128 MB hard limit):
-//   WASM mem8 (resident + pool): WASM_MB   = 64 MB  (allocated by allocate_memory)
+//   WASM mem8 (resident + pool): WASM_MB   = 48 MB  (allocated by allocate_memory)
 //   VGA SVGA buffer             : VGA_MB   =  8 MB  (svga_allocate_memory, separate)
 //   WASM heap overhead          :          ~ 20 MB  (JIT code cache, TLB tables)
 //   JS heap                     :          ~ 10 MB  (emulator objects, WS sessions)
 //   ──────────────────────────────────────────────
-//   Total                                  ~102 MB  ← safe below 128 MB limit
+//   Total                                  ~ 70 MB  ← generous headroom below 128 MB
 //
-// Guest sees LOGICAL_MB via CMOS/e820 (demand-paged by SqlPageStore).
+// Guest sees per-image logicalMemory via CMOS/e820 (demand-paged by SqlPageStore).
 // RESIDENT_MB must equal PAGED_THRESHOLD in stratum/src/rust/cpu/memory.rs.
 const VM_CONFIG = {
   /** GPA threshold: below this, pages are always resident in mem8[0..RESIDENT_MB).
    *  MUST match PAGED_THRESHOLD in stratum/src/rust/cpu/memory.rs. */
-  RESIDENT_MB:   32,
+  RESIDENT_MB:   16,
   /** Hot page frame pool: number of 4 KB frames.
    *  Pool occupies mem8[RESIDENT_MB .. RESIDENT_MB + HOT_FRAMES×4KB).
    *  HOT_POOL_MB = HOT_FRAMES × 4 / 1024 = 32 MB. */
   HOT_FRAMES:    8192,
   /** Total WASM linear memory allocation (MB): RESIDENT_MB + HOT_POOL_MB.
    *  This is the value passed as memory_size to v86.  Must cover the full
-   *  hot pool so in_mapped_range() never fires for pool frame offsets. */
-  WASM_MB:       64,   // = RESIDENT_MB(32) + HOT_FRAMES×4KB/1MB(32)
+   *  hot pool so in_mapped_range() never fires for pool frame offsets.
+   *  Standardized to 32 MB for all images to fit within the 128 MB DO limit. */
+  WASM_MB:       48,   // = RESIDENT_MB(16) + HOT_FRAMES×4KB/1MB(32)
   /** VGA SVGA framebuffer size (MB), allocated separately by svga_allocate_memory. */
   VGA_MB:         8,
   /** Default logical RAM reported to guest BIOS/CMOS (MB).
-   *  GPAs in [WASM_MB, LOGICAL_MB) are demand-paged from DO SQLite.
-   *  Default = WASM_MB (64) so SeaBIOS ACPI tables stay within WASM allocation.
-   *  Per-image logicalMemory overrides this (e.g., AqeousOS uses 3584). */
-  LOGICAL_MB:    64,
+   *  Per-image logicalMemory overrides this.  GPAs in [WASM_MB, logicalMemory)
+   *  are demand-paged from DO SQLite via swap_page_in.
+   *  Default = WASM_MB (48) so SeaBIOS ACPI tables stay within WASM allocation
+   *  for OSes that don't specify logicalMemory. */
+  LOGICAL_MB:    32,
   /** Default SMP CPU count: 1 = BSP only.  Per-image cpuCount overrides. */
   CPU_COUNT:      1,
   /** PageStore tuning forwarded to SqlPageStore constructor. */
   PAGE_STORE: {
-    maxFrames:    8192,  // must equal HOT_FRAMES above
+    maxFrames:    8192,   // must equal HOT_FRAMES above
     maxEvictScan: 256,
   } satisfies Partial<PageStoreConfig>,
 } as const;
@@ -96,16 +99,16 @@ interface ImageDef {
 // linux4 is text-only, no demand-paging, smaller budget.
 const { WASM_MB, VGA_MB } = VM_CONFIG;
 const IMAGES: Record<string, ImageDef> = {
-  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: WASM_MB, vgaMemory: VGA_MB, label: "KolibriOS",
+  kolibri:    { file: "kolibri.img",             drive: "fda",       memory: WASM_MB, vgaMemory: VGA_MB, logicalMemory: 64,   label: "KolibriOS",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: WASM_MB, vgaMemory: VGA_MB, label: "AqeousOS", noSnapshot: true, ahciDiskSize: 32, logicalMemory: 3584, cpuCount: 2 },
-  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 15" },
-  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "TinyCore 11" },
-  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "DSL Linux",
+  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: WASM_MB, vgaMemory: VGA_MB, logicalMemory: 3584, label: "AqeousOS", noSnapshot: true, ahciDiskSize: 32, cpuCount: 2 },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom",     memory: WASM_MB, vgaMemory: VGA_MB, logicalMemory: 128,  label: "TinyCore 15" },
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom",     memory: WASM_MB, vgaMemory: VGA_MB, logicalMemory: 128,  label: "TinyCore 11" },
+  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom",     memory: WASM_MB, vgaMemory: 4,      logicalMemory: 256,  label: "DSL Linux",
                 url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
-  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: WASM_MB, vgaMemory: VGA_MB, label: "HelenOS",
+  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom",     memory: WASM_MB, vgaMemory: 4,      logicalMemory: 128,  label: "HelenOS",
                 url: "https://www.helenos.org/releases/HelenOS-0.14.1-ia32.iso" },
-  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,      vgaMemory: 2,      label: "Linux 4 (Text)",
+  linux4:     { file: "linux4.iso",              drive: "cdrom",     memory: WASM_MB, vgaMemory: 2,      logicalMemory: 64,   label: "Linux 4 (Text)",
                 url: "https://copy.sh/v86/images/linux4.iso" },
 };
 
@@ -153,6 +156,10 @@ export class LinuxVM extends DurableObject<Env> {
   private storage: SqliteStorage | null = null;
   private imageCache: SqliteImageCache | null = null;
   private swapDevice: SQLiteBlockDevice | null = null;
+  private _sqliteDiskBuffer: SqliteDiskBuffer | null = null;
+
+  // ── Error tracking ────────────────────────────────────────────────────
+  readonly errors = new ErrorTracker();
 
   // ── Origin tracking (for post-eviction ASSETS.fetch recovery) ───────────
   // Captured from the first request URL so selfLoadAssets() can build full URLs.
@@ -232,8 +239,8 @@ export class LinuxVM extends DurableObject<Env> {
       if (this._statsInterval) { clearInterval(this._statsInterval); this._statsInterval = null; }
       if (this.snapshotTimer) { clearTimeout(this.snapshotTimer); this.snapshotTimer = null; }
       if (this.emulator) {
-        try { (this.emulator as any).stop?.(); } catch { /* ok */ }
-        try { (this.emulator as any).destroy?.(); } catch { /* ok */ }
+        try { (this.emulator as any).stop?.(); } catch (e) { this.errors.record("v86", "emulator.stop() failed", e); }
+        try { (this.emulator as any).destroy?.(); } catch (e) { this.errors.record("v86", "emulator.destroy() failed", e); }
       }
       this.emulator = null;
       this.booted = false;
@@ -282,7 +289,7 @@ export class LinuxVM extends DurableObject<Env> {
             const meta = JSON.parse(new TextDecoder().decode(metadataRaw));
             this.imageKey = meta.imageKey || null;
           } catch (e) {
-            console.error(`${LOG_PREFIX} Failed to parse init metadata:`, e);
+            this.errors.record("boot", "Failed to parse init metadata", e);
           }
         }
         return Response.json({ status: "assets_loaded", count: this.cachedAssets.size, imageKey: this.imageKey });
@@ -408,6 +415,8 @@ export class LinuxVM extends DurableObject<Env> {
       effectiveFps:  uptimeMs > 0 ? +(p.framesSent / (uptimeMs / 1000)).toFixed(1) : 0,
       // Page store
       pageStore:   ps,
+      // Disk buffer
+      diskBuffer:  this._sqliteDiskBuffer?.stats ?? null,
       // JIT
       jit:         this.getJitBlockCount(),
       mt:          (this as any)._mt ?? null,
@@ -421,6 +430,8 @@ export class LinuxVM extends DurableObject<Env> {
         totalActiveYields: this._yieldDiag.totalActiveYields,
         recentBatches:    this._yieldDiag.batches,
       } : null,
+      // Error observability
+      errors: this.errors.snapshot(),
     };
   }
 
@@ -551,7 +562,7 @@ export class LinuxVM extends DurableObject<Env> {
     const data = encodeDetailedStats(stats);
     for (const [ws, state] of this.sessions) {
       if (!state.wantsDetailedStats) continue;
-      try { ws.send(data); } catch { /* non-fatal */ }
+      try { ws.send(data); } catch (e) { this.errors.record("ws", "pushDetailedStats send failed", e); }
     }
   }
 
@@ -573,6 +584,7 @@ export class LinuxVM extends DurableObject<Env> {
       let diskUrl: string | null = null;
       let diskFile: string | null = null;
       let ahciDiskSize: number | undefined;
+      let sqliteDisk: SqliteDiskBuffer | null = null;
       let logicalMemoryMB = VM_CONFIG.LOGICAL_MB;
       let cpuCount = VM_CONFIG.CPU_COUNT;
 
@@ -591,14 +603,36 @@ export class LinuxVM extends DurableObject<Env> {
           if (meta.ahciDiskSize) ahciDiskSize = meta.ahciDiskSize;
           if (meta.logicalMemory) logicalMemoryMB = meta.logicalMemory;
           if (meta.cpuCount) cpuCount = meta.cpuCount;
+          // Safety: if no explicit logicalMemory was set and memory < WASM_MB,
+          // clamp logical to memory to avoid ACPI tables landing in unmapped
+          // demand-paged region with no usable hot pool frames.
+          if (!meta.logicalMemory && memorySizeMB < VM_CONFIG.WASM_MB) {
+            logicalMemoryMB = memorySizeMB;
+          }
+          // SqliteDiskBuffer recovery: disk data is in SQLite, not the assets map
+          if (meta.sqliteDisk && meta.sqliteDiskSize) {
+            this.ensureStorage();
+            const recoverCacheName = meta.diskFile || imageKey;
+            sqliteDisk = new SqliteDiskBuffer(this.storage!, recoverCacheName, meta.sqliteDiskSize);
+            console.log(`${LOG_PREFIX} Recovered SqliteDiskBuffer from metadata: ${recoverCacheName} (${(meta.sqliteDiskSize / 1024 / 1024).toFixed(1)}MB)`);
+          }
         } catch (e) {
-          console.error(`${LOG_PREFIX} Failed to parse boot metadata:`, e);
+          this.errors.record("boot", "Failed to parse boot metadata", e);
         }
       }
       this.imageKey = imageKey;
 
       // Always initialize storage early (needed for snapshots and image cache)
       this.ensureStorage();
+
+      // Persist imageKey to SQLite so post-eviction recovery knows which OS
+      // to reload (Bug fix: imageKey was in-memory only, lost on DO eviction,
+      // causing selfLoadAssets to default to "kolibri").
+      try {
+        this.storage!.setConfig("imageKey", imageKey);
+      } catch (e) {
+        this.errors.record("sqlite", "Failed to persist imageKey", e);
+      }
 
       // ── Handle fresh boot / noSnapshot (clear cached snapshot) ────────
       const metaForFresh = metadataRaw ? JSON.parse(new TextDecoder().decode(metadataRaw)) : {};
@@ -622,38 +656,69 @@ export class LinuxVM extends DurableObject<Env> {
       }
 
       // ── Resolve disk image ────────────────────────────────────────────
-      let disk = this.cachedAssets.get("disk") || null;
-      if (!disk && diskUrl) {
-        const cacheName = diskFile || imageKey;
+      // For large images (>10MB), we use SqliteDiskBuffer: the ISO is chunked
+      // into SQLite and served on-demand with a 2MB LRU cache. This replaces
+      // holding a 50MB ArrayBuffer in memory. For small images we keep the
+      // original SyncBuffer path (faster, fits in memory).
+      const SQLITE_DISK_THRESHOLD = 10 * 1024 * 1024; // 10MB
 
-        if (this.imageCache!.images.has(cacheName)) {
-          console.log(`${LOG_PREFIX} Cache hit for ${cacheName}`);
+      let disk: ArrayBuffer | null = this.cachedAssets.get("disk") || null;
+      const cacheName = diskFile || imageKey;
+
+      if (!disk && diskUrl) {
+        // Check if SqliteDiskBuffer already has the image from a previous boot
+        const probe = new SqliteDiskBuffer(this.storage!, cacheName, 0);
+        if (probe.hasData()) {
+          // Read total size from do_config (stored during ingest)
+          const sizeStr = this.storage!.getConfig(`disk_size:${cacheName}`);
+          if (sizeStr) {
+            const totalSize = parseInt(sizeStr, 10);
+            sqliteDisk = new SqliteDiskBuffer(this.storage!, cacheName, totalSize);
+            console.log(`${LOG_PREFIX} SqliteDiskBuffer: cache hit for ${cacheName} (${(totalSize / 1024 / 1024).toFixed(1)}MB)`);
+            if (!savedState) this.broadcast(encodeStatus(`booting: ${label} (cached)`));
+          }
+        }
+
+        // Fall back to ChunkedBlobStore cache for small images
+        if (!sqliteDisk && this.imageCache!.images.has(cacheName)) {
+          console.log(`${LOG_PREFIX} Image cache hit for ${cacheName}`);
           if (!savedState) this.broadcast(encodeStatus(`booting: ${label} (cached)`));
           disk = this.imageCache!.images.get(cacheName);
         }
 
-        if (!disk) {
+        if (!sqliteDisk && !disk) {
           console.log(`${LOG_PREFIX} Fetching ${cacheName} from ${diskUrl}`);
           this.broadcast(encodeStatus(`downloading: ${label}`));
           const resp = await this.cachedFetch(diskUrl);
           if (!resp.ok) throw new Error(`Failed to fetch ${diskUrl}: ${resp.status} ${resp.statusText}`);
           disk = await resp.arrayBuffer();
-          const etag = resp.headers.get("etag") || undefined;
           console.log(`${LOG_PREFIX} Downloaded ${cacheName}: ${(disk.byteLength / 1024 / 1024).toFixed(1)}MB`);
 
-          try {
-            this.imageCache!.images.put(cacheName, disk, { etag, fetchedAt: new Date().toISOString() });
-          } catch (e) {
-            console.error(`${LOG_PREFIX} Failed to cache ${cacheName}:`, e);
-            // Non-fatal — we have the image in memory
+          if (disk.byteLength > SQLITE_DISK_THRESHOLD) {
+            // Large image: ingest into SqliteDiskBuffer, then free the ArrayBuffer
+            sqliteDisk = new SqliteDiskBuffer(this.storage!, cacheName, disk.byteLength);
+            sqliteDisk.ingest(disk);
+            this.storage!.setConfig(`disk_size:${cacheName}`, String(disk.byteLength));
+            disk = null; // Free the 50MB+ ArrayBuffer — data now lives in SQLite
+            console.log(`${LOG_PREFIX} Large image stored in SqliteDiskBuffer — ArrayBuffer freed`);
+          } else {
+            // Small image: cache in ChunkedBlobStore as before
+            try {
+              const etag = resp.headers.get("etag") || undefined;
+              this.imageCache!.images.put(cacheName, disk, { etag, fetchedAt: new Date().toISOString() });
+            } catch (e) {
+              this.errors.record("sqlite", `Failed to cache ${cacheName}`, e);
+            }
           }
         }
       }
 
-      if (!disk) throw new Error("No disk image: not provided inline and no URL configured");
+      // Treat 0-byte placeholder (from SqliteDiskBuffer recovery path) as no disk
+      if (disk && disk.byteLength === 0) disk = null;
+      if (!disk && !sqliteDisk) throw new Error("No disk image: not provided inline and no URL configured");
 
       const bootMode = savedState ? "snapshot" : "cold";
-      console.log(`${LOG_PREFIX} Booting ${label} (${bootMode}): drive=${drive} mem=${memorySizeMB}MB vga=${vgaMemoryMB}MB`);
+      console.log(`${LOG_PREFIX} Booting ${label} (${bootMode}): drive=${drive} mem=${memorySizeMB}MB logical=${logicalMemoryMB}MB vga=${vgaMemoryMB}MB`);
       if (!savedState) this.broadcast(encodeStatus(`booting: ${label}`));
       this.screenAdapter = new DOScreenAdapter();
 
@@ -665,7 +730,7 @@ export class LinuxVM extends DurableObject<Env> {
           this.swapDevice.load();
           console.log(`${LOG_PREFIX} SQLite swap initialized (10GB available)`);
         } catch (e) {
-          console.error(`${LOG_PREFIX} Swap init failed:`, e);
+          this.errors.record("boot", "Swap device init failed", e);
           this.swapDevice = null;
         }
       }
@@ -810,6 +875,7 @@ export class LinuxVM extends DurableObject<Env> {
         this.ctx.storage.sql as any,
         VM_CONFIG.PAGE_STORE,
       );
+      pageStore.setErrorTracker(this.errors);
       pageStore.init();
       this._pageStore = pageStore;
 
@@ -862,9 +928,9 @@ export class LinuxVM extends DurableObject<Env> {
         memory_size:         memorySizeMB * 1024 * 1024,
         vga_memory_size:     vgaMemoryMB  * 1024 * 1024,
         // logical_memory_size: what the guest BIOS/CMOS reports.
-        // Defaults to VM_CONFIG.LOGICAL_MB (64), but can be overridden per image
-        // (e.g. AqeousOS needs 256 MB).  GPAs beyond memory_size (WASM allocation)
-        // are demand-paged from DO SQLite via swap_page_in.
+        // Defaults to VM_CONFIG.LOGICAL_MB (32), overridden per image
+        // (e.g. KolibriOS 64 MB, AqeousOS 3584 MB).  GPAs beyond memory_size
+        // (32 MB WASM allocation) are demand-paged from DO SQLite via swap_page_in.
         logical_memory_size: logicalMemoryMB * 1024 * 1024,
         autostart: false,
         disable_speaker: true,
@@ -884,10 +950,27 @@ export class LinuxVM extends DurableObject<Env> {
         ...(ahciDiskSize ? { ahci_disk_size: ahciDiskSize * 1024 * 1024 } : {}),
       };
 
-      if (drive === "multiboot") v86Config.multiboot = { buffer: disk };
-      else if (drive === "fda") v86Config.fda = { buffer: disk };
-      else v86Config.cdrom = { buffer: disk };
-      disk = null; // Allow GC of the 50MB+ buffer
+      // ── Pass disk to v86 config ───────────────────────────────────────
+      // SqliteDiskBuffer implements .get/.set/.load — v86's duck-typing check
+      // in add_file will use it directly as a loadable (no SyncBuffer wrapper).
+      // For raw ArrayBuffer disks, wrap in { buffer: ... } as before.
+      if (sqliteDisk) {
+        // SqliteDiskBuffer: pass directly — duck-typing picks it up
+        if (drive === "cdrom") v86Config.cdrom = sqliteDisk;
+        else if (drive === "fda") v86Config.fda = sqliteDisk;
+        else if (drive === "multiboot") {
+          throw new Error("SqliteDiskBuffer cannot be used with multiboot drive");
+        }
+        this._sqliteDiskBuffer = sqliteDisk;
+        sqliteDisk._errors = this.errors;
+        console.log(`${LOG_PREFIX} Disk: SqliteDiskBuffer (${(sqliteDisk.byteLength / 1024 / 1024).toFixed(1)}MB, LRU cache)`);
+      } else if (disk) {
+        if (drive === "multiboot") v86Config.multiboot = { buffer: disk };
+        else if (drive === "fda") v86Config.fda = { buffer: disk };
+        else v86Config.cdrom = { buffer: disk };
+        console.log(`${LOG_PREFIX} Disk: ArrayBuffer (${(disk.byteLength / 1024 / 1024).toFixed(1)}MB in-memory)`);
+        disk = null; // Allow GC — v86 holds a reference via config
+      }
 
       if (this.swapDevice && needsSwap) v86Config.hda = this.swapDevice;
 
@@ -903,26 +986,33 @@ export class LinuxVM extends DurableObject<Env> {
       console.log(`${LOG_PREFIX} new V86() returned — waiting for emulator-loaded`);
 
       this.emulator.add_listener("emulator-stopped", () => {
+        this.errors.record("v86", "emulator-stopped event fired");
         this.broadcast(encodeStatus("error: emulator stopped"));
       });
 
       this.emulator.add_listener("serial0-output-byte", (byte: number) => {
-        const char = String.fromCharCode(byte);
-        this.serialBuffer += char;
-        if (char === "\n" || this.serialBuffer.length > 256) {
-          this.broadcast(encodeSerialData(this.serialBuffer));
-          this.serialBuffer = "";
-        }
+        try {
+          const char = String.fromCharCode(byte);
+          this.serialBuffer += char;
+          if (char === "\n" || this.serialBuffer.length > 256) {
+            this.broadcast(encodeSerialData(this.serialBuffer));
+            this.serialBuffer = "";
+          }
+        } catch (e) { this.errors.record("v86", "serial0-output-byte handler failed", e); }
       });
 
       this.emulator.add_listener("screen-set-mode", (graphical: boolean) => {
-        if (graphical) this.deltaEncoder.reset();
-        this.broadcast(encodeStatus(graphical ? "mode: graphical" : "mode: text"));
+        try {
+          if (graphical) this.deltaEncoder.reset();
+          this.broadcast(encodeStatus(graphical ? "mode: graphical" : "mode: text"));
+        } catch (e) { this.errors.record("v86", "screen-set-mode handler failed", e); }
       });
 
       this.emulator.add_listener("screen-set-size", (_size: [number, number, number]) => {
-        this.deltaEncoder.reset();
-        for (const state of this.sessions.values()) state.needsKeyframe = true;
+        try {
+          this.deltaEncoder.reset();
+          for (const state of this.sessions.values()) state.needsKeyframe = true;
+        } catch (e) { this.errors.record("v86", "screen-set-size handler failed", e); }
       });
 
       await new Promise<void>((resolve, reject) => {
@@ -934,6 +1024,24 @@ export class LinuxVM extends DurableObject<Env> {
         this.emulator!.add_listener("emulator-loaded", () => {
           console.log(`${LOG_PREFIX} emulator-loaded fired`);
           clearTimeout(timeout);
+
+          // ── Drop config references to large buffers ─────────────────────
+          // v86 has fully consumed all config: BIOS in WASM memory, disk in
+          // IDEInterface.buffer (SyncBuffer wrapping the same ArrayBuffer —
+          // no copy).  Null the config object properties so GC can reclaim
+          // the wrapper objects.  The underlying ArrayBuffers survive via the
+          // emulator's internal references.
+          // Critical for DSL (50 MB ISO): v86Config stays on the bootVM()
+          // stack until the outer await resolves; without this, the wrapper
+          // { buffer: <50MB> } pins memory for the entire boot duration.
+
+          if (v86Config.cdrom) v86Config.cdrom = undefined as any;
+          if (v86Config.fda) v86Config.fda = undefined as any;
+          if (v86Config.multiboot) v86Config.multiboot = undefined as any;
+          if (v86Config.initial_state) v86Config.initial_state = undefined as any;
+          v86Config.bios = undefined as any;
+          v86Config.vga_bios = undefined as any;
+          savedState = null;
 
           // ── SqlPageStore post-init: give the CPU reference for TLB flushing ────
           // The store and its swap hook were wired inside wasm_fn (before cpu.init /
@@ -961,7 +1069,7 @@ export class LinuxVM extends DurableObject<Env> {
               console.warn(`${LOG_PREFIX} SqlPageStore: cpu not available after emulator-loaded`);
             }
           } catch (e) {
-            console.error(`${LOG_PREFIX} SqlPageStore post-init failed (non-fatal):`, e);
+            this.errors.record("pageStore", "SqlPageStore post-init failed", e);
           }
 
           const vga = this.getVga();
@@ -982,60 +1090,118 @@ export class LinuxVM extends DurableObject<Env> {
             // complete_redraw() calls svga_mark_dirty() which fills the WASM dirty
             // bitmap. getVgaPixels() now reads the bitmap directly (not screenAdapter.dirty),
             // so the first render will correctly see dirty pages and capture the frame.
-            try { vga.complete_redraw?.(); } catch (_) {}
+            try { vga.complete_redraw?.(); } catch (e) { this.errors.record("render", "vga.complete_redraw failed", e); }
           }
           this.emulator!.run();
 
-           // ── Yield override ─────────────────────────────────────────────────
+           // ── Adaptive yield override ──────────────────────────────────────
           //
-          // BATCH_SIZE sync yields then 1 async break.  The async break is
-          // where setInterval callbacks (render loop), WS sends, and HTTP
-          // handlers get a chance to run.
+          // The Cloudflare DO runtime has two CPU enforcement mechanisms:
+          //   1. cpu_ms limit (300s) — cumulative CPU across the DO lifetime.
+          //   2. Sustained-burn detector — kills DOs that peg ~100% CPU for
+          //      extended periods (~57s wall at 98% duty).  Outcome: "canceled"
+          //      with ZERO exceptions in application code.
           //
-          // BATCH_SIZE=4: 3 sync + 1 async.  Each yield ≈ 20ms wall time
-          // (one do_many_cycles_native of ~100K instructions at ~5 MIPS).
-          // Total sync blocking ≈ 80ms — well under DO CPU alarm threshold
-          // and short enough for 30fps rendering (33ms interval fires
-          // promptly after the 80ms batch).
+          // We must stay under BOTH.  The approach:
+          //   - Every yield is async (setTimeout) — no sync batching.
+          //   - Measure actual CPU work time per yield callback.
+          //   - Compute sleep delay to achieve a target duty cycle:
+          //       delay = workMs × (1 - targetDuty) / targetDuty
+          //   - Use an EWMA of work time for smooth adaptation.
+          //   - HLT yields (guest idle, t > 10) always sleep long.
+          //   - Floor delay at 1ms to guarantee the event loop breathes.
           //
-          // At the async boundary we also:
-          //   - render a frame (guarantees rendering is never starved)
-          //   - push detailed stats to subscribed WS clients
-          //
-          // Idle detection: t > 10 → HLT (CPU idle), sleep min(t, 40)ms.
-          const BATCH_SIZE = 4;
+          // The microtick is instruction-counter-based, so emulated time
+          // advances correctly regardless of wall-clock pacing.
+
+          const TARGET_DUTY = 0.50;        // target CPU duty cycle (0.0 – 1.0)
+          const HLT_DELAY_MS = 40;         // guest is halted, no rush
+          const MIN_DELAY_MS = 1;          // floor: always yield to event loop
+          const MAX_DELAY_MS = 20;         // cap: don't starve the emulator
+          const EWMA_ALPHA = 0.1;          // smoothing: 10% new, 90% old
+          const RENDER_INTERVAL_MS = 33;   // 30fps cap for yield-boundary renders
+          const LOG_INTERVAL = 10_000;     // log duty stats every 10s
+
           const v86Internal = (this.emulator as any).v86;
+
+          // ── Adaptive state (closure-scoped) ──
+          let ewmaWorkMs = 0.2;            // EWMA of CPU work per yield (seed)
+          let totalWorkMs = 0;             // cumulative CPU work time
+          let totalSleepMs = 0;            // cumulative sleep time
+          let yieldCount = 0;
+          let hltCount = 0;
+          let lastLogTime = performance.now();
+          let lastCallbackEnd = performance.now();
+          const startWall = performance.now();
+
           if (v86Internal) {
-            let yieldCount = 0;
             v86Internal.yield = (t: number, tick: number) => {
-              yieldCount++;
               this._perf.yields++;
-              if (yieldCount % BATCH_SIZE !== 0) {
-                this._perf.syncYields++;
-                v86Internal.yield_callback(tick);
-                return;
-              }
-              // ── Async yield: break to event loop ──
-              // Render a frame if enough time has passed (30fps cap).
-              // This guarantees VGA output stays in sync with emulator
-              // progress even if setInterval is delayed by sync batches.
-              const _yieldNow = performance.now();
-              if (_yieldNow - this._lastYieldRenderTime >= 33) {
-                this._lastYieldRenderTime = _yieldNow;
-                try { this.renderFrame(); } catch { /* non-fatal */ }
+              yieldCount++;
+              const isHlt = t > 10;
+              if (isHlt) hltCount++;
+
+              const yieldNow = performance.now();
+
+              // Work time = time from when our setTimeout callback fired
+              // (lastCallbackEnd) to now (when yield is called after WASM ran).
+              // On the first yield, this includes boot setup — seed with EWMA.
+              const workMs = yieldCount > 1
+                ? Math.max(0, yieldNow - lastCallbackEnd)
+                : ewmaWorkMs;
+              totalWorkMs += workMs;
+
+              // Update EWMA of work time
+              ewmaWorkMs = EWMA_ALPHA * workMs + (1 - EWMA_ALPHA) * ewmaWorkMs;
+
+              // Render at yield boundary — 30fps cap
+              if (yieldNow - this._lastYieldRenderTime >= RENDER_INTERVAL_MS) {
+                this._lastYieldRenderTime = yieldNow;
+                try { this.renderFrame(); } catch (e) { this.errors.record("render", "yield-boundary renderFrame failed", e); }
               }
               this.pushDetailedStats();
-              if (t > 10) {
-                setTimeout(() => {
-                  try { v86Internal.yield_callback(tick); }
-                  catch (e) { this._yieldError = `async: ${e}`; this._yieldDead = true; }
-                }, Math.min(t, 40));
+
+              // Compute delay to hit target duty cycle:
+              //   duty = work / (work + sleep)  →  sleep = work × (1-duty)/duty
+              let delay: number;
+              if (isHlt) {
+                delay = Math.min(t, HLT_DELAY_MS);
               } else {
-                setTimeout(() => {
-                  try { v86Internal.yield_callback(tick); }
-                  catch (e) { this._yieldError = `async: ${e}`; this._yieldDead = true; }
-                }, 1);
+                const raw = ewmaWorkMs * (1 - TARGET_DUTY) / TARGET_DUTY;
+                delay = Math.max(MIN_DELAY_MS, Math.min(MAX_DELAY_MS, raw));
               }
+              totalSleepMs += delay;
+
+              // Periodic log
+              if (yieldNow - lastLogTime >= LOG_INTERVAL) {
+                const elapsed = yieldNow - startWall;
+                const measuredDuty = totalWorkMs / (totalWorkMs + totalSleepMs);
+                const yps = yieldCount / (elapsed / 1000);
+                console.log(
+                  `${LOG_PREFIX} YIELD n=${yieldCount} ` +
+                  `elapsed=${(elapsed / 1000).toFixed(0)}s ` +
+                  `duty=${(measuredDuty * 100).toFixed(1)}% ` +
+                  `target=${(TARGET_DUTY * 100).toFixed(0)}% ` +
+                  `ewma=${ewmaWorkMs.toFixed(2)}ms ` +
+                  `delay=${delay.toFixed(1)}ms ` +
+                  `yps=${yps.toFixed(0)} ` +
+                  `hlt=${hltCount} ` +
+                  `work=${(totalWorkMs / 1000).toFixed(1)}s ` +
+                  `sleep=${(totalSleepMs / 1000).toFixed(1)}s ` +
+                  `sessions=${this.sessions.size}`,
+                );
+                lastLogTime = yieldNow;
+              }
+
+              setTimeout(() => {
+                lastCallbackEnd = performance.now();
+                try { v86Internal.yield_callback(tick); }
+                catch (e) {
+                  this._yieldError = e instanceof Error ? `${e.message}\n${e.stack}` : `async: ${e}`;
+                  this._yieldDead = true;
+                  this.errors.record("yield", "Yield death — emulator stopped", e);
+                }
+              }, delay);
             };
           }
 
@@ -1043,12 +1209,24 @@ export class LinuxVM extends DurableObject<Env> {
         });
       });
 
-      // DSL needs an Enter key to auto-boot from CD menu
+      // DSL needs an Enter key to auto-boot from CD menu (ISOLINUX).
+      // Send Enter scancodes at multiple delays to ensure we hit the window
+      // when ISOLINUX is ready to accept input.  Uses scancodes (0x1C down,
+      // 0x9C up) rather than keyboard_send_text which may not work before
+      // the keyboard controller is fully initialized.
       if (imageKey === "dsl" && !savedState) {
-        setTimeout(() => {
-          try { this.emulator?.keyboard_send_text("\n"); }
-          catch (e) { console.error(`${LOG_PREFIX} DSL auto-enter failed:`, e); }
-        }, 3000);
+        for (const delay of [5000, 10000, 15000]) {
+          setTimeout(() => {
+            try {
+              const bus = this.emulator?.bus;
+              if (bus) {
+                bus.send("keyboard-code", 0x1C); // Enter down
+                bus.send("keyboard-code", 0x9C); // Enter up
+                console.log(`${LOG_PREFIX} DSL auto-enter sent at +${delay}ms`);
+              }
+            } catch (e) { this.errors.record("v86", "DSL auto-enter failed", e); }
+          }, delay);
+        }
       }
 
       this.booted = true;
@@ -1059,7 +1237,7 @@ export class LinuxVM extends DurableObject<Env> {
       this.startRenderLoop();
       // Render immediately — capture text/VGA state from the synchronous
       // BIOS POST that ran during `new V86()` before the yield loop started.
-      try { this.renderFrame(); } catch { /* non-fatal */ }
+      try { this.renderFrame(); } catch (e) { this.errors.record("render", "post-boot renderFrame failed", e); }
       this.startStatsInterval();
 
       if (savedState) {
@@ -1097,7 +1275,7 @@ export class LinuxVM extends DurableObject<Env> {
       this.bootError = String(err);
       this.cachedAssets = null;
       this.inputGated = false; // Don't leave input gated on boot failure
-      console.error(`${LOG_PREFIX} Boot failed:`, err);
+      this.errors.record("boot", "bootVM failed", err);
       throw err;
     } finally {
       this.booting = false;
@@ -1135,7 +1313,7 @@ export class LinuxVM extends DurableObject<Env> {
       console.log(`${LOG_PREFIX} Boot snapshot saved for ${label} (${(state.byteLength / 1024 / 1024).toFixed(1)}MB) — no further snapshots will be taken`);
       this.broadcast(encodeStatus(`running: ${label}`));
     } catch (err) {
-      console.error(`${LOG_PREFIX} Failed to save snapshot:`, err);
+      this.errors.record("boot", "Failed to save snapshot", err);
       this.broadcast(encodeStatus(`running: ${label}`));
     } finally {
       // Always ungate input after the snapshot attempt, success or failure.
@@ -1157,7 +1335,7 @@ export class LinuxVM extends DurableObject<Env> {
     this.snapshotTimer = setTimeout(() => {
       this.snapshotTimer = null;
       this.saveSnapshot(label).catch((err) => {
-        console.error(`${LOG_PREFIX} Snapshot error:`, err);
+        this.errors.record("boot", "Snapshot Promise rejected", err);
       });
     }, delayMs);
   }
@@ -1197,7 +1375,7 @@ export class LinuxVM extends DurableObject<Env> {
     if (this.renderInterval) clearInterval(this.renderInterval);
     const interval = Math.round(1000 / this.currentFPS);
     this.renderInterval = setInterval(() => {
-      try { this.renderFrame(); } catch { /* non-fatal */ }
+      try { this.renderFrame(); } catch (e) { this.errors.record("render", "interval renderFrame failed", e); }
     }, interval);
   }
 
@@ -1227,7 +1405,7 @@ export class LinuxVM extends DurableObject<Env> {
         const stats = this.collectStats();
         this.broadcast(encodeStats(stats));
         console.log(`${LOG_PREFIX} STATS ${JSON.stringify(stats)}`);
-      } catch { /* non-fatal */ }
+       } catch (e) { this.errors.record("render", "stats collection/broadcast failed", e); }
     }, 10_000);
   }
 
@@ -1288,21 +1466,16 @@ export class LinuxVM extends DurableObject<Env> {
 
     // ── Dirty detection and pixel fill ──────────────────────────────────
     //
-    // Legacy VGA: diff_addr_min/max are JS-side counters updated on every
-    // port write.  Safe to check before fill.
+    // Legacy VGA: diff_addr_min/max are JS-side counters updated on port
+    // writes.  However, some VGA modes (linear framebuffer writes used by
+    // DSL Linux) don't update these counters reliably.  Rather than skip
+    // rendering based on an unreliable heuristic, we always call
+    // screen_fill_buffer() and let the delta encoder handle change detection.
     //
     // SVGA: the authoritative dirty state is the WASM dirty bitmap, read by
     // svga_fill_pixel_buffer() inside screen_fill_buffer().  We always call
     // screen_fill_buffer(), then read the WASM output (min/max_offset) to
     // decide whether the fill found any dirty pages.
-    //
-    // At 8fps (125ms interval), this call runs ≤8 times/s — negligible cost.
-    if (!vga.svga_enabled) {
-      if (vga.diff_addr_min >= vga.diff_addr_max) {
-        this._dbgPixelsNullReason = `legacy_not_dirty(${vga.diff_addr_min}..${vga.diff_addr_max})`;
-        return null;
-      }
-    }
 
     // screen_fill_buffer processes the WASM dirty bitmap, writes RGBA to
     // dest_buffer, then clears the bitmap.  Cheap even when bitmap is empty.
@@ -1405,7 +1578,7 @@ export class LinuxVM extends DurableObject<Env> {
           frame.width, frame.height, frame.bufferWidth, frame.rgba, anyNeedsKeyframe,
         );
       } catch (e) {
-        console.error(`${LOG_PREFIX} Delta encode error:`, e);
+        this.errors.record("render", "Delta encode error", e);
         this.deltaEncoder.reset();
         for (const state of this.sessions.values()) state.needsKeyframe = true;
         return;
@@ -1481,7 +1654,7 @@ export class LinuxVM extends DurableObject<Env> {
           );
           if (keyframe) data = keyframe.data;
         } catch (e) {
-          console.error(`${LOG_PREFIX} Keyframe re-encode failed:`, e);
+          this.errors.record("render", "Keyframe re-encode failed", e);
         }
       }
 
@@ -1491,8 +1664,8 @@ export class LinuxVM extends DurableObject<Env> {
         state.droppedFrames = 0;
         state.needsKeyframe = false;
         this._perf.framesSent++;
-      } catch {
-        // WebSocket send failed — client disconnected
+      } catch (e) {
+        this.errors.record("ws", "frame send failed — client disconnected", e);
         dead.push(ws);
       }
     }
@@ -1522,8 +1695,8 @@ export class LinuxVM extends DurableObject<Env> {
           ));
         }
       }
-    } catch {
-      // WebSocket send may fail if client disconnected during frame capture
+    } catch (e) {
+      this.errors.record("ws", "sendCurrentFrame failed", e);
     }
   }
 
@@ -1539,7 +1712,7 @@ export class LinuxVM extends DurableObject<Env> {
 
       let msg: ClientMessage;
       try { msg = JSON.parse(message); }
-      catch { return; /* ignore malformed JSON */ }
+      catch (e) { this.errors.record("ws", "Malformed JSON from client", e); return; }
 
       // ── Boot trigger ───────────────────────────────────────────────────
       // Boot is intentionally triggered from webSocketMessage so that the
@@ -1567,7 +1740,21 @@ export class LinuxVM extends DurableObject<Env> {
           // cachedAssets is in-memory only; eviction wipes it.
           // this.imageKey was either set from the last /init call or captured
           // from the WS URL query param (?image=...) at upgrade time.
-          const recoveryKey = this.imageKey ?? "kolibri";
+          // If still null, read the persisted imageKey from SQLite (set during
+          // the original boot). Only default to "kolibri" as a last resort.
+          let recoveryKey = this.imageKey;
+          if (!recoveryKey) {
+            try {
+              this.ensureStorage();
+              recoveryKey = this.storage!.getConfig("imageKey");
+              if (recoveryKey) {
+                console.log(`${LOG_PREFIX} Recovered imageKey from SQLite: ${recoveryKey}`);
+              }
+            } catch (e) {
+              this.errors.record("sqlite", "Failed to read persisted imageKey", e);
+            }
+          }
+          if (!recoveryKey) recoveryKey = "kolibri";
 
           console.log(`${LOG_PREFIX} DO eviction recovery: reloading assets for ${recoveryKey}`);
           this.wsSend(ws, encodeStatus(`recovering: ${recoveryKey}`));
@@ -1575,8 +1762,7 @@ export class LinuxVM extends DurableObject<Env> {
           try {
             await this.selfLoadAssets(recoveryKey);
           } catch (err) {
-            const msg = `Asset recovery failed: ${err}`;
-            console.error(`${LOG_PREFIX} ${msg}`);
+            this.errors.record("boot", "selfLoadAssets recovery failed", err);
             this.wsSend(ws, encodeStatus("waiting_for_assets"));
             return;
           }
@@ -1685,8 +1871,9 @@ export class LinuxVM extends DurableObject<Env> {
           this.emulator.serial0_send?.(msg.data);
           break;
       }
-    } catch {
+    } catch (e) {
       // Never throw from WS handler — would crash the DO
+      this.errors.record("ws", "Unhandled error in webSocketMessage", e);
     }
   }
 
@@ -1756,16 +1943,52 @@ export class LinuxVM extends DurableObject<Env> {
     assets.set("bios", bios);
     assets.set("vgaBios", vgaBios);
 
-    // Check SQLite image cache first — avoids re-downloading on every eviction
     this.ensureStorage();
     const cacheName = imageDef.file || resolvedKey;
     let disk: ArrayBuffer | null = null;
+    const SQLITE_DISK_THRESHOLD = 10 * 1024 * 1024; // 10MB
 
+    // 1) Check SqliteDiskBuffer first — survives DO eviction for large images
+    const probe = new SqliteDiskBuffer(this.storage!, cacheName, 0);
+    if (probe.hasData()) {
+      const sizeStr = this.storage!.getConfig(`disk_size:${cacheName}`);
+      if (sizeStr) {
+        const totalSize = parseInt(sizeStr, 10);
+        console.log(`${LOG_PREFIX} Self-recovery: SqliteDiskBuffer hit for ${cacheName} (${(totalSize / 1024 / 1024).toFixed(1)}MB)`);
+        // Build a SqliteDiskBuffer-aware disk reference.
+        // bootVM will detect this special sentinel and create the SqliteDiskBuffer.
+        // We store the size in metadata so bootVM can reconstruct it.
+        const meta: Record<string, unknown> = {
+          imageKey: resolvedKey,
+          drive: imageDef.drive,
+          memory: imageDef.memory,
+          vgaMemory: imageDef.vgaMemory,
+          label: imageDef.label,
+          noSnapshot: imageDef.noSnapshot ?? false,
+          sqliteDisk: true,             // signal to bootVM
+          sqliteDiskSize: totalSize,
+          ...(imageDef.ahciDiskSize ? { ahciDiskSize: imageDef.ahciDiskSize } : {}),
+          ...(imageDef.logicalMemory ? { logicalMemory: imageDef.logicalMemory } : {}),
+          ...(imageDef.cpuCount ? { cpuCount: imageDef.cpuCount } : {}),
+        };
+        // Create a minimal 1-byte disk placeholder so bootVM doesn't throw
+        // "No disk image" — the real disk comes from sqliteDisk metadata.
+        assets.set("disk", new ArrayBuffer(0));
+        assets.set("metadata", new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer);
+        this.cachedAssets = assets;
+        this.imageKey = resolvedKey;
+        console.log(`${LOG_PREFIX} Self-recovery complete for ${resolvedKey} (SqliteDiskBuffer)`);
+        return;
+      }
+    }
+
+    // 2) Check ChunkedBlobStore cache (small images)
     if (this.imageCache!.images.has(cacheName)) {
-      console.log(`${LOG_PREFIX} Self-recovery: cache hit for ${cacheName}`);
+      console.log(`${LOG_PREFIX} Self-recovery: image cache hit for ${cacheName}`);
       disk = this.imageCache!.images.get(cacheName) ?? null;
     }
 
+    // 3) Download from URL/ASSETS
     if (!disk) {
       if (!imageDef.url) {
         console.log(`${LOG_PREFIX} Self-recovery: fetching ${cacheName} from ASSETS`);
@@ -1785,10 +2008,40 @@ export class LinuxVM extends DurableObject<Env> {
           `(${(disk.byteLength / 1024 / 1024).toFixed(1)} MB)`,
         );
 
-        try {
-          this.imageCache!.images.put(cacheName, disk, { etag, fetchedAt: new Date().toISOString() });
-        } catch (e) {
-          console.error(`${LOG_PREFIX} Self-recovery: cache write failed (non-fatal):`, e);
+        if (disk.byteLength > SQLITE_DISK_THRESHOLD) {
+          // Ingest into SqliteDiskBuffer for this boot and future recoveries
+          const sqlBuf = new SqliteDiskBuffer(this.storage!, cacheName, disk.byteLength);
+          sqlBuf.ingest(disk);
+          this.storage!.setConfig(`disk_size:${cacheName}`, String(disk.byteLength));
+          // Recurse — now hasData() will succeed, picking up the fast path
+          console.log(`${LOG_PREFIX} Self-recovery: ingested large image into SqliteDiskBuffer`);
+          // Re-use the sentinel path: disk=0-byte, metadata has sqliteDisk flag
+          const meta: Record<string, unknown> = {
+            imageKey: resolvedKey,
+            drive: imageDef.drive,
+            memory: imageDef.memory,
+            vgaMemory: imageDef.vgaMemory,
+            label: imageDef.label,
+            noSnapshot: imageDef.noSnapshot ?? false,
+            sqliteDisk: true,
+            sqliteDiskSize: disk.byteLength,
+            ...(imageDef.ahciDiskSize ? { ahciDiskSize: imageDef.ahciDiskSize } : {}),
+            ...(imageDef.logicalMemory ? { logicalMemory: imageDef.logicalMemory } : {}),
+            ...(imageDef.cpuCount ? { cpuCount: imageDef.cpuCount } : {}),
+          };
+          disk = null; // Free the large ArrayBuffer
+          assets.set("disk", new ArrayBuffer(0));
+          assets.set("metadata", new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer);
+          this.cachedAssets = assets;
+          this.imageKey = resolvedKey;
+          console.log(`${LOG_PREFIX} Self-recovery complete for ${resolvedKey} (SqliteDiskBuffer)`);
+          return;
+        } else {
+          try {
+            this.imageCache!.images.put(cacheName, disk, { etag, fetchedAt: new Date().toISOString() });
+          } catch (e) {
+            this.errors.record("sqlite", "Self-recovery cache write failed", e);
+          }
         }
       }
     }
@@ -1804,9 +2057,8 @@ export class LinuxVM extends DurableObject<Env> {
       ...(imageDef.ahciDiskSize ? { ahciDiskSize: imageDef.ahciDiskSize } : {}),
       ...(imageDef.logicalMemory ? { logicalMemory: imageDef.logicalMemory } : {}),
       ...(imageDef.cpuCount ? { cpuCount: imageDef.cpuCount } : {}),
-      // disk was resolved above, no need for diskUrl — pass it inline
     };
-    assets.set("disk", disk);
+    assets.set("disk", disk!);
     assets.set("metadata", new TextEncoder().encode(JSON.stringify(meta)).buffer as ArrayBuffer);
 
     this.cachedAssets = assets;

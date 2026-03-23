@@ -44,6 +44,7 @@
 
 import type { SqlHandle } from "./types";
 import { LOG_PREFIX } from "./types";
+import type { ErrorTracker } from "./error-tracker";
 
 // ── Page size (fixed by x86 architecture) ────────────────────────────────────
 
@@ -135,6 +136,9 @@ export class SqlPageStore {
 
   /** Byte offset in WASM heap where the frame pool starts (== PAGED_THRESHOLD). */
   private poolBase = 0;
+
+  /** Shared error tracker — set via setErrorTracker(). */
+  private _errors: ErrorTracker | null = null;
 
   /** Exported pool_* functions from page_pool.rs (set via setWasmExports). */
   private pool: PoolExports | null = null;
@@ -266,6 +270,11 @@ export class SqlPageStore {
     this.cpu = cpu;
   }
 
+  /** Inject the shared error tracker for observability. */
+  setErrorTracker(tracker: ErrorTracker): void {
+    this._errors = tracker;
+  }
+
   // ── Core API ──────────────────────────────────────────────────────────────
 
   /**
@@ -282,6 +291,14 @@ export class SqlPageStore {
    * @returns          WASM byte offset of the 4 KB frame, or -1 on error.
    */
   swapPageIn(gpa: number, forWriting: number): number {
+    try { return this._swapPageInInner(gpa, forWriting); }
+    catch (e) {
+      this._errors?.record("pageStore", `swapPageIn crashed gpa=0x${gpa.toString(16)}`, e);
+      return -1;
+    }
+  }
+
+  private _swapPageInInner(gpa: number, forWriting: number): number {
     const pageGpa = gpa & ~(PAGE_SIZE - 1);
     this._swapIns++;
 
@@ -440,7 +457,7 @@ export class SqlPageStore {
     if (evicted >= 0) {
       // Single TLB flush after eviction — avoids per-eviction cascade
       if (this.cpu) {
-        try { this.cpu.full_clear_tlb(); } catch { /* non-fatal */ }
+        try { this.cpu.full_clear_tlb(); } catch (e) { this._errors?.record("pageStore", "full_clear_tlb failed", e); }
       }
       this._tlbFlushes++;
     }
@@ -482,7 +499,7 @@ export class SqlPageStore {
     }
 
     if (evicted < 0) {
-      console.error(`${LOG_PREFIX} SqlPageStore: Clock eviction failed after ${limit} scans`);
+      this._errors?.record("pageStore", `Clock eviction failed after ${limit} scans (used=${this.usedFrames}/${this.cfg.maxFrames})`);
       return -1;
     }
 
@@ -592,6 +609,11 @@ export class SqlPageStore {
     this._writeFlushScheduled = false;
     const pending = this._pendingWriteMap;
     if (pending.size === 0) return;
+    try { this._flushPendingWritesInner(pending); }
+    catch (e) { this._errors?.record("pageStore", `flushPendingWrites failed (${pending.size} rows)`, e); }
+  }
+
+  private _flushPendingWritesInner(pending: Map<number, Uint8Array>): void {
 
     // Snapshot and clear the map atomically
     const entries = Array.from(pending.entries());

@@ -30,43 +30,39 @@ interface ImageDef {
 // ── DO memory budget ─────────────────────────────────────────────────────────
 // Cloudflare Durable Objects have a 128 MB total isolate memory limit.
 // Demand-paging layout (all tunable in linux-vm.ts VM_CONFIG):
-//   WASM mem8 total    : 64 MB  (memory_size passed to v86; MUST cover full hot pool)
-//     ↳ Resident RAM   : 32 MB  (mem8[0..32MB], PAGED_THRESHOLD in Rust)
-//     ↳ Hot pool       : 32 MB  (mem8[32MB..64MB], 8192 × 4 KB frames)
+//   WASM mem8 total    : 32 MB  (memory_size passed to v86; covers hot pool)
+//     ↳ Resident RAM   : 16 MB  (mem8[0..16MB], PAGED_THRESHOLD in Rust)
+//     ↳ Hot pool       : 16 MB  (mem8[16MB..32MB], 4096 × 4 KB frames)
 //   VGA SVGA buffer    :  8 MB  (svga_allocate_memory, separate allocation)
 //   WASM heap overhead : ~20 MB (JIT code cache, TLB tables, CPU structs)
 //   JS heap            : ~10 MB (emulator objects, WS sessions, delta encoder)
 //   ──────────────────────────────────
-//   Total              ~102 MB ← safe headroom below 128 MB limit
+//   Total              ~ 70 MB ← safe headroom below 128 MB limit
 //
-// Guest sees logicalMemory MB via CMOS/e820 (default 256 MB, per-image override).
-// SeaBIOS places ACPI tables at ~logical_memory_size-7KB.  patch_dsdt_s5 now uses
-// resolveGPA to read them, so ACPI works correctly even when tables are above 64MB.
-// GPAs [32 MB, logicalMemory MB) are demand-paged from DO SQLite via swap_page_in.
-// linux4 (text-only, no demand-paging) uses a smaller budget: 32 MB RAM, 2 MB VGA.
+// Guest sees logicalMemory MB via CMOS/e820 (per-image, e.g. 64 for KolibriOS,
+// 3584 for AqeousOS).  GPAs in [16 MB, logicalMemory MB) are demand-paged from
+// DO SQLite via swap_page_in.
 //
-// memory/vgaMemory values in IMAGES are the values passed as memory_size to v86.
-// For demand-paged images this is WASM_MB = 64 MB (must include the hot pool).
-// To change the shared default, edit VM_CONFIG in linux-vm.ts.
+// memory/vgaMemory values in IMAGES are the WASM allocation passed to v86.
+// Standardized to 32 MB for all images.  To change, edit VM_CONFIG in linux-vm.ts.
 
-/** Shared default memory/VGA allocation for demand-paged images (MB).
- *  memory = WASM_MB = RESIDENT_MB + HOT_POOL_MB = 64 MB (full mem8 allocation).
- *  Must match VM_CONFIG.WASM_MB in linux-vm.ts — see that file for the full explanation
- *  of why memory_size must cover the hot pool, not just the resident window. */
-const DEFAULT_MEMORY_MB  = 64; // == VM_CONFIG.WASM_MB (resident 32 MB + hot pool 32 MB)
+/** Shared default memory/VGA allocation (MB).
+ *  memory = WASM_MB = 32 MB for all images (RESIDENT 16 MB + HOT_POOL 16 MB).
+ *  Must match VM_CONFIG.WASM_MB in linux-vm.ts. */
+const DEFAULT_MEMORY_MB  = 32; // == VM_CONFIG.WASM_MB
 const DEFAULT_VGA_MB     =  8; // == VM_CONFIG.VGA_MB
 
 const IMAGES: Record<string, ImageDef> = {
-  kolibri:    { file: "kolibri.img",             drive: "fda",   memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
+  kolibri:    { file: "kolibri.img",             drive: "fda",       memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, logicalMemory: 64,   label: "KolibriOS",      description: "Full GUI, boots fast. Tiny x86 OS written in FASM.",
                 url: "https://copy.sh/v86/images/kolibri.img" },
-  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true, ahciDiskSize: 32, logicalMemory: 3584, cpuCount: 2 },
-  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager." },
-  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop." },
-  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
+  aqeous:     { file: "aqeous.bin",              drive: "multiboot", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, logicalMemory: 3584, label: "AqeousOS",       description: "Custom x86 OS built from scratch. Full GUI with window system.", noSnapshot: true, ahciDiskSize: 32, cpuCount: 2 },
+  tinycore:   { file: "TinyCore-15.0.iso",       drive: "cdrom",     memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, logicalMemory: 128,  label: "TinyCore 15",    description: "Minimal Linux with X11 desktop and FLWM window manager. Full POSIX environment with package manager." },
+  tinycore11: { file: "TinyCore-11.1.iso",       drive: "cdrom",     memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, logicalMemory: 128,  label: "TinyCore 11",    description: "Classic TinyCore release with broad hardware compatibility and lightweight X11 desktop." },
+  dsl:        { file: "dsl-4.11.rc2.iso",        drive: "cdrom",     memory: DEFAULT_MEMORY_MB, vgaMemory: 4,              logicalMemory: 256,  label: "DSL Linux",      description: "Damn Small Linux — complete desktop with Fluxbox window manager, browser, and tools.",
                 url: "https://distro.ibiblio.org/damnsmall/release_candidate/dsl-4.11.rc2.iso" },
-  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom", memory: DEFAULT_MEMORY_MB, vgaMemory: DEFAULT_VGA_MB, label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
+  helenos:    { file: "HelenOS-0.14.1-ia32.iso", drive: "cdrom",     memory: DEFAULT_MEMORY_MB, vgaMemory: 4,              logicalMemory: 128,  label: "HelenOS",        description: "Research microkernel OS with a custom graphical interface.",
                 url: "https://www.helenos.org/releases/HelenOS-0.14.1-ia32.iso" },
-  linux4:     { file: "linux4.iso",              drive: "cdrom", memory: 32,                vgaMemory: 2,              label: "Linux 4 (Text)", description: "Minimal Linux kernel. Text-only — great for exploring the shell.",
+  linux4:     { file: "linux4.iso",              drive: "cdrom",     memory: DEFAULT_MEMORY_MB, vgaMemory: 2,              logicalMemory: 64,   label: "Linux 4 (Text)", description: "Minimal Linux kernel. Text-only — great for exploring the shell.",
                 url: "https://copy.sh/v86/images/linux4.iso" },
 };
 
@@ -224,7 +220,7 @@ export default {
           label: def.label,
           description: def.description,
           drive: def.drive,
-          memory: def.memory === DEFAULT_MEMORY_MB ? 256 : def.memory,
+          memory: def.logicalMemory || 64,
         })),
       );
     }
