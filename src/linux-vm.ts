@@ -145,7 +145,7 @@ export class LinuxVM extends DurableObject<Env> {
   // Any dirty detection immediately renders and resets the counter.
   private _cleanTicks = 0;
   private _adaptiveSkips = 0;  // perf counter: frames skipped due to idle
-  // _lastYieldRenderTime removed: rendering is now once per batch at async boundary
+  private _lastYieldRenderTime = 0;  // throttle yield-boundary renders to 30fps
   private _lastFrameProducedTime = 0;  // last time a VGA frame was actually sent
   private _textSent = 0;       // text frames actually broadcast
   private _textEmpty = 0;      // text mode: getTextScreen returned empty
@@ -1075,125 +1075,73 @@ export class LinuxVM extends DurableObject<Env> {
           }
           this.emulator!.run();
 
-           // ── Batch yield scheduler ─────────────────────────────────────────
+           // ── Yield override ─────────────────────────────────────────────────
           //
-          // Cloudflare Workers: performance.now() is frozen during sync WASM
-          // execution (Spectre mitigation).  Adaptive duty cycle is impossible.
-          // Instead we use a calibrated fixed batch:
+          // BATCH_SIZE sync yields then 1 async break.  The async break is
+          // where setInterval callbacks (render loop), WS sends, and HTTP
+          // handlers get a chance to run.
           //
-          //   BATCH_SIZE sync main_loop() calls → setTimeout(SLEEP_MS)
+          // BATCH_SIZE=4: 3 sync + 1 async.  Each yield ≈ 20ms wall time
+          // (one do_many_cycles_native of ~100K instructions at ~5 MIPS).
+          // Total sync blocking ≈ 80ms — well under DO CPU alarm threshold
+          // and short enough for 30fps rendering (33ms interval fires
+          // promptly after the 80ms batch).
           //
-          // Each main_loop() runs ~600K instructions in ~0.5ms real CPU.
-          // The runtime cancels DOs that block the event loop for >~525ms
-          // per turn (measured: boundary at ~1050 sync calls).
+          // At the async boundary we also:
+          //   - render a frame (guarantees rendering is never starved)
+          //   - push detailed stats to subscribed WS clients
           //
-          // Calibration data (DSL Linux, production, 90s survival tests):
-          //   BATCH   yields/s   sync_burst_ms   survived
-          //      1     1,000       0.5ms           ✓
-          //      8     8,016       4ms             ✓
-          //    128   134,000      64ms             ✓
-          //    256   260,000     128ms             ✓
-          //    512   568,889     256ms             ✓
-          //   1000  1,200,000    500ms             ✓
-          //   1050     —         525ms             ✓ (boundary)
-          //   1100     —         550ms             ✗ canceled
+          // Idle detection: t > 10 → HLT (CPU idle), sleep min(t, 40)ms.
           //
-          // Rendering + stats are done ONCE per batch at the async boundary,
-          // not inside the sync loop.  performance.now() is frozen during sync
-          // WASM execution so render checks don't work there anyway.
-          // BATCH_SIZE=256 → ~128ms burst, ~4 renders/s, wide safety margin.
-
-          const BATCH_SIZE  = 64;   // sync main_loop() calls per event loop turn
-          const SLEEP_MS    = 1;     // setTimeout delay after each batch
-          const HLT_SLEEP_MS = 40;   // guest is halted, sleep longer
-          const LOG_INTERVAL = 10_000;
-
+          // DSL protection: after 30s of continuous yielding without HLT,
+          // reduce BATCH_SIZE from 4 to 2 to lower duty cycle and avoid
+          // the ~57s cancellation boundary on very long cold boots.
+          let BATCH_SIZE = 4;
+          const BATCH_REDUCE_AFTER_MS = 30_000;
+          const BATCH_SIZE_REDUCED = 2;
           const v86Internal = (this.emulator as any).v86;
-
-          let batchPos = 0;          // position within current batch (0..BATCH_SIZE-1)
-          let yieldCount = 0;
-          let hltCount = 0;
-          let batchCount = 0;        // completed batches (each = 1 event loop turn)
-          const startWall = performance.now();
-          let lastLogTime = startWall;
-          let lastBatchStart = startWall;  // when the current setTimeout callback fired
-
-          const diag = this._yieldDiag = {
-            batchSize: BATCH_SIZE,
-            sleepMs: SLEEP_MS,
-            yieldCount: 0,
-            hltCount: 0,
-            batchCount: 0,
-            yieldsPerSec: 0,
-            lastCycleMs: 0,    // wall time of last full cycle (batch+sleep)
-            avgCycleMs: 0,     // average cycle wall time
-          };
-
           if (v86Internal) {
+            let yieldCount = 0;
+            let lastHltTime = performance.now();
+            let batchReduced = false;
             v86Internal.yield = (t: number, tick: number) => {
-              this._perf.yields++;
               yieldCount++;
-              batchPos++;
-              const isHlt = t > 10;
-              if (isHlt) hltCount++;
-
-              // ── Sync path: pure — just yield_callback + counters ──
-              // Rendering and stats are deferred to the async boundary
-              // because performance.now() is frozen during sync WASM
-              // execution (Spectre mitigation in Cloudflare Workers).
-              if (!isHlt && batchPos < BATCH_SIZE) {
+              this._perf.yields++;
+              // ── DSL protection: reduce batch after 30s without HLT ──
+              if (!batchReduced && t <= 10) {
+                const now = performance.now();
+                if (now - lastHltTime >= BATCH_REDUCE_AFTER_MS) {
+                  BATCH_SIZE = BATCH_SIZE_REDUCED;
+                  batchReduced = true;
+                }
+              }
+              if (t > 10) lastHltTime = performance.now();
+              if (yieldCount % BATCH_SIZE !== 0) {
                 this._perf.syncYields++;
                 v86Internal.yield_callback(tick);
                 return;
               }
-
-              // ── Async path: batch complete or HLT ──
-              batchPos = 0;
-              batchCount++;
-              const now = performance.now();
-              const sleep = isHlt ? Math.min(t, HLT_SLEEP_MS) : SLEEP_MS;
-
-              // Periodic log (uses performance.now() across async boundary — accurate)
-              if (now - lastLogTime >= LOG_INTERVAL) {
-                const elapsed = now - startWall;
-                const yps = yieldCount / (elapsed / 1000);
-                const bps = batchCount / (elapsed / 1000);
-                console.log(
-                  `${LOG_PREFIX} YIELD n=${yieldCount} batch=${batchCount} ` +
-                  `elapsed=${(elapsed / 1000).toFixed(0)}s ` +
-                  `yps=${yps.toFixed(0)} bps=${bps.toFixed(0)} ` +
-                  `hlt=${hltCount} ` +
-                  `sessions=${this.sessions.size}`,
-                );
-                lastLogTime = now;
+              // ── Async yield: break to event loop ──
+              // Render a frame if enough time has passed (30fps cap).
+              // This guarantees VGA output stays in sync with emulator
+              // progress even if setInterval is delayed by sync batches.
+              const _yieldNow = performance.now();
+              if (_yieldNow - this._lastYieldRenderTime >= 33) {
+                this._lastYieldRenderTime = _yieldNow;
+                try { this.renderFrame(); } catch (e) { this.errors.record("render", "yield-boundary renderFrame failed", e); }
               }
-
-              // Update diag
-              const elapsed = now - startWall;
-              const cycleMs = now - lastBatchStart;
-              diag.yieldCount = yieldCount;
-              diag.hltCount = hltCount;
-              diag.batchCount = batchCount;
-              diag.yieldsPerSec = elapsed > 0 ? yieldCount / (elapsed / 1000) : 0;
-              diag.lastCycleMs = cycleMs;
-              diag.avgCycleMs = elapsed / (batchCount || 1);
-
-              // ── Render + stats ONCE per event loop turn ──
-              // Moved out of the sync loop: performance.now() is now
-              // unfrozen (we're at the async boundary), and we only pay
-              // the cost once per batch instead of 256× per batch.
-              try { this.renderFrame(); } catch (e) { this.errors.record("render", "yield-boundary renderFrame failed", e); }
               this.pushDetailedStats();
-
-              setTimeout(() => {
-                lastBatchStart = performance.now();
-                try { v86Internal.yield_callback(tick); }
-                catch (e) {
-                  this._yieldError = e instanceof Error ? `${e.message}\n${e.stack}` : `async: ${e}`;
-                  this._yieldDead = true;
-                  this.errors.record("yield", "Yield death — emulator stopped", e);
-                }
-              }, sleep);
+              if (t > 10) {
+                setTimeout(() => {
+                  try { v86Internal.yield_callback(tick); }
+                  catch (e) { this._yieldError = `async: ${e}`; this._yieldDead = true; this.errors.record("yield", "Yield death — emulator stopped", e); }
+                }, Math.min(t, 40));
+              } else {
+                setTimeout(() => {
+                  try { v86Internal.yield_callback(tick); }
+                  catch (e) { this._yieldError = `async: ${e}`; this._yieldDead = true; this.errors.record("yield", "Yield death — emulator stopped", e); }
+                }, 1);
+              }
             };
           }
 
